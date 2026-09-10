@@ -1,11 +1,12 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { db } from './db.js';
-import { SESSIONS_DIR } from './paths.js';
+import { discoverProfiles } from './paths.js';
 import { accountLabel, listAccounts, currentAccount } from './accounts.js';
 import { capacityFor } from './calibrate.js';
 import { LIMIT_TYPES, currentWindow, burnRate, recentWindows } from './windows.js';
 import { modelLabel } from './pricing.js';
+import { billingPeriod, periodSpend } from './billing.js';
 
 const UNATTRIBUTED = '__unattributed__';
 
@@ -96,6 +97,7 @@ export function overview(now = Date.now()) {
         FROM events e JOIN sessions s ON s.session_id = e.session_id
        WHERE s.account_uuid = ?`).get(a.account_uuid);
 
+    const period = billingPeriod(a.subscription_at, 'month', now);
     return {
       accountUuid: a.account_uuid,
       label: accountLabel(a),
@@ -107,6 +109,7 @@ export function overview(now = Date.now()) {
       totalCost: totals.cost,
       totalEvents: totals.events,
       limits,
+      billing: period ? { ...period, spend: periodSpend(d, a.account_uuid, period) } : null,
     };
   });
 
@@ -177,26 +180,35 @@ export function sessions(limit = 40, accountUuid = null) {
      ORDER BY s.last_ts DESC LIMIT @limit`).all({ limit, ...params });
 }
 
-/** Claude Code processes running right now, from the CLI's own session registry. */
+/**
+ * Claude Code processes running right now, across every profile.
+ * Each profile keeps its own session registry, so all of them are read.
+ */
 export function liveSessions() {
-  let names = [];
-  try { names = fs.readdirSync(SESSIONS_DIR); } catch { return []; }
   const out = [];
-  for (const n of names) {
-    if (!n.endsWith('.json')) continue;
-    try {
-      const s = JSON.parse(fs.readFileSync(path.join(SESSIONS_DIR, n), 'utf8'));
-      if (!s.sessionId) continue;
-      // The registry keeps entries for exited processes; drop anything whose pid is gone.
-      let alive = true;
-      try { process.kill(s.pid, 0); } catch { alive = false; }
-      if (!alive) continue;
-      out.push({
-        sessionId: s.sessionId, pid: s.pid, cwd: s.cwd, name: s.name,
-        status: s.status, startedAt: s.startedAt, updatedAt: s.updatedAt,
-        version: s.version, kind: s.kind,
-      });
-    } catch { /* mid-write or malformed */ }
+  const byUuid = new Map(
+    db().prepare('SELECT config_dir, account_uuid FROM accounts WHERE config_dir IS NOT NULL')
+      .all().map((r) => [r.config_dir, r.account_uuid]));
+
+  for (const profile of discoverProfiles()) {
+    let names = [];
+    try { names = fs.readdirSync(profile.sessionsDir); } catch { continue; }
+    for (const n of names) {
+      if (!n.endsWith('.json')) continue;
+      try {
+        const s = JSON.parse(fs.readFileSync(path.join(profile.sessionsDir, n), 'utf8'));
+        if (!s.sessionId) continue;
+        // The registry keeps entries for exited processes; drop anything whose pid is gone.
+        try { process.kill(s.pid, 0); } catch { continue; }
+        out.push({
+          sessionId: s.sessionId, pid: s.pid, cwd: s.cwd, name: s.name,
+          status: s.status, startedAt: s.startedAt, updatedAt: s.updatedAt,
+          version: s.version, kind: s.kind,
+          profile: profile.name,
+          accountUuid: byUuid.get(profile.dir) ?? null,
+        });
+      } catch { /* mid-write or malformed */ }
+    }
   }
   return out.sort((a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0));
 }

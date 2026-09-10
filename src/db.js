@@ -53,10 +53,13 @@ CREATE TABLE IF NOT EXISTS sessions (
   git_branch      TEXT,
   version         TEXT,
   entrypoint      TEXT,
+  config_dir      TEXT,   -- the Claude profile this session was recorded under
+  user_email      TEXT,   -- signed-in address, when the session recorded one
   account_uuid    TEXT,
-  account_source  TEXT,   -- 'bridge' | 'observed' | 'inferred' | null
+  account_source  TEXT,   -- 'bridge' | 'profile' | 'observed' | 'inferred' | null
   reported_cost   REAL
 );
+CREATE INDEX IF NOT EXISTS idx_sessions_config ON sessions(config_dir);
 CREATE INDEX IF NOT EXISTS idx_sessions_account ON sessions(account_uuid);
 CREATE INDEX IF NOT EXISTS idx_sessions_last    ON sessions(last_ts);
 
@@ -70,6 +73,9 @@ CREATE TABLE IF NOT EXISTS accounts (
   org_name          TEXT,
   rate_limit_tier   TEXT,
   subscription_type TEXT,
+  billing_type      TEXT,
+  subscription_at   TEXT,   -- ISO date the subscription started; anchors the cycle
+  config_dir        TEXT,   -- profile this account is signed into, when known
   first_seen        INTEGER,
   last_seen         INTEGER
 );
@@ -88,14 +94,19 @@ CREATE TABLE IF NOT EXISTS limit_events (
 );
 CREATE INDEX IF NOT EXISTS idx_limit_ts ON limit_events(ts);
 
--- Sightings of "this account was signed in at this time", from the live watcher
--- and from .claude.json backups. Used to attribute sessions with no bridge record.
+-- Sightings of "this account was signed into this profile at this time", from
+-- the live watcher and from each profile's config backups. A profile holds one
+-- account at a time, so these form a per-profile timeline that dates any session
+-- recorded under it.
 CREATE TABLE IF NOT EXISTS account_observations (
-  ts           INTEGER PRIMARY KEY,
+  ts           INTEGER NOT NULL,
+  config_dir   TEXT NOT NULL DEFAULT '',
   account_uuid TEXT NOT NULL,
   email        TEXT,
-  source       TEXT
+  source       TEXT,
+  PRIMARY KEY (ts, config_dir)
 );
+CREATE INDEX IF NOT EXISTS idx_obs_dir ON account_observations(config_dir, ts);
 
 -- Learned capacity per (account, limit_type), produced by calibrate.js.
 CREATE TABLE IF NOT EXISTS calibration (
@@ -115,18 +126,47 @@ CREATE TABLE IF NOT EXISTS meta (
 `;
 
 /**
- * Columns added after the first release. CREATE TABLE IF NOT EXISTS will not
- * add a column to a table that already exists, so widen it explicitly.
+ * Everything here is derived from transcripts on disk, so the index is a cache,
+ * not a record. When the schema changes, rebuilding from source is both simpler
+ * and more trustworthy than migrating - a full rescan takes about half a minute.
+ * Only genuinely user-authored state is carried across (currently: labels).
  */
-const MIGRATIONS = [
-  ['sessions', 'user_email', 'TEXT'],
+const SCHEMA_VERSION = 3;
+
+const DERIVED_TABLES = [
+  'files', 'events', 'sessions', 'limit_events', 'account_observations', 'calibration', 'accounts',
 ];
 
-function migrate(d) {
-  for (const [table, column, type] of MIGRATIONS) {
-    const cols = d.prepare(`PRAGMA table_info(${table})`).all().map((c) => c.name);
-    if (!cols.includes(column)) d.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${type}`);
+function ensureSchema(d) {
+  // The version has to be read before the schema is applied: an old table plus
+  // a new index over a column it lacks is an error, not a no-op.
+  d.exec('CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)');
+  const row = d.prepare("SELECT value FROM meta WHERE key = 'schema_version'").get();
+  const have = row ? Number(row.value) : 0;
+
+  const fresh = !d.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='events'").get();
+  if (have === SCHEMA_VERSION || fresh) {
+    d.exec(SCHEMA);
+    d.prepare(`INSERT INTO meta (key, value) VALUES ('schema_version', ?)
+               ON CONFLICT(key) DO UPDATE SET value = excluded.value`).run(String(SCHEMA_VERSION));
+    return;
   }
+
+  // Preserve names the user set by hand; they cannot be re-derived.
+  let labels = [];
+  try {
+    labels = d.prepare('SELECT account_uuid, label FROM accounts WHERE label IS NOT NULL').all();
+  } catch { /* table predates labels */ }
+
+  for (const t of DERIVED_TABLES) d.exec(`DROP TABLE IF EXISTS ${t}`);
+  d.exec(SCHEMA);
+  for (const l of labels) {
+    d.prepare(`INSERT INTO accounts (account_uuid, label) VALUES (?, ?)
+               ON CONFLICT(account_uuid) DO UPDATE SET label = excluded.label`)
+      .run(l.account_uuid, l.label);
+  }
+  d.prepare(`INSERT INTO meta (key, value) VALUES ('schema_version', ?)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value`).run(String(SCHEMA_VERSION));
 }
 
 let _db = null;
@@ -135,8 +175,7 @@ export function db() {
   if (_db) return _db;
   ensureDataDir();
   _db = new DatabaseSync(DB_PATH);
-  _db.exec(SCHEMA);
-  migrate(_db);
+  ensureSchema(_db);
   return _db;
 }
 

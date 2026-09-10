@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import readline from 'node:readline';
-import { PROJECTS_DIR, prettyProject } from './paths.js';
+import { discoverProfiles, prettyProject } from './paths.js';
 import { db, tx } from './db.js';
 import { costOf } from './pricing.js';
 
@@ -12,44 +12,47 @@ import { costOf } from './pricing.js';
  */
 
 /**
- * Every transcript under ~/.claude/projects, at any depth.
+ * Every transcript under every discovered profile, at any depth.
  *
  * The tree is not flat. Alongside the top-level `<project>/<sessionId>.jsonl`
  * there are per-session `subagents` and `wf_...` workflow directories holding
  * subagent and workflow turns. Those are billed exactly like main-thread turns
  * and count against the same limits, so they must be ingested too; each carries
  * the parent `sessionId`, which keeps attribution intact.
+ *
+ * Each file is tagged with the profile it came from, which is what later lets a
+ * session be attributed to an account outright instead of by inference.
  */
-function listTranscripts() {
+function listTranscripts(profiles = discoverProfiles()) {
   const out = [];
 
   // Deepest observed layout is project/session/subagents/workflows/wf_id/agent.jsonl.
   const MAX_DEPTH = 8;
 
-  const walk = (dir, slug, depth) => {
+  const walk = (dir, slug, profile, depth) => {
     if (depth > MAX_DEPTH) return;
     let entries = [];
     try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
     for (const e of entries) {
       const full = path.join(dir, e.name);
       if (e.isDirectory()) {
-        walk(full, slug, depth + 1);
+        walk(full, slug, profile, depth + 1);
       } else if (e.isFile() && e.name.endsWith('.jsonl')) {
         let st;
         try { st = fs.statSync(full); } catch { continue; }
-        out.push({ path: full, slug, size: st.size, mtime: Math.floor(st.mtimeMs) });
+        out.push({ path: full, slug, configDir: profile.dir, size: st.size, mtime: Math.floor(st.mtimeMs) });
       }
     }
   };
 
-  let projects = [];
-  try {
-    projects = fs.readdirSync(PROJECTS_DIR, { withFileTypes: true })
-      .filter((d) => d.isDirectory()).map((d) => d.name);
-  } catch {
-    return [];
+  for (const profile of profiles) {
+    let projects = [];
+    try {
+      projects = fs.readdirSync(profile.projectsDir, { withFileTypes: true })
+        .filter((d) => d.isDirectory()).map((d) => d.name);
+    } catch { continue; }
+    for (const slug of projects) walk(path.join(profile.projectsDir, slug), slug, profile, 1);
   }
-  for (const slug of projects) walk(path.join(PROJECTS_DIR, slug), slug, 1);
   return out;
 }
 
@@ -100,8 +103,8 @@ function prepare(d) {
     VALUES (?,?, 'bridge')
     ON CONFLICT(session_id) DO UPDATE SET account_uuid = excluded.account_uuid, account_source = 'bridge'`);
   STMT.sessMeta ||= d.prepare(`
-    INSERT INTO sessions (session_id, first_ts, last_ts, cwd, project, git_branch, version, entrypoint)
-    VALUES (?,?,?,?,?,?,?,?)
+    INSERT INTO sessions (session_id, first_ts, last_ts, cwd, project, git_branch, version, entrypoint, config_dir)
+    VALUES (?,?,?,?,?,?,?,?,?)
     ON CONFLICT(session_id) DO UPDATE SET
       first_ts   = MIN(COALESCE(sessions.first_ts, excluded.first_ts), excluded.first_ts),
       last_ts    = MAX(COALESCE(sessions.last_ts, excluded.last_ts), excluded.last_ts),
@@ -109,7 +112,8 @@ function prepare(d) {
       project    = COALESCE(excluded.project, sessions.project),
       git_branch = COALESCE(excluded.git_branch, sessions.git_branch),
       version    = COALESCE(excluded.version, sessions.version),
-      entrypoint = COALESCE(excluded.entrypoint, sessions.entrypoint)`);
+      entrypoint = COALESCE(excluded.entrypoint, sessions.entrypoint),
+      config_dir = COALESCE(sessions.config_dir, excluded.config_dir)`);
   STMT.cost ||= d.prepare(`
     INSERT INTO sessions (session_id, reported_cost) VALUES (?, ?)
     ON CONFLICT(session_id) DO UPDATE SET reported_cost = excluded.reported_cost`);
@@ -202,6 +206,7 @@ function handleLine(line, ctx) {
     STMT.sessMeta.run(
       d.sessionId, ts, ts, d.cwd ?? null,
       prettyProject(ctx.slug, d.cwd), d.gitBranch ?? null, d.version ?? null, d.entrypoint ?? null,
+      ctx.configDir,
     );
   }
   return 1;
@@ -221,7 +226,7 @@ async function ingestFile(file, from) {
   const d = db();
   const stream = fs.createReadStream(file.path, { start: from, encoding: 'utf8' });
   const rl = readline.createInterface({ input: stream, crlfDelay: Infinity });
-  const ctx = { slug: file.slug, now: Date.now() };
+  const ctx = { slug: file.slug, configDir: file.configDir ?? null, now: Date.now() };
   let consumed = from;
   let events = 0;
   let pendingBytes = 0;
@@ -261,7 +266,8 @@ async function ingestFile(file, from) {
 export async function ingestAll(opts = {}) {
   const d = db();
   prepare(d);
-  const files = listTranscripts();
+  const profiles = opts.profiles ?? discoverProfiles();
+  const files = listTranscripts(profiles);
   const known = new Map(
     d.prepare('SELECT path, size, offset, mtime FROM files').all().map((r) => [r.path, r]),
   );
@@ -295,7 +301,7 @@ export async function ingestAll(opts = {}) {
   }
   flush();
 
-  return { files: files.length, scanned, skipped, newEvents, bytes };
+  return { files: files.length, scanned, skipped, newEvents, bytes, profiles: profiles.length };
 }
 
 export { listTranscripts };

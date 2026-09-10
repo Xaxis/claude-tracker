@@ -286,3 +286,11 @@ td { font-variant-numeric: tabular-nums; }
   .hero { grid-template-columns: 1fr; }
   .hero-figure { font-size: 40px; }
 }
+
+/* --- billing period ------------------------------------------------------- */
+.billing { display: flex; flex-direction: column; gap: 5px; padding-top: 10px; border-top: 1px solid var(--border); }
+.billing-head { display: flex; justify-content: space-between; align-items: baseline; font-size: 12px; color: var(--text-secondary); }
+.billing-when { color: var(--text-primary); font-variant-numeric: tabular-nums; }
+.billing-track { height: 4px; border-radius: 2px; background: var(--gridline); overflow: hidden; }
+.billing-track > span { display: block; height: 100%; border-radius: 2px; background: var(--text-muted); }
+.limit-note { font-size: 11px; color: var(--text-muted); margin-top: -4px; }

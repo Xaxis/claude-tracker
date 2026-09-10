@@ -232,3 +232,89 @@ test('bridge attribution is authoritative and never overwritten', () => {
   assert.equal(row.account_uuid, 'acct-a');
   assert.equal(row.account_source, 'bridge');
 });
+
+/* ------------------------------------------------------------------ billing */
+
+const { billingPeriod } = await import('../src/billing.js');
+
+test('the billing period is projected forward from the subscription start', () => {
+  const start = '2026-01-15T10:00:00Z';
+  const now = Date.parse('2026-09-20T00:00:00Z');
+  const p = billingPeriod(start, 'month', now);
+  // The 15th is the anchor, so the period in force on the 20th ends next month.
+  assert.equal(new Date(p.end).getDate(), 15);
+  assert.ok(p.end > now, 'the period end is in the future');
+  assert.ok(p.start <= now, 'the period has already started');
+  assert.ok(p.percentElapsed > 0 && p.percentElapsed < 100);
+});
+
+test('a subscription that starts on the 31st bills on short months too', () => {
+  // February has no 31st; billing lands on the last day rather than skipping.
+  const p = billingPeriod('2026-01-31T00:00:00Z', 'month', Date.parse('2026-02-10T00:00:00Z'));
+  const end = new Date(p.end);
+  assert.equal(end.getMonth(), 1, 'ends in February');
+  assert.equal(end.getDate(), 28, 'clamped to the last day of the month');
+});
+
+test('an annual cycle advances a year at a time', () => {
+  const p = billingPeriod('2024-03-05T00:00:00Z', 'year', Date.parse('2026-09-01T00:00:00Z'));
+  assert.equal(new Date(p.end).getFullYear(), 2027);
+  assert.equal(new Date(p.end).getMonth(), 2);
+});
+
+test('a period is always reported as an estimate', () => {
+  const p = billingPeriod('2026-01-15T10:00:00Z', 'month', Date.parse('2026-09-20T00:00:00Z'));
+  assert.equal(p.estimated, true);
+  assert.match(p.assumption, /projected from the subscription start/);
+});
+
+test('a missing or unparseable start date yields no period', () => {
+  assert.equal(billingPeriod(null), null);
+  assert.equal(billingPeriod('not a date'), null);
+});
+
+/* ------------------------------------------------- profile-based attribution */
+
+test('a session is attributed to whoever was signed into its profile', () => {
+  reset();
+  const t0 = Date.UTC(2026, 8, 1, 0, 0, 0);
+  addAccount('work');
+  addAccount('personal');
+  // Two profiles, each with its own signed-in account.
+  db().prepare(`INSERT INTO account_observations (ts, config_dir, account_uuid, source)
+                VALUES (?,?,?,'backup')`).run(t0, '/home/me/.claude-work', 'work');
+  db().prepare(`INSERT INTO account_observations (ts, config_dir, account_uuid, source)
+                VALUES (?,?,?,'backup')`).run(t0, '/home/me/.claude-personal', 'personal');
+
+  db().prepare(`INSERT INTO sessions (session_id, first_ts, last_ts, config_dir) VALUES (?,?,?,?)`)
+    .run('s-work', t0 + 5 * HOUR, t0 + 5 * HOUR, '/home/me/.claude-work');
+  db().prepare(`INSERT INTO sessions (session_id, first_ts, last_ts, config_dir) VALUES (?,?,?,?)`)
+    .run('s-personal', t0 + 5 * HOUR, t0 + 5 * HOUR, '/home/me/.claude-personal');
+
+  attributeSessions();
+  const w = db().prepare('SELECT account_uuid, account_source FROM sessions WHERE session_id = ?').get('s-work');
+  const p = db().prepare('SELECT account_uuid, account_source FROM sessions WHERE session_id = ?').get('s-personal');
+  assert.equal(w.account_uuid, 'work');
+  assert.equal(w.account_source, 'profile');
+  assert.equal(p.account_uuid, 'personal', 'concurrent profiles do not bleed into each other');
+});
+
+test('a profile that changed accounts attributes by date, not by latest', () => {
+  reset();
+  const t0 = Date.UTC(2026, 8, 1, 0, 0, 0);
+  const dir = '/home/me/.claude';
+  addAccount('old');
+  addAccount('new');
+  db().prepare(`INSERT INTO account_observations (ts, config_dir, account_uuid, source)
+                VALUES (?,?,?,'backup')`).run(t0, dir, 'old');
+  db().prepare(`INSERT INTO account_observations (ts, config_dir, account_uuid, source)
+                VALUES (?,?,?,'backup')`).run(t0 + 10 * HOUR, dir, 'new');
+
+  for (const [id, at] of [['before', t0 + 2 * HOUR], ['after', t0 + 20 * HOUR]]) {
+    db().prepare('INSERT INTO sessions (session_id, first_ts, last_ts, config_dir) VALUES (?,?,?,?)')
+      .run(id, at, at, dir);
+  }
+  attributeSessions();
+  assert.equal(db().prepare('SELECT account_uuid a FROM sessions WHERE session_id=?').get('before').a, 'old');
+  assert.equal(db().prepare('SELECT account_uuid a FROM sessions WHERE session_id=?').get('after').a, 'new');
+});

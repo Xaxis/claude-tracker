@@ -4,9 +4,10 @@ A local dashboard for people running Claude across several accounts, who keep
 hitting a limit without warning and having to work out which account still has
 room.
 
-It reads the transcripts Claude Code already writes to `~/.claude/projects`,
-reconstructs the 5-hour and 7-day rate-limit windows per account, and shows how
-full each one is right now — in the terminal, in the browser, or both at once.
+It reads the transcripts Claude Code already writes, across every config
+directory you use, reconstructs the 5-hour and 7-day rate-limit windows per
+account, and shows how full each one is right now — in the terminal, in the
+browser, or both at once. New accounts are picked up on their own.
 
 Everything stays on your machine. There are no dependencies, no API calls, and
 no network access beyond a loopback HTTP server you start yourself.
@@ -76,8 +77,8 @@ yarn verify
 Pass flags through with `--`: `yarn start --port 5000`, `npm start -- --port 5000`.
 
 Leaving it running is worth it beyond the dashboard: while it runs it samples
-which account is signed in, which is what makes attribution for new sessions
-exact instead of inferred.
+which account is signed into each profile, and notices new profiles appearing —
+so a newly added account starts being tracked without you doing anything.
 
 Both dashboards run in one process off a single file watcher, so the browser and
 the terminal never disagree and the transcripts are only scanned once.
@@ -101,49 +102,81 @@ turns and count against the same limits, and on a heavy install they can be most
 of the spend. A tracker that only reads top-level transcripts will understate
 usage badly.
 
+### Profiles — the thing that makes multi-account work
+
+Running several accounts on one machine means several *config directories*:
+`CLAUDE_CONFIG_DIR=~/.claude-work claude`, and so on. Each is a complete,
+independent Claude state tree with its own `projects/`, its own history, and its
+own signed-in account.
+
+That last part is the important one. **A config directory holds exactly one
+account at a time, so the directory a transcript lives under is the account that
+paid for it.** No inference required.
+
+`claude-tracker` discovers every profile at runtime — `~/.claude`, any
+`~/.claude-*` sibling, anything named in `CLAUDE_CONFIG_DIR`, and anything listed
+in `CLAUDE_TRACKER_EXTRA_DIRS` (colon-separated). Signing a new account into a
+new directory makes it appear on its own, with no configuration; the watcher
+re-scans while running, so a profile created after startup is picked up too. A
+profile nested inside another is skipped, so a kept copy of an old tree does not
+get scanned twice.
+
 ### Which account did what
 
-Nothing in a transcript names the account that paid for it, with one exception:
-sessions that used the Claude Code bridge record their owner outright. Everything
-else is reconstructed, and the source of each attribution is tracked:
+Attribution is recorded with its source, strongest first:
 
-- **bridge** — the transcript states the owner. Authoritative.
-- **observed** — the watcher saw who was signed in at that moment. While
-  `claude-tracker` is running it samples `~/.claude.json` continuously, so
-  attribution for new sessions is exact.
+- **bridge** — the transcript states the owner outright.
+- **profile** — the profile's account timeline at the moment the session started.
+  Each profile's config *and its rotating backups* form a dated record of who was
+  signed into it, so this dates old sessions too, and handles a profile that
+  changed accounts partway through.
+- **observed** — the watcher saw who was signed in at that moment.
 - **inferred** — the session sits between two moments that agree on the account.
 
-Two rules keep this honest. When the surrounding evidence disagrees, the session
-is left unattributed rather than guessed at, and the unattributed total is
-reported on the dashboard so you can see the size of the gap. And a session is
-never attributed to an account that the API had rate limited at that moment —
-hitting a limit is exactly when you switch accounts, which is exactly when naive
-inference would otherwise keep crediting the account you just left.
+Two rules keep it honest. When the evidence disagrees, the session is left
+unattributed rather than guessed at, and the unattributed total is shown on the
+dashboard so the size of the gap is visible. And a session is never attributed to
+an account the API had rate limited at that moment — hitting a limit is exactly
+when you switch accounts, which is exactly when naive inference would otherwise
+keep crediting the account you just left.
 
 Historical attribution is imperfect by nature; the further back you look, the
 more of it is inferred. It becomes exact from the moment you start running this.
 
+### Renewal dates
+
+Claude records when each subscription started, but never when it next renews, so
+the cycle is projected forward from the start date: same day of month, clamped to
+the last day in shorter months. The dashboards show the next renewal, how far
+through the period you are, and what you have used inside it.
+
+This is an estimate and is labelled as one. It assumes a monthly cycle, so an
+annual plan will read wrong, and it cannot see a plan that was cancelled, paused,
+or switched. The renewal date is only as good as the subscription start date on
+disk.
+
 ### Why some accounts show a UUID instead of an email
 
-Because an email address is usually not there to find. Claude records the
-account's address in only two places, and both describe whoever is signed in
-*at that moment*: `~/.claude.json`, which holds one account at a time, and a
-per-session context record that recent Claude Code versions attach to new
-sessions. Everything older identifies its account by UUID alone, so an account
-you have not signed into recently has no local name to recover.
+Usually they don't: each profile's config and its backups name the account
+signed into it, so most accounts resolve to an email on their own.
 
-Two things fix it. Signing into an account while the tracker is running names it
-permanently — the email is captured, tied to that UUID, and applied everywhere
-that account appears. Or name it yourself:
+One case still leaves a UUID. An account only appears by name where its own
+config still exists — if a profile was signed out and re-signed to a different
+account, and its backups have since rotated away, the older account's name is
+gone even though its transcripts remain. The same is true of an account used
+only through a profile you have deleted.
+
+Signing into that account again while the tracker is running names it
+permanently. Or name it yourself:
 
 ```sh
 claude-tracker accounts                       # shows the UUIDs
 claude-tracker label a1b2c3d4 "work account"  # a prefix is enough
 ```
 
-For the same reason, an account can be missing from the list entirely: accounts
-are discovered from local traces, so one that has not been used on this machine
-inside the retained transcript window leaves nothing to discover.
+An account can also be missing entirely: accounts are discovered from local
+traces, so one never used on this machine — or used only from a config directory
+that has since been deleted — leaves nothing to discover.
 
 ### The limit windows
 
@@ -198,11 +231,13 @@ itself the first time it hits a wall.
 - **Only what is on this machine is visible.** Usage from claude.ai, other
   devices, or other machines counts against the same limits but leaves no local
   trace, so a reading can understate.
+- **Renewal dates assume a monthly cycle** projected from the subscription start
+  date; see above.
 - **Transcripts are eventually cleaned up.** Windows that extend past the oldest
   retained transcript will read low.
-- **Concurrent accounts are assumed rare.** Attribution assumes one signed-in
-  account at a time per config directory, which is how the CLI works unless you
-  deliberately run separate `CLAUDE_CONFIG_DIR` profiles.
+- **One account per profile at a time.** That is how the CLI works, and it is
+  what makes profile attribution exact. Several profiles running at once is fine
+  and fully supported - each is tracked separately.
 
 ## Privacy
 
@@ -228,6 +263,7 @@ depend on your own usage history.
 | `src/accounts.js` | account discovery and attribution |
 | `src/windows.js` | rolling-window reconstruction |
 | `src/calibrate.js` | learns each plan's ceiling from observed limits |
+| `src/billing.js` | projects the subscription cycle from its start date |
 | `src/api.js` | aggregation for both dashboards |
 | `src/tui.js` | terminal dashboard |
 | `src/server.js` | HTTP API, static files, live updates |
