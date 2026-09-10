@@ -89,11 +89,11 @@ function extractUsage(msg) {
 const STMT = {};
 function prepare(d) {
   STMT.event ||= d.prepare(`
-    INSERT INTO events (uuid, ts, session_id, request_id, model, input_tokens, output_tokens,
+    INSERT INTO events (call_id, uuid, ts, session_id, request_id, model, input_tokens, output_tokens,
                         thinking_tokens, cache_write_5m, cache_write_1h, cache_read, web_search,
                         service_tier, speed, cost_usd, is_sidechain)
-    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-    ON CONFLICT(uuid) DO NOTHING`);
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+    ON CONFLICT(call_id) DO NOTHING`);
   STMT.limit ||= d.prepare(`
     INSERT INTO limit_events (ts, session_id, account_uuid, limit_type, resets_at, status, overage)
     VALUES (?,?,?,?,?,?,?)
@@ -194,13 +194,21 @@ function handleLine(line, ctx) {
   const total = u.input + u.output + u.cacheWrite5m + u.cacheWrite1h + u.cacheRead;
   if (total <= 0) return 0;
 
-  const uuid = d.uuid || `${d.requestId || 'r'}:${ts}:${msg.id || ''}`;
+  // Identify the API response, not the transcript line: a multi-block response
+  // is written as several lines that each repeat the same usage totals, and only
+  // one of them represents real spend. message.id names the response directly;
+  // requestId names the HTTP call that produced it; the line uuid is the last
+  // resort for records that carry neither.
+  const callId = msg.id || d.requestId || d.uuid || `${ts}:${model}`;
   const cost = costOf(model, u);
-  STMT.event.run(
-    uuid, ts, d.sessionId ?? null, d.requestId ?? null, model,
+  const res = STMT.event.run(
+    callId, d.uuid ?? null, ts, d.sessionId ?? null, d.requestId ?? null, model,
     u.input, u.output, u.thinking, u.cacheWrite5m, u.cacheWrite1h, u.cacheRead,
     u.webSearch, u.serviceTier, u.speed, cost, d.isSidechain ? 1 : 0,
   );
+  // A repeat of a response we already have contributes nothing; report only
+  // rows actually stored so the ingest count means what it says.
+  const stored = res.changes > 0 ? 1 : 0;
 
   if (d.sessionId) {
     STMT.sessMeta.run(
@@ -209,7 +217,7 @@ function handleLine(line, ctx) {
       ctx.configDir,
     );
   }
-  return 1;
+  return stored;
 }
 
 /**

@@ -171,7 +171,7 @@ export function sessions(limit = 40, accountUuid = null) {
     SELECT s.session_id, s.project, s.cwd, s.git_branch, s.first_ts, s.last_ts,
            s.account_uuid, s.account_source, s.version,
            COALESCE(SUM(e.cost_usd), 0) AS cost,
-           COUNT(e.uuid) AS events,
+           COUNT(e.call_id) AS events,
            COALESCE(SUM(e.input_tokens + e.output_tokens + e.cache_write_5m + e.cache_write_1h + e.cache_read), 0) AS tokens
       FROM sessions s LEFT JOIN events e ON e.session_id = s.session_id
       ${where}

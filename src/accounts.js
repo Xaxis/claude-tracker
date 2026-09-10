@@ -16,8 +16,8 @@ import { db, tx } from './db.js';
  * In order of authority:
  *
  *   1. bridge   - the transcript states the owner outright.
- *   2. profile  - the profile's account timeline at the session's start.
- *   3. observed - the live watcher recorded who was signed in at that moment.
+ *   2. email    - the session recorded the address it was signed in as.
+ *   3. profile  - the profile's account timeline at the session's start.
  *   4. inferred - the session sits between two anchors that agree.
  *
  * Sessions that remain ambiguous are left unattributed rather than guessed at,
@@ -219,20 +219,49 @@ export function attributeSessions() {
   const isBlocked = (account, t) =>
     (blocked.get(account) ?? []).some(([from, until]) => t >= from && t <= until);
 
-  // Per-profile timelines: who was signed into this config directory, and when.
-  const timelines = new Map();
+  /*
+   * Per-profile timelines: who was signed into this config directory, and when.
+   *
+   * Built from every dated piece of evidence, not just config snapshots. Those
+   * rotate away within hours, so on a first run they often cover only the last
+   * few minutes - and treating that as the whole history credits months of past
+   * usage to whoever signed in most recently. Sessions that state their own
+   * owner (a bridge record, or a recorded signed-in email) are dated evidence
+   * about the same profile, and they reach back as far as the transcripts do.
+   */
+  const points = [];
   for (const r of d.prepare(
-      'SELECT ts, config_dir, account_uuid FROM account_observations ORDER BY ts').all()) {
-    if (!r.config_dir) continue;
-    if (!timelines.has(r.config_dir)) timelines.set(r.config_dir, []);
-    const tl = timelines.get(r.config_dir);
+      'SELECT ts, config_dir, account_uuid FROM account_observations').all()) {
+    if (r.config_dir) points.push({ dir: r.config_dir, ts: r.ts, account: r.account_uuid });
+  }
+  for (const r of d.prepare(`
+      SELECT first_ts, last_ts, config_dir, account_uuid FROM sessions
+       WHERE config_dir IS NOT NULL AND account_uuid IS NOT NULL
+         AND account_source IN ('bridge', 'email') AND first_ts IS NOT NULL`).all()) {
+    points.push({ dir: r.config_dir, ts: r.first_ts, account: r.account_uuid });
+    if (r.last_ts) points.push({ dir: r.config_dir, ts: r.last_ts, account: r.account_uuid });
+  }
+
+  const timelines = new Map();
+  for (const p of points.sort((a, b) => a.ts - b.ts)) {
+    if (!timelines.has(p.dir)) timelines.set(p.dir, []);
+    const tl = timelines.get(p.dir);
     // Collapse runs: only the moments the account actually changed matter.
-    if (!tl.length || tl[tl.length - 1].account !== r.account_uuid) {
-      tl.push({ ts: r.ts, account: r.account_uuid });
+    if (!tl.length || tl[tl.length - 1].account !== p.account) {
+      tl.push({ ts: p.ts, account: p.account });
     }
   }
 
-  /** Which account was signed into `dir` at time `t`. */
+  /**
+   * Which account was signed into `dir` at time `t`.
+   *
+   * Crucially this does NOT extrapolate backwards past the earliest observation
+   * unless the profile has only ever held one account. Config backups rotate -
+   * a handful of recent snapshots is all that survives - so the earliest thing
+   * we can see may be an account that signed in long after the sessions being
+   * dated. Assuming it applies backwards silently credits months of history to
+   * whoever logged in most recently.
+   */
   const accountAt = (dir, t) => {
     const tl = timelines.get(dir);
     if (!tl?.length) return null;
@@ -241,10 +270,17 @@ export function attributeSessions() {
       if (entry.ts <= t) hit = entry.account;
       else break;
     }
-    // Before the first snapshot, the earliest known account is the best guess -
-    // a profile is normally created for one account and kept for it.
-    return hit ?? tl[0].account;
+    if (hit) return hit;
+    // Before the first snapshot: safe only if this profile has never held more
+    // than one account, in which case there is nothing to confuse it with.
+    const distinct = new Set(tl.map((e) => e.account));
+    return distinct.size === 1 ? tl[0].account : null;
   };
+
+  // A session that recorded the signed-in email names its own account outright.
+  const byEmail = new Map(
+    d.prepare('SELECT LOWER(email) e, account_uuid a FROM accounts WHERE email IS NOT NULL')
+      .all().map((r) => [r.e, r.a]));
 
   // Global anchors, for sessions whose profile has no timeline at all.
   const anchors = [];
@@ -268,16 +304,24 @@ export function attributeSessions() {
   };
 
   const pending = d.prepare(`
-    SELECT session_id, first_ts, config_dir FROM sessions
-    WHERE (account_uuid IS NULL OR account_source IN ('inferred', 'profile'))
+    SELECT session_id, first_ts, config_dir, user_email FROM sessions
+    WHERE (account_uuid IS NULL OR account_source IN ('inferred', 'profile', 'email'))
       AND first_ts IS NOT NULL`).all();
 
   const upd = d.prepare('UPDATE sessions SET account_uuid = ?, account_source = ? WHERE session_id = ?');
-  const counts = { profile: 0, inferred: 0, ambiguous: 0 };
+  const counts = { email: 0, profile: 0, inferred: 0, ambiguous: 0 };
 
   tx(() => {
     for (const s of pending) {
-      // The profile the session was recorded under names its account directly.
+      // The session recorded the address it was signed in as - unambiguous.
+      const fromEmail = s.user_email ? byEmail.get(s.user_email.toLowerCase()) : null;
+      if (fromEmail) {
+        upd.run(fromEmail, 'email', s.session_id);
+        counts.email++;
+        continue;
+      }
+
+      // Otherwise the profile the session was recorded under names its account.
       const fromProfile = s.config_dir ? accountAt(s.config_dir, s.first_ts) : null;
       if (fromProfile) {
         upd.run(fromProfile, 'profile', s.session_id);
