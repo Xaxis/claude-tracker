@@ -127,7 +127,7 @@ export function startTui({ webUrl, onQuit }) {
     accountIdx: 0,      // 0 = all accounts
     live: true,
     lastRefresh: Date.now(),
-    frameLines: 0,
+    error: null,
   };
 
   let data = { overview: null, live: [], models: [], windows: [] };
@@ -314,9 +314,12 @@ export function startTui({ webUrl, onQuit }) {
     const height = Math.max(12, out.rows || 24);
     const body = frame(width, height);
 
-    const footer = `  ${C.muted}q${C.reset} quit  ${C.muted}r${C.reset} refresh  ` +
-      `${C.muted}a${C.reset} account  ${C.muted}w${C.reset} window  ${C.muted}↑↓${C.reset} scroll` +
-      (state.live ? '' : `  ${C.warning}paused${C.reset}`);
+    const age = Math.round((Date.now() - state.lastRefresh) / 1000);
+    const footer = state.error
+      ? `  ${C.critical}refresh failed:${C.reset} ${state.error} ${C.muted}· showing data from ${age}s ago · r to retry${C.reset}`
+      : `  ${C.muted}q${C.reset} quit  ${C.muted}r${C.reset} refresh  ` +
+        `${C.muted}a${C.reset} account  ${C.muted}w${C.reset} window  ${C.muted}↑↓${C.reset} scroll` +
+        (state.live ? '' : `  ${C.warning}paused${C.reset}`);
 
     const viewH = height - 2;
     const maxScroll = Math.max(0, body.length - viewH);
@@ -331,8 +334,15 @@ export function startTui({ webUrl, onQuit }) {
   }
 
   function refreshAndRender() {
-    try { collect(); } catch { /* keep the last good frame */ }
-    state.lastRefresh = Date.now();
+    try {
+      collect();
+      state.error = null;
+      state.lastRefresh = Date.now();
+    } catch (err) {
+      // Keep the last good frame, but say so - silently serving stale numbers
+      // is worse than an ugly footer, because it looks like nothing changed.
+      state.error = err.message;
+    }
     render();
   }
 
@@ -398,6 +408,8 @@ export function startTui({ webUrl, onQuit }) {
   return {
     /** Called by the watcher when new usage lands. */
     update() { if (state.live) refreshAndRender(); },
+    /** Surface a background failure rather than quietly showing stale numbers. */
+    reportError(message) { state.error = message; render(); },
     stop: quit,
   };
 }

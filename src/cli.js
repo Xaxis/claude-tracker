@@ -1,5 +1,8 @@
 import { ingestAll } from './ingest.js';
-import { discoverAccounts, attributeSessions, attributeLimitEvents, listAccounts, accountLabel } from './accounts.js';
+import {
+  discoverAccounts, attributeSessions, attributeLimitEvents,
+  listAccounts, accountLabel, resolveAccountEmails, setLabel,
+} from './accounts.js';
 import { calibrateAll, verifyWindowModel } from './calibrate.js';
 import { overview, modelBreakdown, liveSessions } from './api.js';
 import { LIMIT_TYPES } from './windows.js';
@@ -50,6 +53,7 @@ async function refresh({ quiet = false, force = false } = {}) {
   if (!quiet && process.stdout.isTTY) process.stdout.write('\r\x1b[2K');
   attributeSessions();
   attributeLimitEvents();
+  resolveAccountEmails();
   calibrateAll();
   return { ...res, ms: Date.now() - t0 };
 }
@@ -96,15 +100,45 @@ function cmdStatus() {
 function cmdAccounts() {
   const rows = listAccounts();
   console.log();
+  let anonymous = 0;
   for (const a of rows) {
+    const named = a.label || a.email || a.display_name;
+    if (!named) anonymous++;
     console.log(`${c.bold}${accountLabel(a)}${c.reset}`);
     console.log(`  ${c.dim}uuid${c.reset}     ${a.account_uuid}`);
     if (a.org_name) console.log(`  ${c.dim}org${c.reset}      ${a.org_name}`);
     if (a.rate_limit_tier) console.log(`  ${c.dim}tier${c.reset}     ${a.rate_limit_tier}`);
     console.log(`  ${c.dim}sessions${c.reset} ${a.sessions}`);
+    if (!named) {
+      console.log(`  ${c.dim}name it${c.reset}  claude-tracker label ${a.account_uuid.slice(0, 8)} "some name"`);
+    }
     console.log();
   }
-  if (!rows.length) console.log(`  ${c.dim}none discovered${c.reset}\n`);
+  if (!rows.length) { console.log(`  ${c.dim}none discovered${c.reset}\n`); return; }
+  if (anonymous) {
+    console.log(`${c.dim}${anonymous} account${anonymous === 1 ? '' : 's'} without a name. Claude only records the`);
+    console.log(`email of the account signed in at the time, and only in recent versions —`);
+    console.log(`older sessions leave a UUID. Sign in to one and it names itself, or set`);
+    console.log(`a label by hand.${c.reset}\n`);
+  }
+}
+
+function cmdLabel(rest) {
+  const [prefix, ...words] = rest;
+  if (!prefix) {
+    console.error('usage: claude-tracker label <uuid-prefix> "display name"');
+    process.exitCode = 1;
+    return;
+  }
+  const uuid = setLabel(prefix, words.join(' '));
+  if (!uuid) {
+    console.error(`No account starts with "${prefix}". Run: claude-tracker accounts`);
+    process.exitCode = 1;
+    return;
+  }
+  console.log(words.length
+    ? `${c.green}✓${c.reset} ${uuid.slice(0, 8)}… is now "${words.join(' ')}"`
+    : `${c.green}✓${c.reset} cleared the label on ${uuid.slice(0, 8)}…`);
 }
 
 function cmdModels(days) {
@@ -147,6 +181,7 @@ ${c.bold}claude-tracker${c.reset} — local usage and rate-limit tracking for Cl
   ${c.bold}status${c.reset}                      one-shot limit status for every account
   ${c.bold}ingest${c.reset} [--force]            read new transcript data
   ${c.bold}accounts${c.reset}                    list discovered accounts
+  ${c.bold}label${c.reset} <uuid-prefix> <name>  give an account a readable name
   ${c.bold}models${c.reset} [--days N]           per-model usage breakdown
   ${c.bold}verify${c.reset}                      check the window model against observed resets
   ${c.bold}where${c.reset}                       print data locations
@@ -172,6 +207,13 @@ function parseArgs(argv) {
   return { flags, rest };
 }
 
+/**
+ * Commands that keep running after `serve()` resolves. Their database must stay
+ * open - a `return` inside the try below still runs the `finally`, so closing it
+ * there would pull the connection out from under a live dashboard.
+ */
+const LONG_RUNNING = new Set(['serve', 'dash', 'tui']);
+
 export async function runCli(argv) {
   const { flags, rest } = parseArgs(argv);
   const cmd = rest[0] ?? 'serve';
@@ -186,6 +228,7 @@ export async function runCli(argv) {
       }
       case 'status': await refresh({ quiet: true }); cmdStatus(); break;
       case 'accounts': await refresh({ quiet: true }); cmdAccounts(); break;
+      case 'label': cmdLabel(rest.slice(1)); break;
       case 'models': await refresh({ quiet: true }); cmdModels(Number(flags.days ?? 30)); break;
       case 'verify': await refresh({ quiet: true }); cmdVerify(); break;
       case 'where':
@@ -212,6 +255,6 @@ export async function runCli(argv) {
         process.exitCode = 1;
     }
   } finally {
-    if (cmd !== 'serve') closeDb();
+    if (!LONG_RUNNING.has(cmd)) closeDb();
   }
 }

@@ -4,6 +4,12 @@ import { DB_PATH, ensureDataDir } from './paths.js';
 const SCHEMA = `
 PRAGMA journal_mode = WAL;
 PRAGMA synchronous = NORMAL;
+-- Several instances are normal: a terminal dashboard in one window, a web one
+-- in another, plus one-shot status calls from a shell prompt. WAL lets them
+-- all read concurrently, but only one may write at a time - without a busy
+-- timeout the losers fail instantly with "database is locked" instead of
+-- waiting the few milliseconds an ingest batch actually takes.
+PRAGMA busy_timeout = 10000;
 
 -- Incremental ingest bookkeeping: how far into each transcript we have read.
 CREATE TABLE IF NOT EXISTS files (
@@ -108,6 +114,21 @@ CREATE TABLE IF NOT EXISTS meta (
 );
 `;
 
+/**
+ * Columns added after the first release. CREATE TABLE IF NOT EXISTS will not
+ * add a column to a table that already exists, so widen it explicitly.
+ */
+const MIGRATIONS = [
+  ['sessions', 'user_email', 'TEXT'],
+];
+
+function migrate(d) {
+  for (const [table, column, type] of MIGRATIONS) {
+    const cols = d.prepare(`PRAGMA table_info(${table})`).all().map((c) => c.name);
+    if (!cols.includes(column)) d.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${type}`);
+  }
+}
+
 let _db = null;
 
 export function db() {
@@ -115,6 +136,7 @@ export function db() {
   ensureDataDir();
   _db = new DatabaseSync(DB_PATH);
   _db.exec(SCHEMA);
+  migrate(_db);
   return _db;
 }
 

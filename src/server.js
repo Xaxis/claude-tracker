@@ -137,8 +137,10 @@ export async function serve({ port = 4785, open = false, refresh, tui = true, we
         if (web) broadcast('update', { reason: info.reason, at: Date.now() });
         ui?.update();
       } catch (err) {
-        // With the TUI owning the screen, a stray write would corrupt the frame.
-        if (!ui) console.error('refresh failed:', err.message);
+        // The TUI owns the screen, so a stray write would corrupt the frame -
+        // hand it the message to show in its footer instead of dropping it.
+        if (ui) ui.reportError(err.message);
+        else console.error('refresh failed:', err.message);
       }
     },
   });
