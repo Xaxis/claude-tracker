@@ -20,9 +20,16 @@ CREATE TABLE IF NOT EXISTS files (
   scanned_at INTEGER NOT NULL DEFAULT 0
 );
 
--- One row per billed assistant response.
+-- One row per billed API response.
+--
+-- The key is the response's own id, NOT the transcript line's uuid. Claude Code
+-- writes one JSONL line per content block, so a single response with 40 tool
+-- calls lands as 40 lines - each repeating the *same* usage totals. Keying on
+-- the line would count that response 40 times; keying on the response counts it
+-- once, which is what was actually billed.
 CREATE TABLE IF NOT EXISTS events (
-  uuid            TEXT PRIMARY KEY,
+  call_id         TEXT PRIMARY KEY,
+  uuid            TEXT,
   ts              INTEGER NOT NULL,
   session_id      TEXT,
   request_id      TEXT,
@@ -131,11 +138,16 @@ CREATE TABLE IF NOT EXISTS meta (
  * and more trustworthy than migrating - a full rescan takes about half a minute.
  * Only genuinely user-authored state is carried across (currently: labels).
  */
-const SCHEMA_VERSION = 3;
+const SCHEMA_VERSION = 5;
 
 const DERIVED_TABLES = [
-  'files', 'events', 'sessions', 'limit_events', 'account_observations', 'calibration', 'accounts',
+  'files', 'events', 'sessions', 'limit_events', 'calibration', 'accounts',
 ];
+
+// Account sightings are NOT derived: each comes from a config snapshot that
+// rotates away within hours. Once lost they cannot be recovered from anything on
+// disk, so they survive a rebuild.
+const PRESERVED_TABLES = ['account_observations'];
 
 function ensureSchema(d) {
   // The version has to be read before the schema is applied: an old table plus
@@ -158,8 +170,18 @@ function ensureSchema(d) {
     labels = d.prepare('SELECT account_uuid, label FROM accounts WHERE label IS NOT NULL').all();
   } catch { /* table predates labels */ }
 
+  let observations = [];
+  try {
+    observations = d.prepare('SELECT ts, config_dir, account_uuid, email, source FROM account_observations').all();
+  } catch { /* table predates per-profile observations */ }
+
   for (const t of DERIVED_TABLES) d.exec(`DROP TABLE IF EXISTS ${t}`);
   d.exec(SCHEMA);
+  for (const o of observations) {
+    d.prepare(`INSERT INTO account_observations (ts, config_dir, account_uuid, email, source)
+               VALUES (?,?,?,?,?) ON CONFLICT(ts, config_dir) DO NOTHING`)
+      .run(o.ts, o.config_dir ?? '', o.account_uuid, o.email, o.source);
+  }
   for (const l of labels) {
     d.prepare(`INSERT INTO accounts (account_uuid, label) VALUES (?, ?)
                ON CONFLICT(account_uuid) DO UPDATE SET label = excluded.label`)

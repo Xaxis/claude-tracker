@@ -143,6 +143,30 @@ keep crediting the account you just left.
 Historical attribution is imperfect by nature; the further back you look, the
 more of it is inferred. It becomes exact from the moment you start running this.
 
+### What the dollar figures mean
+
+They are **not your bill.** On a subscription you are not billed per token, and
+these numbers are usually many times what you actually pay — that is the point of
+the plan.
+
+Different models draw down quota at very different rates, so usage is normalised
+to a common unit before being summed: what the same tokens would cost at list API
+prices. `$317` means "as much quota as $317 of pay-as-you-go API usage would
+consume." It is the unit the rate-limit maths runs in, and it is what makes an
+Opus call and a Haiku call comparable.
+
+Two things dominate the total and surprise people: **cache reads**, which are
+cheap per token but enormous in volume (a long agentic session re-reads its whole
+context on every turn), and **subagent and workflow turns**, which are billed like
+any other call.
+
+The arithmetic is checked against Claude Code's own per-session cost accounting:
+on single-run sessions the two agree to within about 4%. They diverge on sessions
+that were resumed, because Claude Code's counter resets on resume and only covers
+the final run — a 26-day session in this repo's own data reports 40 minutes of API
+time against 13,406 calls. Where they disagree that way, the figure here is the
+more complete one.
+
 ### Renewal dates
 
 Claude records when each subscription started, but never when it next renews, so

@@ -31,7 +31,7 @@ function reset() {
 
 let seq = 0;
 function addEvent(sessionId, ts, cost) {
-  db().prepare(`INSERT INTO events (uuid, ts, session_id, model, cost_usd) VALUES (?,?,?,?,?)`)
+  db().prepare(`INSERT INTO events (call_id, ts, session_id, model, cost_usd) VALUES (?,?,?,?,?)`)
     .run(`e${seq++}`, ts, sessionId, 'claude-opus-5', cost);
 }
 function addSession(sessionId, firstTs, account, source = 'bridge') {
@@ -317,4 +317,60 @@ test('a profile that changed accounts attributes by date, not by latest', () => 
   attributeSessions();
   assert.equal(db().prepare('SELECT account_uuid a FROM sessions WHERE session_id=?').get('before').a, 'old');
   assert.equal(db().prepare('SELECT account_uuid a FROM sessions WHERE session_id=?').get('after').a, 'new');
+});
+
+/* ------------------------------------------------- one response, one charge */
+
+test('a multi-block response is billed once, not once per content block', async () => {
+  reset();
+  // Claude Code writes one JSONL line per content block, each repeating the
+  // SAME usage totals. Counting per line inflated real usage by ~2x overall.
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ct-profile-'));
+  const proj = path.join(root, 'projects', '-tmp-demo');
+  fs.mkdirSync(proj, { recursive: true });
+  fs.writeFileSync(path.join(root, 'settings.json'), '{}');
+
+  const usage = {
+    input_tokens: 100, output_tokens: 2000, cache_read_input_tokens: 500_000,
+    cache_creation: { ephemeral_5m_input_tokens: 0, ephemeral_1h_input_tokens: 0 },
+  };
+  const blocks = ['text', 'tool_use', 'tool_use', 'thinking'];
+  const lines = blocks.map((b, i) => JSON.stringify({
+    type: 'assistant', uuid: `line-${i}`, timestamp: '2026-09-01T10:00:00.000Z',
+    sessionId: 'sess-1', requestId: 'req_same', cwd: '/tmp/demo',
+    message: { id: 'msg_same', model: 'claude-opus-5', content: [{ type: b }], usage },
+  }));
+  fs.writeFileSync(path.join(proj, 'sess-1.jsonl'), lines.join('\n') + '\n');
+
+  const { ingestAll } = await import('../src/ingest.js');
+  await ingestAll({ profiles: [{ dir: root, name: 'demo', projectsDir: path.join(root, 'projects') }] });
+
+  const row = db().prepare('SELECT COUNT(*) n, SUM(cache_read) cr FROM events').get();
+  assert.equal(row.n, 1, `${blocks.length} lines are one API response`);
+  assert.equal(row.cr, 500_000, 'usage counted once, not multiplied by block count');
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test('history is never attributed backwards to a newly signed-in account', () => {
+  reset();
+  const dir = '/home/me/.claude';
+  const july = Date.UTC(2026, 6, 1);
+  const today = Date.UTC(2026, 8, 10, 10, 0);
+  addAccount('old-account');
+  addAccount('just-logged-in');
+
+  // Config backups rotate, so the only snapshot left is from minutes ago.
+  db().prepare(`INSERT INTO account_observations (ts, config_dir, account_uuid, source)
+                VALUES (?,?,?,'backup')`).run(today, dir, 'just-logged-in');
+  // But a bridge-attributed session proves who was using the profile in July.
+  db().prepare(`INSERT INTO sessions (session_id, first_ts, last_ts, config_dir, account_uuid, account_source)
+                VALUES (?,?,?,?,?, 'bridge')`).run('known', july, july, dir, 'old-account');
+  // The session under test predates the surviving snapshot.
+  db().prepare('INSERT INTO sessions (session_id, first_ts, last_ts, config_dir) VALUES (?,?,?,?)')
+    .run('old-work', july + HOUR, july + HOUR, dir);
+
+  attributeSessions();
+  const got = db().prepare('SELECT account_uuid a FROM sessions WHERE session_id=?').get('old-work').a;
+  assert.notEqual(got, 'just-logged-in', 'July usage must not land on an account that appeared in September');
+  assert.equal(got, 'old-account');
 });
