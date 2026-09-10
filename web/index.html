@@ -1,0 +1,126 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Claude Tracker</title>
+<link rel="stylesheet" href="/style.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📊</text></svg>">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">
+    <span class="brand-mark" aria-hidden="true"></span>
+    <h1>Claude Tracker</h1>
+  </div>
+  <div class="topbar-right">
+    <span class="live" id="live-state" title="Live connection status">
+      <span class="live-dot" aria-hidden="true"></span>
+      <span id="live-label">connecting…</span>
+    </span>
+    <button id="theme-toggle" class="ghost-btn" type="button" aria-label="Switch colour theme">
+      <span id="theme-label">Auto</span>
+    </button>
+  </div>
+</header>
+
+<main>
+  <!-- Hero: the one thing you opened this page to find out. -->
+  <section class="hero" id="hero" hidden>
+    <div class="hero-body">
+      <p class="hero-label" id="hero-label">Session limit</p>
+      <p class="hero-figure" id="hero-figure">—</p>
+      <p class="hero-sub" id="hero-sub"></p>
+    </div>
+    <div class="hero-meter">
+      <div class="meter" id="hero-meter"></div>
+    </div>
+  </section>
+
+  <section class="panel">
+    <div class="panel-head">
+      <h2>Accounts</h2>
+      <p class="panel-note" id="accounts-note"></p>
+    </div>
+    <div class="account-grid" id="accounts"></div>
+  </section>
+
+  <section class="panel">
+    <div class="panel-head">
+      <h2>Daily usage</h2>
+      <div class="controls">
+        <label class="field">
+          <span>Account</span>
+          <select id="filter-account"><option value="all">All accounts</option></select>
+        </label>
+        <label class="field">
+          <span>Range</span>
+          <select id="filter-days">
+            <option value="7">Last 7 days</option>
+            <option value="14">Last 14 days</option>
+            <option value="30" selected>Last 30 days</option>
+            <option value="90">Last 90 days</option>
+          </select>
+        </label>
+        <button class="ghost-btn" id="toggle-table" type="button" aria-pressed="false">Table</button>
+      </div>
+    </div>
+    <div class="legend" id="daily-legend"></div>
+    <div class="chart-wrap">
+      <div id="daily-chart" class="chart" role="img" aria-label="Daily usage by model"></div>
+    </div>
+    <div id="daily-table" class="table-wrap" hidden></div>
+  </section>
+
+  <div class="panel-row">
+    <section class="panel">
+      <div class="panel-head">
+        <h2>Window history</h2>
+        <div class="controls">
+          <label class="field">
+            <span>Limit</span>
+            <select id="window-type">
+              <option value="five_hour">Session (5h)</option>
+              <option value="seven_day">Weekly (7d)</option>
+            </select>
+          </label>
+        </div>
+      </div>
+      <p class="panel-note">How full each recent window got for <strong id="window-for">—</strong>, newest last.</p>
+      <div class="chart-wrap">
+        <div id="window-chart" class="chart" role="img" aria-label="Recent limit windows"></div>
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-head"><h2>By model</h2></div>
+      <div id="model-list" class="model-list"></div>
+    </section>
+  </div>
+
+  <div class="panel-row">
+    <section class="panel">
+      <div class="panel-head">
+        <h2>Running now</h2>
+        <p class="panel-note" id="live-count"></p>
+      </div>
+      <div id="live-sessions" class="session-list"></div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-head"><h2>Recent sessions</h2></div>
+      <div id="sessions" class="session-list"></div>
+    </section>
+  </div>
+
+  <footer class="foot">
+    <p id="foot-note"></p>
+  </footer>
+</main>
+
+<div class="tooltip" id="tooltip" role="tooltip" aria-hidden="true"></div>
+
+<script type="module" src="/app.js"></script>
+</body>
+</html>

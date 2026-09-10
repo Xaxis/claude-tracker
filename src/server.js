@@ -1,0 +1,169 @@
+import http from 'node:http';
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { exec } from 'node:child_process';
+import { overview, history, sessions, modelBreakdown, liveSessions, windowHistory } from './api.js';
+import { verifyWindowModel } from './calibrate.js';
+import { startWatcher } from './watcher.js';
+import { listAccounts } from './accounts.js';
+
+const WEB_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'web');
+
+const MIME = {
+  '.html': 'text/html; charset=utf-8',
+  '.css': 'text/css; charset=utf-8',
+  '.js': 'text/javascript; charset=utf-8',
+  '.svg': 'image/svg+xml',
+  '.json': 'application/json; charset=utf-8',
+};
+
+const clients = new Set();
+
+function sendJson(res, body, status = 200) {
+  const s = JSON.stringify(body);
+  res.writeHead(status, {
+    'content-type': 'application/json; charset=utf-8',
+    'cache-control': 'no-store',
+    'content-length': Buffer.byteLength(s),
+  });
+  res.end(s);
+}
+
+/** Push an event to every connected dashboard. */
+export function broadcast(event, data) {
+  const payload = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
+  for (const res of clients) {
+    try { res.write(payload); } catch { clients.delete(res); }
+  }
+}
+
+function serveStatic(req, res, urlPath) {
+  const rel = urlPath === '/' ? 'index.html' : urlPath.replace(/^\/+/, '');
+  // Resolve and confirm the result stays inside web/ - no traversal out of it.
+  const full = path.resolve(WEB_DIR, rel);
+  if (full !== WEB_DIR && !full.startsWith(WEB_DIR + path.sep)) {
+    res.writeHead(403).end('Forbidden');
+    return;
+  }
+  fs.readFile(full, (err, buf) => {
+    if (err) { res.writeHead(404, { 'content-type': 'text/plain' }).end('Not found'); return; }
+    res.writeHead(200, {
+      'content-type': MIME[path.extname(full)] ?? 'application/octet-stream',
+      'cache-control': 'no-cache',
+    });
+    res.end(buf);
+  });
+}
+
+function handleApi(req, res, url) {
+  const q = url.searchParams;
+  const account = q.get('account') || null;
+  const days = Math.min(365, Math.max(1, Number(q.get('days') ?? 30)));
+
+  switch (url.pathname) {
+    case '/api/overview': return sendJson(res, overview());
+    case '/api/history': return sendJson(res, history(days, account));
+    case '/api/sessions': return sendJson(res, sessions(Math.min(200, Number(q.get('limit') ?? 40)), account));
+    case '/api/models': return sendJson(res, modelBreakdown(days, account));
+    case '/api/live': return sendJson(res, liveSessions());
+    case '/api/accounts': return sendJson(res, listAccounts());
+    case '/api/verify': return sendJson(res, verifyWindowModel());
+    case '/api/windows':
+      if (!account) return sendJson(res, { error: 'account required' }, 400);
+      return sendJson(res, windowHistory(account, q.get('type') ?? 'five_hour', Math.min(60, Number(q.get('count') ?? 14))));
+    default:
+      return sendJson(res, { error: 'not found' }, 404);
+  }
+}
+
+function handleEvents(req, res) {
+  res.writeHead(200, {
+    'content-type': 'text/event-stream',
+    'cache-control': 'no-cache',
+    connection: 'keep-alive',
+  });
+  res.write('retry: 2000\n\n');
+  clients.add(res);
+  // Keep intermediaries and idle sockets from dropping the stream.
+  const ping = setInterval(() => { try { res.write(': ping\n\n'); } catch { /* closed */ } }, 25000);
+  req.on('close', () => { clearInterval(ping); clients.delete(res); });
+}
+
+/**
+ * Run the tracker: an HTTP dashboard, a terminal dashboard, or both.
+ *
+ * Both surfaces live in one process and share a single watcher, so the browser
+ * and the terminal always show the same numbers and the transcripts are only
+ * scanned once no matter how many views are open.
+ */
+export async function serve({ port = 4785, open = false, refresh, tui = true, web = true }) {
+  // Bring the database current before accepting requests.
+  await refresh({ quiet: true });
+
+  const server = http.createServer((req, res) => {
+    let url;
+    try { url = new URL(req.url, `http://${req.headers.host ?? 'localhost'}`); }
+    catch { res.writeHead(400).end('Bad request'); return; }
+
+    // A failing query must surface as a 500, never take the server down with it.
+    try {
+      if (url.pathname === '/events') return handleEvents(req, res);
+      if (url.pathname.startsWith('/api/')) return handleApi(req, res, url);
+      return serveStatic(req, res, url.pathname);
+    } catch (err) {
+      console.error(`${url.pathname}:`, err.message);
+      if (!res.headersSent) return sendJson(res, { error: err.message }, 500);
+      return res.end();
+    }
+  });
+
+  let addr = null;
+  if (web) {
+    // Bind to loopback only: this exposes local usage history and should never
+    // be reachable from the network.
+    await new Promise((resolve, reject) => {
+      server.once('error', reject);
+      server.listen(port, '127.0.0.1', resolve);
+    });
+    addr = `http://127.0.0.1:${port}`;
+  }
+
+  let ui = null;
+  const stopWatching = startWatcher({
+    onChange: async (info) => {
+      try {
+        await refresh({ quiet: true });
+        if (web) broadcast('update', { reason: info.reason, at: Date.now() });
+        ui?.update();
+      } catch (err) {
+        // With the TUI owning the screen, a stray write would corrupt the frame.
+        if (!ui) console.error('refresh failed:', err.message);
+      }
+    },
+  });
+
+  let closing = false;
+  const shutdown = () => {
+    if (closing) return;
+    closing = true;
+    stopWatching();
+    ui?.stop();
+    for (const c of clients) { try { c.end(); } catch { /* already gone */ } }
+    if (web) server.close(() => process.exit(0));
+    else process.exit(0);
+    // Don't hang on a wedged keep-alive socket.
+    setTimeout(() => process.exit(0), 1500).unref();
+  };
+  process.on('SIGINT', shutdown);
+  process.on('SIGTERM', shutdown);
+
+  if (open && addr) exec(`open ${addr}`);
+
+  if (tui) {
+    const { startTui } = await import('./tui.js');
+    ui = startTui({ webUrl: addr ?? 'web dashboard off', onQuit: shutdown });
+  } else if (web) {
+    console.log(`\n  claude-tracker  →  ${addr}\n  watching for new usage… (ctrl-c to stop)\n`);
+  }
+}
