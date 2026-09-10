@@ -113,6 +113,9 @@ function prepare(d) {
   STMT.cost ||= d.prepare(`
     INSERT INTO sessions (session_id, reported_cost) VALUES (?, ?)
     ON CONFLICT(session_id) DO UPDATE SET reported_cost = excluded.reported_cost`);
+  STMT.sessEmail ||= d.prepare(`
+    INSERT INTO sessions (session_id, user_email) VALUES (?, ?)
+    ON CONFLICT(session_id) DO UPDATE SET user_email = excluded.user_email`);
   STMT.acctSeen ||= d.prepare(`
     INSERT INTO accounts (account_uuid, org_uuid, first_seen, last_seen)
     VALUES (?,?,?,?)
@@ -140,6 +143,19 @@ function handleLine(line, ctx) {
     if (d.sessionId && d.ownerAccountUuid) {
       STMT.bridge.run(d.sessionId, d.ownerAccountUuid);
       STMT.acctSeen.run(d.ownerAccountUuid, d.ownerOrganizationUuid ?? null, ctx.now, ctx.now);
+    }
+    return 0;
+  }
+
+  // Recent Claude Code versions inject the signed-in user's email into each
+  // session's context. That is the only place a transcript names the account in
+  // human terms, so it is what lets an account show up as an address instead of
+  // a bare UUID. Older sessions predate it and stay anonymous.
+  if (type === 'attachment' && d.attachment?.type === 'session_context') {
+    const raw = d.attachment.context?.userEmail;
+    if (raw && d.sessionId) {
+      const m = /email address is\s+([^\s,;]+@[^\s,;]+?)[.,;]?(?:\s|$)/i.exec(String(raw));
+      if (m) STMT.sessEmail.run(d.sessionId, m[1]);
     }
     return 0;
   }

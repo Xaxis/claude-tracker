@@ -235,6 +235,45 @@ export function attributeSessions() {
   return { inferred, ambiguous, anchors: anchors.length };
 }
 
+/**
+ * Give accounts a human name wherever a session recorded one.
+ *
+ * Sessions that captured the signed-in email are joined back to their account,
+ * so an account named in any one session stops being a bare UUID everywhere.
+ * Only bridge-attributed sessions are trusted here - naming an account from an
+ * inferred session would let one bad guess mislabel it permanently.
+ */
+export function resolveAccountEmails() {
+  const rows = db().prepare(`
+    SELECT s.account_uuid, s.user_email, COUNT(*) AS n
+      FROM sessions s
+     WHERE s.user_email IS NOT NULL AND s.account_uuid IS NOT NULL
+       AND s.account_source = 'bridge'
+     GROUP BY s.account_uuid, s.user_email
+     ORDER BY n DESC`).all();
+
+  const claimed = new Set();
+  let named = 0;
+  for (const r of rows) {
+    if (claimed.has(r.account_uuid)) continue;   // keep the best-supported name
+    claimed.add(r.account_uuid);
+    db().prepare(`UPDATE accounts SET email = COALESCE(email, ?) WHERE account_uuid = ?`)
+      .run(r.user_email, r.account_uuid);
+    named++;
+  }
+  return { named };
+}
+
+/** Set a manual display name for an account. Accepts a UUID prefix. */
+export function setLabel(prefix, label) {
+  const row = db().prepare(
+    'SELECT account_uuid FROM accounts WHERE account_uuid LIKE ? || \'%\'').get(prefix);
+  if (!row) return null;
+  db().prepare('UPDATE accounts SET label = ? WHERE account_uuid = ?')
+    .run(label || null, row.account_uuid);
+  return row.account_uuid;
+}
+
 /** Copy session-level attribution onto limit events, which arrive without one. */
 export function attributeLimitEvents() {
   db().exec(`

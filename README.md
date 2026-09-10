@@ -60,6 +60,8 @@ Run it from any directory once linked:
 | `claude-tracker status` | one-shot summary — fine for a shell prompt |
 | `claude-tracker models --days 7` | where the spend went |
 | `claude-tracker verify` | check the window model against your own resets |
+| `claude-tracker accounts` | list accounts and their UUIDs |
+| `claude-tracker label a1b2c3d4 "work"` | name an account by UUID prefix |
 
 Or from inside the repo, without linking — `yarn` and `npm run` both work:
 
@@ -120,6 +122,28 @@ inference would otherwise keep crediting the account you just left.
 
 Historical attribution is imperfect by nature; the further back you look, the
 more of it is inferred. It becomes exact from the moment you start running this.
+
+### Why some accounts show a UUID instead of an email
+
+Because an email address is usually not there to find. Claude records the
+account's address in only two places, and both describe whoever is signed in
+*at that moment*: `~/.claude.json`, which holds one account at a time, and a
+per-session context record that recent Claude Code versions attach to new
+sessions. Everything older identifies its account by UUID alone, so an account
+you have not signed into recently has no local name to recover.
+
+Two things fix it. Signing into an account while the tracker is running names it
+permanently — the email is captured, tied to that UUID, and applied everywhere
+that account appears. Or name it yourself:
+
+```sh
+claude-tracker accounts                       # shows the UUIDs
+claude-tracker label a1b2c3d4 "work account"  # a prefix is enough
+```
+
+For the same reason, an account can be missing from the list entirely: accounts
+are discovered from local traces, so one that has not been used on this machine
+inside the retained transcript window leaves nothing to discover.
 
 ### The limit windows
 
