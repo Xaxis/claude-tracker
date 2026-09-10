@@ -7,9 +7,15 @@
     "claude-tracker": "./bin/cli.js"
   },
   "scripts": {
-    "start": "node bin/cli.js serve",
-    "ingest": "node bin/cli.js ingest",
+    "start": "node bin/cli.js serve --open",
+    "serve": "node bin/cli.js serve",
+    "tui": "node bin/cli.js tui",
+    "web": "node bin/cli.js serve --no-tui --open",
     "status": "node bin/cli.js status",
+    "ingest": "node bin/cli.js ingest",
+    "models": "node bin/cli.js models",
+    "accounts": "node bin/cli.js accounts",
+    "verify": "node bin/cli.js verify",
     "test": "node --test"
   },
   "engines": {
