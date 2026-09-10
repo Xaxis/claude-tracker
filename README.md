@@ -30,31 +30,52 @@ no network access beyond a loopback HTTP server you start yourself.
 
 ## Install
 
-Node 22.5 or newer. Nothing else.
+Node 22.5 or newer. No dependencies to install.
 
 ```sh
 git clone https://github.com/Xaxis/claude-tracker
 cd claude-tracker
-node bin/cli.js serve
+npm link          # puts `claude-tracker` on your PATH
 ```
 
-Optionally link it so it is on your `PATH`:
+Then, from anywhere:
 
 ```sh
-npm link          # then just: claude-tracker
+claude-tracker
 ```
+
+That is the whole thing: terminal dashboard and web dashboard, together.
+(`npm unlink -g claude-tracker` undoes it.)
 
 ## Use
 
+Run it from any directory once linked:
+
+| Command | What you get |
+|---|---|
+| `claude-tracker` | terminal + web dashboard together |
+| `claude-tracker --open` | ...and opens the browser |
+| `claude-tracker tui` | terminal only, no HTTP server |
+| `claude-tracker serve --no-tui` | web only, good for leaving running |
+| `claude-tracker status` | one-shot summary — fine for a shell prompt |
+| `claude-tracker models --days 7` | where the spend went |
+| `claude-tracker verify` | check the window model against your own resets |
+
+Or from inside the repo, without linking — `yarn` and `npm run` both work:
+
 ```sh
-claude-tracker                 # terminal dashboard + web dashboard together
-claude-tracker serve --open    # ...and open the browser for you
-claude-tracker serve --no-tui  # web only (for running in the background)
-claude-tracker tui             # terminal only, no HTTP server
-claude-tracker status          # one-shot summary, good for a shell prompt
-claude-tracker models --days 7 # what the spend went to
-claude-tracker verify          # check the window model against reality
+yarn start        # dashboards + open the browser
+yarn tui          # terminal only
+yarn web          # web only
+yarn status       # one-shot summary
+yarn verify
 ```
+
+Pass flags through with `--`: `yarn start --port 5000`, `npm start -- --port 5000`.
+
+Leaving it running is worth it beyond the dashboard: while it runs it samples
+which account is signed in, which is what makes attribution for new sessions
+exact instead of inferred.
 
 Both dashboards run in one process off a single file watcher, so the browser and
 the terminal never disagree and the transcripts are only scanned once.
