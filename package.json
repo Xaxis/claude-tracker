@@ -1,0 +1,27 @@
+{
+  "name": "claude-tracker",
+  "version": "1.0.0",
+  "description": "Local dashboard that tracks Claude usage, sessions, and rate-limit windows across multiple accounts.",
+  "type": "module",
+  "bin": {
+    "claude-tracker": "./bin/cli.js"
+  },
+  "scripts": {
+    "start": "node bin/cli.js serve",
+    "ingest": "node bin/cli.js ingest",
+    "status": "node bin/cli.js status",
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=22.5.0"
+  },
+  "keywords": [
+    "claude",
+    "claude-code",
+    "usage",
+    "rate-limit",
+    "dashboard"
+  ],
+  "license": "MIT",
+  "dependencies": {}
+}
