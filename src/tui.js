@@ -233,10 +233,16 @@ export function startTui({ webUrl, onQuit }) {
         L.push([
           `    ${C.muted}${padEnd(l.label, LABEL)}${C.reset}`,
           meterBar(l.percent, barW, sev.color),
-          `${sev.color}${String(Math.round(l.percent)).padStart(3)}%${C.reset}`,
+          `${sev.color}${String(Math.round(l.percent)).padStart(3)}%${C.reset}${l.confidence === 'measured' ? ' ' : `${C.muted}≈${C.reset}`}`,
           showWhen ? `${C.muted}${padEnd(when, whenW)}${C.reset}` : '',
           `${sev.color}${sev.word}${C.reset}`,
         ].filter(Boolean).join(' '));
+      }
+
+      if (a.billing) {
+        const when = new Date(a.billing.end).toLocaleDateString([], { month: 'short', day: 'numeric' });
+        L.push(`    ${C.muted}${padEnd('Renews', 14)} ${when} · in ${duration(a.billing.renewsInMs)} ` +
+          `· ${money(a.billing.spend.cost)} used this period ${C.muted}(est)${C.reset}`);
       }
 
       const NOTE = {

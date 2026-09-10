@@ -1,30 +1,34 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
-import { CLAUDE_JSON, BACKUPS_DIR } from './paths.js';
+import { discoverProfiles } from './paths.js';
 import { db, tx } from './db.js';
 
 /**
  * Account identity and attribution.
  *
- * Nothing in a transcript names the account that paid for it, except
- * `bridge-session` records. Everything else has to be reconstructed:
+ * The strongest signal is the profile a session was recorded under. A Claude
+ * config directory holds exactly one signed-in account at a time, so the
+ * directory a transcript lives in names its owner - no inference needed. Each
+ * profile's config and its rotating backups give a dated timeline of which
+ * account was signed into it, which dates older sessions too.
  *
- *   1. bridge   - the transcript states the owner outright. Authoritative.
- *   2. observed - the live watcher recorded who was signed in at that moment.
- *   3. inferred - the session sits between two anchors that agree on the account.
+ * In order of authority:
  *
- * Sessions that fall between anchors that disagree are left unattributed rather
- * than guessed at, so the dashboard can show honestly how much is unaccounted.
+ *   1. bridge   - the transcript states the owner outright.
+ *   2. profile  - the profile's account timeline at the session's start.
+ *   3. observed - the live watcher recorded who was signed in at that moment.
+ *   4. inferred - the session sits between two anchors that agree.
+ *
+ * Sessions that remain ambiguous are left unattributed rather than guessed at,
+ * so the dashboard can show honestly how much is unaccounted for.
  */
 
 function readJson(file) {
   try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return null; }
 }
 
-/** The account currently signed in, per ~/.claude.json. */
-export function currentAccount() {
-  const cfg = readJson(CLAUDE_JSON);
+function accountFromConfig(cfg, configDir = null) {
   const o = cfg?.oauthAccount;
   if (!o?.accountUuid) return null;
   return {
@@ -35,7 +39,26 @@ export function currentAccount() {
     orgName: o.organizationName ?? null,
     rateLimitTier: o.organizationRateLimitTier ?? o.userRateLimitTier ?? null,
     orgType: o.organizationType ?? null,
+    billingType: o.billingType ?? null,
+    subscriptionAt: o.subscriptionCreatedAt ?? o.accountCreatedAt ?? null,
+    configDir,
   };
+}
+
+/** The account signed into a profile right now. */
+export function profileAccount(profile) {
+  if (!profile?.configFile) return null;
+  return accountFromConfig(readJson(profile.configFile), profile.dir);
+}
+
+/**
+ * The account signed into the default profile right now - "who am I" for the
+ * status line. With several profiles this is only one of them.
+ */
+export function currentAccount() {
+  const profiles = discoverProfiles();
+  const def = profiles.find((p) => p.isDefault) ?? profiles[0];
+  return def ? profileAccount(def) : null;
 }
 
 /**
@@ -63,29 +86,33 @@ export function keychainTiers() {
   return out;
 }
 
-/** Account sightings recovered from rotating ~/.claude/backups/.claude.json.* files. */
-function backupObservations() {
+/**
+ * Account sightings recovered from a profile's rotating config backups. Each
+ * backup is a dated snapshot of who was signed into that profile, which is what
+ * makes it possible to attribute sessions from before the tracker existed.
+ */
+function backupObservations(profile) {
   let names = [];
-  try { names = fs.readdirSync(BACKUPS_DIR); } catch { return []; }
+  try { names = fs.readdirSync(profile.backupsDir); } catch { return []; }
   const out = [];
   for (const n of names) {
     const m = /\.claude\.json\.backup\.(\d+)$/.exec(n);
     if (!m) continue;
-    const cfg = readJson(path.join(BACKUPS_DIR, n));
-    const o = cfg?.oauthAccount;
-    if (o?.accountUuid) {
-      out.push({ ts: Number(m[1]), accountUuid: o.accountUuid, email: o.emailAddress ?? null, source: 'backup' });
-    }
+    // A backup is a full config snapshot, so it carries the same identity and
+    // billing fields as a live one. That is the only way to recover details for
+    // an account that has since been signed out - or replaced in that profile.
+    const account = accountFromConfig(readJson(path.join(profile.backupsDir, n)), profile.dir);
+    if (account) out.push({ ts: Number(m[1]), account, source: 'backup' });
   }
   return out;
 }
 
-/** Record that `account` was signed in at `ts`. */
+/** Record that `account` was signed into a profile at `ts`. */
 export function observeAccount(account, ts = Date.now(), source = 'watch') {
   if (!account?.accountUuid) return;
-  const d = db();
-  d.prepare(`INSERT INTO account_observations (ts, account_uuid, email, source) VALUES (?,?,?,?)
-             ON CONFLICT(ts) DO NOTHING`).run(ts, account.accountUuid, account.email ?? null, source);
+  db().prepare(`INSERT INTO account_observations (ts, config_dir, account_uuid, email, source)
+                VALUES (?,?,?,?,?) ON CONFLICT(ts, config_dir) DO NOTHING`)
+    .run(ts, account.configDir ?? '', account.accountUuid, account.email ?? null, source);
   upsertAccount(account, ts);
 }
 
@@ -93,8 +120,9 @@ export function upsertAccount(a, ts = Date.now()) {
   if (!a?.accountUuid) return;
   db().prepare(`
     INSERT INTO accounts (account_uuid, email, display_name, org_uuid, org_name,
-                          rate_limit_tier, subscription_type, first_seen, last_seen)
-    VALUES (?,?,?,?,?,?,?,?,?)
+                          rate_limit_tier, subscription_type, billing_type,
+                          subscription_at, config_dir, first_seen, last_seen)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
     ON CONFLICT(account_uuid) DO UPDATE SET
       email             = COALESCE(excluded.email, accounts.email),
       display_name      = COALESCE(excluded.display_name, accounts.display_name),
@@ -102,39 +130,58 @@ export function upsertAccount(a, ts = Date.now()) {
       org_name          = COALESCE(excluded.org_name, accounts.org_name),
       rate_limit_tier   = COALESCE(excluded.rate_limit_tier, accounts.rate_limit_tier),
       subscription_type = COALESCE(excluded.subscription_type, accounts.subscription_type),
+      billing_type      = COALESCE(excluded.billing_type, accounts.billing_type),
+      subscription_at   = COALESCE(excluded.subscription_at, accounts.subscription_at),
+      config_dir        = COALESCE(excluded.config_dir, accounts.config_dir),
       first_seen        = MIN(COALESCE(accounts.first_seen, excluded.first_seen), excluded.first_seen),
       last_seen         = MAX(COALESCE(accounts.last_seen, excluded.last_seen), excluded.last_seen)
   `).run(a.accountUuid, a.email ?? null, a.displayName ?? null, a.orgUuid ?? null,
-         a.orgName ?? null, a.rateLimitTier ?? null, a.subscriptionType ?? null, ts, ts);
+         a.orgName ?? null, a.rateLimitTier ?? null, a.subscriptionType ?? null,
+         a.billingType ?? null, a.subscriptionAt ?? null, a.configDir ?? null, ts, ts);
 }
 
-/** Pull in every account we can name from local config, and seed observations. */
+/**
+ * Learn every account from every profile: who is signed in now, and - from each
+ * profile's config backups - who was signed in before. Runs on every refresh, so
+ * signing a new account into a new config directory surfaces it automatically.
+ */
 export function discoverAccounts() {
   const d = db();
-  const cur = currentAccount();
+  const profiles = discoverProfiles();
   const tiers = keychainTiers();
-  // A single signed-in account maps to the one live keychain entry; extra
-  // entries belong to other profiles we cannot name, so only apply when unambiguous.
-  if (cur && tiers.length) {
-    cur.subscriptionType = tiers[0].subscriptionType;
-    cur.rateLimitTier ||= tiers[0].rateLimitTier;
-  }
+  const seen = [];
 
   tx(() => {
-    if (cur) { upsertAccount(cur); observeAccount(cur, Date.now(), 'config'); }
-    for (const o of backupObservations()) {
-      d.prepare(`INSERT INTO account_observations (ts, account_uuid, email, source) VALUES (?,?,?,?)
-                 ON CONFLICT(ts) DO NOTHING`).run(o.ts, o.accountUuid, o.email, o.source);
-      upsertAccount({ accountUuid: o.accountUuid, email: o.email }, o.ts);
-    }
-    // groveConfigCache keys are account UUIDs the CLI has talked to.
-    const cfg = readJson(CLAUDE_JSON);
-    for (const [uuid, v] of Object.entries(cfg?.groveConfigCache ?? {})) {
-      upsertAccount({ accountUuid: uuid }, v?.timestamp ?? Date.now());
+    for (const profile of profiles) {
+      const cur = profileAccount(profile);
+      if (cur) {
+        // Only trust the keychain's plan fields when there is one entry to read;
+        // with several profiles there is no way to tell which entry is whose.
+        if (tiers.length === 1) {
+          cur.subscriptionType = tiers[0].subscriptionType;
+          cur.rateLimitTier ||= tiers[0].rateLimitTier;
+        }
+        upsertAccount(cur);
+        observeAccount(cur, Date.now(), 'config');
+        seen.push(cur);
+      }
+
+      for (const o of backupObservations(profile)) {
+        d.prepare(`INSERT INTO account_observations (ts, config_dir, account_uuid, email, source)
+                   VALUES (?,?,?,?,?) ON CONFLICT(ts, config_dir) DO NOTHING`)
+          .run(o.ts, o.account.configDir ?? '', o.account.accountUuid, o.account.email, o.source);
+        upsertAccount(o.account, o.ts);
+      }
+
+      // groveConfigCache keys are account UUIDs this profile's CLI has talked to.
+      const cfg = profile.configFile ? readJson(profile.configFile) : null;
+      for (const [uuid, v] of Object.entries(cfg?.groveConfigCache ?? {})) {
+        upsertAccount({ accountUuid: uuid }, v?.timestamp ?? Date.now());
+      }
     }
   });
 
-  return { current: cur, keychain: tiers.length };
+  return { profiles: profiles.length, signedIn: seen.length };
 }
 
 /**
@@ -171,8 +218,36 @@ export function attributeSessions() {
   const blocked = blockedIntervals();
   const isBlocked = (account, t) =>
     (blocked.get(account) ?? []).some(([from, until]) => t >= from && t <= until);
-  const anchors = [];
 
+  // Per-profile timelines: who was signed into this config directory, and when.
+  const timelines = new Map();
+  for (const r of d.prepare(
+      'SELECT ts, config_dir, account_uuid FROM account_observations ORDER BY ts').all()) {
+    if (!r.config_dir) continue;
+    if (!timelines.has(r.config_dir)) timelines.set(r.config_dir, []);
+    const tl = timelines.get(r.config_dir);
+    // Collapse runs: only the moments the account actually changed matter.
+    if (!tl.length || tl[tl.length - 1].account !== r.account_uuid) {
+      tl.push({ ts: r.ts, account: r.account_uuid });
+    }
+  }
+
+  /** Which account was signed into `dir` at time `t`. */
+  const accountAt = (dir, t) => {
+    const tl = timelines.get(dir);
+    if (!tl?.length) return null;
+    let hit = null;
+    for (const entry of tl) {
+      if (entry.ts <= t) hit = entry.account;
+      else break;
+    }
+    // Before the first snapshot, the earliest known account is the best guess -
+    // a profile is normally created for one account and kept for it.
+    return hit ?? tl[0].account;
+  };
+
+  // Global anchors, for sessions whose profile has no timeline at all.
+  const anchors = [];
   for (const r of d.prepare(`
       SELECT first_ts, last_ts, account_uuid FROM sessions
       WHERE account_uuid IS NOT NULL AND account_source = 'bridge'
@@ -184,7 +259,6 @@ export function attributeSessions() {
     anchors.push({ ts: r.ts, account: r.account_uuid });
   }
   anchors.sort((a, b) => a.ts - b.ts);
-  if (!anchors.length) return { inferred: 0, ambiguous: 0, anchors: 0 };
 
   const times = anchors.map((a) => a.ts);
   const bisect = (t) => {
@@ -194,14 +268,23 @@ export function attributeSessions() {
   };
 
   const pending = d.prepare(`
-    SELECT session_id, first_ts FROM sessions
-    WHERE (account_uuid IS NULL OR account_source = 'inferred') AND first_ts IS NOT NULL`).all();
+    SELECT session_id, first_ts, config_dir FROM sessions
+    WHERE (account_uuid IS NULL OR account_source IN ('inferred', 'profile'))
+      AND first_ts IS NOT NULL`).all();
 
   const upd = d.prepare('UPDATE sessions SET account_uuid = ?, account_source = ? WHERE session_id = ?');
-  let inferred = 0, ambiguous = 0;
+  const counts = { profile: 0, inferred: 0, ambiguous: 0 };
 
   tx(() => {
     for (const s of pending) {
+      // The profile the session was recorded under names its account directly.
+      const fromProfile = s.config_dir ? accountAt(s.config_dir, s.first_ts) : null;
+      if (fromProfile) {
+        upd.run(fromProfile, 'profile', s.session_id);
+        counts.profile++;
+        continue;
+      }
+
       const i = bisect(s.first_ts);
       const before = i > 0 ? anchors[i - 1] : null;
       const after = i < anchors.length ? anchors[i] : null;
@@ -227,12 +310,12 @@ export function attributeSessions() {
         }
       }
 
-      if (account) { upd.run(account, 'inferred', s.session_id); inferred++; }
-      else { upd.run(null, null, s.session_id); ambiguous++; }
+      if (account) { upd.run(account, 'inferred', s.session_id); counts.inferred++; }
+      else { upd.run(null, null, s.session_id); counts.ambiguous++; }
     }
   });
 
-  return { inferred, ambiguous, anchors: anchors.length };
+  return { ...counts, anchors: anchors.length, profiles: timelines.size };
 }
 
 /**
@@ -240,15 +323,15 @@ export function attributeSessions() {
  *
  * Sessions that captured the signed-in email are joined back to their account,
  * so an account named in any one session stops being a bare UUID everywhere.
- * Only bridge-attributed sessions are trusted here - naming an account from an
- * inferred session would let one bad guess mislabel it permanently.
+ * Only firmly attributed sessions are trusted here - naming an account from a
+ * guessed session would let one bad inference mislabel it permanently.
  */
 export function resolveAccountEmails() {
   const rows = db().prepare(`
     SELECT s.account_uuid, s.user_email, COUNT(*) AS n
       FROM sessions s
      WHERE s.user_email IS NOT NULL AND s.account_uuid IS NOT NULL
-       AND s.account_source = 'bridge'
+       AND s.account_source IN ('bridge', 'profile')
      GROUP BY s.account_uuid, s.user_email
      ORDER BY n DESC`).all();
 

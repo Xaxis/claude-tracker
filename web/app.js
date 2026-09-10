@@ -159,14 +159,40 @@ function renderAccounts(data) {
           `At the current rate this fills in ${duration(l.exhaustsAt - data.now)}.`);
         card.append(warn);
       }
+      // Every unmeasured ceiling says so, on its own row - suppressing one to
+      // reduce clutter would leave an estimate looking like a measurement.
       if (l.confidence !== 'measured') {
-        const note = l.confidence === 'default'
-          ? 'Ceiling not yet measured for this account — estimated.'
-          : l.confidence === 'tier'
-            ? 'Ceiling borrowed from another account on the same plan.'
-            : 'Ceiling from a single observed limit — approximate.';
-        card.append(el('div', 'panel-note', note));
+        const note = {
+          partial: '≈ ceiling from one observed limit',
+          tier: '≈ ceiling borrowed from a same-plan account',
+          default: '≈ ceiling estimated, none observed yet',
+        }[l.confidence] ?? '≈ ceiling estimated';
+        const n = el('div', 'limit-note', note);
+        n.title = `Used ${money(l.used)} of an estimated ${money(l.capacity)} this window.`;
+        card.append(n);
       }
+    }
+
+    // Billing period: a projection, so it is labelled as one.
+    if (a.billing) {
+      const b = a.billing;
+      const when = new Date(b.end).toLocaleDateString([], { month: 'short', day: 'numeric' });
+      const row = el('div', 'billing');
+      const head = el('div', 'billing-head');
+      head.append(el('span', null, 'Renews'));
+      head.append(el('span', 'billing-when', `${when} · ${duration(b.renewsInMs)}`));
+      row.append(head);
+
+      const track = el('div', 'billing-track');
+      const fill = el('span');
+      fill.style.width = `${b.percentElapsed}%`;
+      track.append(fill);
+      row.append(track);
+
+      row.append(el('div', 'panel-note',
+        `${money(b.spend.cost)} used this period · ${b.assumption}`));
+      row.title = `Subscription started ${new Date(b.subscriptionStart).toLocaleDateString()}`;
+      card.append(row);
     }
 
     host.append(card);
