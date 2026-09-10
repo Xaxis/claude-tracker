@@ -169,7 +169,22 @@ export function startTui({ webUrl, onQuit }) {
     L.push('');
 
     if (!ov || !ov.accounts.length) {
-      L.push(`  ${C.muted}No usage data found yet.${C.reset}`);
+      // Usage with no identifiable account is a real state, not an empty one -
+      // saying "no data" here would contradict the web dashboard, which shows
+      // the same usage perfectly well.
+      const un = ov?.unattributed;
+      if (un?.events) {
+        L.push(`  ${C.muted}Usage found, but no account could be identified.${C.reset}`);
+        L.push('');
+        L.push(`  ${un.events.toLocaleString()} calls · ${money(un.cost)} tracked`);
+        L.push('');
+        L.push(`  ${C.muted}Sign in with Claude Code so a profile config exists, then press r.${C.reset}`);
+      } else {
+        L.push(`  ${C.muted}No usage data found yet.${C.reset}`);
+        L.push('');
+        L.push(`  ${C.muted}Looked in every Claude profile on this machine and found no${C.reset}`);
+        L.push(`  ${C.muted}transcripts. Run Claude Code once, then press r.${C.reset}`);
+      }
       return L;
     }
 
