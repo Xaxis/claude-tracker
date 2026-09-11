@@ -730,3 +730,17 @@ test('bridge records stored under the old dating move to the call that followed'
   redateBridgePoints();
   assert.deepEqual(db().prepare("SELECT ts FROM identity_points WHERE session_id = 'sb'").all().map((r) => r.ts), [t2]);
 });
+
+test('an idle session is read as of its last call, not the render', async () => {
+  reset();
+  const { ingestLive, LIVE_DIR } = await import('../src/live.js');
+  fs.mkdirSync(LIVE_DIR, { recursive: true });
+  const now = Date.now(), lastCallAt = now - HOUR;
+  db().prepare("INSERT INTO events (call_id, ts, session_id, cost_usd) VALUES ('idle-call', ?, 'sess-idle', 1)").run(lastCallAt);
+  fs.writeFileSync(path.join(LIVE_DIR, 'sess-idle.json'), JSON.stringify({
+    ts: now, session_id: 'sess-idle', config_dir: '/home/me/.claude', account_uuid: 'A',
+    rate_limits: { five_hour: { used_percentage: 30, resets_at: Math.floor(now / 1000) + 3600 } } }));
+  ingestLive();
+  assert.equal(db().prepare("SELECT ts FROM utilization WHERE session_id = 'sess-idle'").get().ts, lastCallAt);
+  fs.rmSync(LIVE_DIR, { recursive: true, force: true });
+});

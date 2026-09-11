@@ -202,7 +202,9 @@ bar is carried forward with the calls made since. Accounts with nothing running
 fall back to an estimate, marked `≈`, until their next session. Each reading
 carries its window's reset time, so it is filed under the account that reset
 belongs to: a session still running on an old account after a `/login` reads -
-and is counted as - that old account.
+and is counted as - that old account. An idle session's status line keeps
+repeating its last response's numbers, so its reading is dated to that call, not
+to the render.
 
 The installer changes only the `statusLine` key of each profile's
 `settings.json`, writes a backup first, and will not replace a status line you

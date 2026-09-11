@@ -13,6 +13,7 @@ import { db, tx } from './db.js';
  */
 export const LIVE_DIR = path.join(DATA_DIR, 'live');
 const KEEP_MS = 24 * 3600e3;
+const IDLE_MS = 2 * 60_000;
 
 const toMs = (v) => {
   if (v == null) return null;
@@ -45,6 +46,7 @@ export function ingestLive() {
   try { names = fs.readdirSync(LIVE_DIR).filter((n) => n.endsWith('.json') && !n.startsWith('.')); } catch { return { samples: 0 }; }
   const d = db();
   const last = d.prepare('SELECT pct, resets_at FROM utilization WHERE session_id = ? AND limit_type = ? ORDER BY ts DESC LIMIT 1');
+  const lastCall = d.prepare('SELECT MAX(ts) t FROM events WHERE session_id = ?');
   const ins = d.prepare(`INSERT OR IGNORE INTO utilization (ts, session_id, config_dir, account_uuid, limit_type, pct, resets_at)
                          VALUES (?,?,?,?,?,?,?)`);
   const now = Date.now();
@@ -56,6 +58,10 @@ export function ingestLive() {
       try { rec = JSON.parse(fs.readFileSync(file, 'utf8')); } catch { continue; }
       if (!rec?.session_id || !rec.ts) continue;
       if (now - rec.ts > KEEP_MS) { try { fs.unlinkSync(file); } catch { /* gone */ } continue; }
+      // The status line repeats the last response's numbers on every render, so
+      // an idle session's reading is only as new as its last call.
+      const lc = lastCall.get(rec.session_id)?.t;
+      const at = lc != null && rec.ts - lc > IDLE_MS ? lc : rec.ts;
       let acct;
       for (const [type, l] of Object.entries(rec.rate_limits ?? {})) {
         if (typeof l?.used_percentage !== 'number') continue;
@@ -63,9 +69,9 @@ export function ingestLive() {
         const prev = last.get(rec.session_id, type);
         if (prev && Math.abs(prev.pct - l.used_percentage) < 0.05 && prev.resets_at === resets) continue;
         acct ??= rec.account_uuid ?? accountFor(d, rec);
-        if (ins.run(rec.ts, rec.session_id, rec.config_dir ?? null, acct, type, l.used_percentage, resets).changes) {
+        if (ins.run(at, rec.session_id, rec.config_dir ?? null, acct, type, l.used_percentage, resets).changes) {
           samples++;
-          oldest = Math.min(oldest ?? Infinity, rec.ts);
+          oldest = Math.min(oldest ?? Infinity, at);
         }
       }
     }
