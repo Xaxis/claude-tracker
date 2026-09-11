@@ -10,7 +10,8 @@ await new Promise((r) => (ws.onopen = r));
 await send('Page.enable'); await send('Runtime.enable'); await send('Page.navigate', { url });
 await new Promise((r) => setTimeout(r, 2500));
 const expr = `JSON.stringify({
-  cards: [...document.querySelectorAll('.account')].map((c) => ({ name: c.querySelector('.account-name')?.textContent, meta: c.querySelector('.account-meta')?.textContent })),
+  cards: [...document.querySelectorAll('.account')].map((c) => ({ name: c.querySelector('.account-name')?.textContent, meta: c.querySelector('.account-meta')?.textContent, exact: !!c.querySelector('.exact-tag') })),
+  useNow: document.querySelector('#rec-name')?.textContent ?? null,
   live: [...document.querySelectorAll('#live-sessions .row')].map((r) => ({ title: r.querySelector('.row-title')?.textContent.trim(), sub: r.querySelector('.row-sub')?.textContent })) })`;
 const end = Date.now() + Number(durMs);
 while (Date.now() < end) {

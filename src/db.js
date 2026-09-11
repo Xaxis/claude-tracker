@@ -1,7 +1,7 @@
 import { DatabaseSync } from 'node:sqlite';
 import { DB_PATH, ensureDataDir } from './paths.js';
 
-const SCHEMA = `
+const PRAGMAS = `
 PRAGMA journal_mode = WAL;
 PRAGMA synchronous = NORMAL;
 -- Several instances are normal: a terminal dashboard in one window, a web one
@@ -10,6 +10,9 @@ PRAGMA synchronous = NORMAL;
 -- timeout the losers fail instantly with "database is locked" instead of
 -- waiting the few milliseconds an ingest batch actually takes.
 PRAGMA busy_timeout = 10000;
+`;
+
+const SCHEMA = `
 
 -- Incremental ingest bookkeeping: how far into each transcript we have read.
 CREATE TABLE IF NOT EXISTS files (
@@ -155,6 +158,26 @@ CREATE TABLE IF NOT EXISTS calibration (
   PRIMARY KEY (account_uuid, limit_type)
 );
 
+-- Exact plan utilization, as Claude Code itself reports it to each session's
+-- status line. Ground truth for the bars wherever a session has run recently.
+CREATE TABLE IF NOT EXISTS utilization (
+  ts           INTEGER NOT NULL,
+  session_id   TEXT NOT NULL,
+  config_dir   TEXT,
+  account_uuid TEXT,
+  limit_type   TEXT NOT NULL,       -- 'five_hour' | 'seven_day' | 'spend_limit'
+  pct          REAL NOT NULL,       -- 0-100
+  resets_at    INTEGER,             -- epoch ms
+  PRIMARY KEY (session_id, limit_type, ts)
+);
+CREATE INDEX IF NOT EXISTS idx_util_acct ON utilization(account_uuid, limit_type, ts);
+
+-- Notifications already sent, so several tracker processes never repeat one.
+CREATE TABLE IF NOT EXISTS notifications (
+  key TEXT PRIMARY KEY,
+  ts  INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS meta (
   key   TEXT PRIMARY KEY,
   value TEXT
@@ -162,22 +185,11 @@ CREATE TABLE IF NOT EXISTS meta (
 `;
 
 /**
- * Everything here is derived from transcripts on disk, so the index is a cache,
- * not a record. When the schema changes, rebuilding from source is both simpler
- * and more trustworthy than migrating - a full rescan takes about half a minute.
- * Only what cannot be re-derived is carried across: account rows (labels, plan
- * details from long-gone config snapshots) and account observations.
+ * Bump when the schema changes. Nothing is thrown away on an upgrade: Claude
+ * Code deletes old transcripts, so history this index holds may exist nowhere
+ * else, and account details come from config snapshots that rotate away.
  */
 const SCHEMA_VERSION = 6;
-
-const DERIVED_TABLES = [
-  'files', 'events', 'sessions', 'limit_events', 'calibration', 'accounts', 'identity_points',
-];
-
-// Account sightings are NOT derived: each comes from a config snapshot that
-// rotates away within hours. Once lost they cannot be recovered from anything on
-// disk, so they survive a rebuild.
-const PRESERVED_TABLES = ['account_observations'];
 
 function ensureSchema(d) {
   // The version has to be read before the schema is applied: an old table plus
@@ -194,32 +206,36 @@ function ensureSchema(d) {
     return;
   }
 
-  // Account rows are not fully derivable: plan tier and subscription dates come
-  // from config snapshots that rotate away within hours, and labels are typed by
-  // hand. Carry every row across, keeping whichever columns the new schema has.
-  let accountRows = [];
-  try { accountRows = d.prepare('SELECT * FROM accounts').all(); } catch { /* no table yet */ }
-
-  let observations = [];
+  // Rename every table aside, recreate it from the new schema, and refill it
+  // with every column the two versions share. Indexes are dropped first: they
+  // follow a renamed table, and would stop the new table from getting its own.
+  const tables = d.prepare(`SELECT name FROM sqlite_master WHERE type = 'table'
+    AND name NOT LIKE 'sqlite_%' AND name != 'meta'`).all().map((r) => r.name);
+  const q = (id) => `"${id.replace(/"/g, '""')}"`;
+  d.exec('BEGIN');
   try {
-    observations = d.prepare('SELECT ts, config_dir, account_uuid, email, source FROM account_observations').all();
-  } catch { /* table predates per-profile observations */ }
-
-  for (const t of DERIVED_TABLES) d.exec(`DROP TABLE IF EXISTS ${t}`);
-  d.exec(SCHEMA);
-  for (const o of observations) {
-    d.prepare(`INSERT INTO account_observations (ts, config_dir, account_uuid, email, source)
-               VALUES (?,?,?,?,?) ON CONFLICT(ts, config_dir) DO NOTHING`)
-      .run(o.ts, o.config_dir ?? '', o.account_uuid, o.email, o.source);
+    for (const t of tables) {
+      for (const { name } of d.prepare(`SELECT name FROM sqlite_master
+          WHERE type = 'index' AND tbl_name = ? AND sql IS NOT NULL`).all(t)) d.exec(`DROP INDEX ${q(name)}`);
+      d.exec(`ALTER TABLE ${q(t)} RENAME TO ${q(t + '__old')}`);
+    }
+    d.exec(SCHEMA);
+    for (const t of tables) {
+      const newCols = new Set(d.prepare(`PRAGMA table_info(${q(t)})`).all().map((c) => c.name));
+      const shared = d.prepare(`PRAGMA table_info(${q(t + '__old')})`).all().map((c) => c.name).filter((c) => newCols.has(c));
+      if (shared.length) {
+        const cols = shared.map(q).join(', ');
+        d.exec(`INSERT OR IGNORE INTO ${q(t)} (${cols}) SELECT ${cols} FROM ${q(t + '__old')}`);
+      }
+      d.exec(`DROP TABLE ${q(t + '__old')}`);
+    }
+    d.prepare(`INSERT INTO meta (key, value) VALUES ('schema_version', ?)
+               ON CONFLICT(key) DO UPDATE SET value = excluded.value`).run(String(SCHEMA_VERSION));
+    d.exec('COMMIT');
+  } catch (err) {
+    try { d.exec('ROLLBACK'); } catch { /* already rolled back */ }
+    throw err;
   }
-  const cols = new Set(d.prepare('PRAGMA table_info(accounts)').all().map((c) => c.name));
-  for (const row of accountRows) {
-    const keys = Object.keys(row).filter((k) => cols.has(k));
-    d.prepare(`INSERT INTO accounts (${keys.join(', ')}) VALUES (${keys.map(() => '?').join(', ')})
-               ON CONFLICT(account_uuid) DO NOTHING`).run(...keys.map((k) => row[k]));
-  }
-  d.prepare(`INSERT INTO meta (key, value) VALUES ('schema_version', ?)
-             ON CONFLICT(key) DO UPDATE SET value = excluded.value`).run(String(SCHEMA_VERSION));
 }
 
 let _db = null;
@@ -228,6 +244,7 @@ export function db() {
   if (_db) return _db;
   ensureDataDir();
   _db = new DatabaseSync(DB_PATH);
+  _db.exec(PRAGMAS);
   ensureSchema(_db);
   return _db;
 }

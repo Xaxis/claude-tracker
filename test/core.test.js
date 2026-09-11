@@ -24,7 +24,7 @@ const MIN = 60_000;
 
 function reset() {
   const d = db();
-  for (const t of ['events', 'sessions', 'accounts', 'limit_events', 'calibration', 'account_observations', 'files', 'identity_points']) {
+  for (const t of ['events', 'sessions', 'accounts', 'limit_events', 'calibration', 'account_observations', 'files', 'identity_points', 'utilization', 'notifications']) {
     d.exec(`DELETE FROM ${t}`);
   }
 }
@@ -413,6 +413,8 @@ test('a background job keeps its own account when the profile switches', () => {
   // The profile moved to the new account...
   db().prepare("INSERT INTO account_observations (ts, config_dir, account_uuid, source) VALUES (?, ?, 'old', 'watch')").run(t0, dir);
   db().prepare("INSERT INTO account_observations (ts, config_dir, account_uuid, source) VALUES (?, ?, 'new', 'watch')").run(sw, dir);
+  // The tracker was watching, so it left a heartbeat every few minutes.
+  db().prepare("INSERT INTO account_observations (ts, config_dir, account_uuid, source) VALUES (?, ?, 'new', 'watch')").run(sw + 30 * MIN, dir);
   // ...but the job's own transcript still says the old one after the switch.
   db().prepare('INSERT INTO sessions (session_id, first_ts, last_ts, config_dir) VALUES (?,?,?,?)').run('job', t0, sw + HOUR, dir);
   db().prepare("INSERT INTO identity_points (session_id, ts, email, source) VALUES ('job', ?, 'old@x.com', 'context')").run(sw + 30 * MIN);
@@ -452,4 +454,279 @@ test('account rows survive a schema rebuild', async () => {
   assert.equal(out.rebuilt, true, 'the rebuild actually ran');
   assert.deepEqual({ ...out.row }, { email: 'k@x.com', rate_limit_tier: 'max_20x', subscription_at: '2026-09-10T12:00:00Z', label: 'mine' });
   fs.rmSync(dir, { recursive: true, force: true });
+});
+
+
+/* ------------------------------------------------------ refusals as evidence */
+
+const point = (sid, ts, { account = null, email = null, source }) =>
+  db().prepare('INSERT INTO identity_points (session_id, ts, email, account_uuid, source) VALUES (?,?,?,?,?)').run(sid, ts, email, account, source);
+const session = (sid, t0, dir) =>
+  db().prepare('INSERT INTO sessions (session_id, first_ts, last_ts, config_dir) VALUES (?,?,?,?)').run(sid, t0, t0 + 6 * HOUR, dir);
+const refuse = (sid, ts, resetsAtMs, type = 'five_hour') =>
+  db().prepare("INSERT INTO limit_events (ts, session_id, limit_type, resets_at, status) VALUES (?,?,?,?, 'rejected')")
+    .run(ts, sid, type, Math.floor(resetsAtMs / 1000));
+
+test('sessions refused together are on one account, whatever stale records say', () => {
+  reset();
+  const t0 = Date.UTC(2026, 8, 10, 12, 0);
+  db().prepare("INSERT INTO accounts (account_uuid, email) VALUES ('A', 'a@x.com'), ('B', 'b@x.com')").run();
+  for (const s of ['s1', 's2', 's3']) session(s, t0, '/home/me/.claude');
+  point('s1', t0, { account: 'A', source: 'bridge' });
+  point('s2', t0, { account: 'A', source: 'bridge' });
+  point('s3', t0, { account: 'B', source: 'bridge' });                 // stale
+  point('s3', t0 + HOUR, { email: 'a@x.com', source: 'context' });     // its own signed-in record
+  for (const s of ['s1', 's2', 's3']) refuse(s, t0 + 2 * HOUR, t0 + 5 * HOUR);
+  attributeEvents({ all: true });
+  assert.deepEqual(db().prepare('SELECT DISTINCT account_uuid a FROM limit_events').all().map((r) => r.a), ['A']);
+});
+
+test('calls made while an account was refused belong to the account the session moved to', () => {
+  reset();
+  const t0 = Date.UTC(2026, 8, 10, 12, 0), dir = '/home/me/.claude';
+  db().prepare("INSERT INTO accounts (account_uuid, email) VALUES ('A', 'a@x.com'), ('B', 'b@x.com')").run();
+  session('s', t0, dir);
+  point('s', t0, { account: 'A', source: 'bridge' });                  // the bridge keeps saying A
+  refuse('s', t0 + HOUR, t0 + 5 * HOUR);                               // A is refused...
+  point('s', t0 + 3 * HOUR, { email: 'b@x.com', source: 'context' });  // ...and the session is next seen on B
+  rawEvent('before', 's', t0 + 30 * MIN, dir);
+  rawEvent('during', 's', t0 + 2 * HOUR, dir);
+  rawEvent('after', 's', t0 + 4 * HOUR, dir);
+  attributeEvents({ all: true });
+  assert.equal(acctOf('before'), 'A');
+  assert.equal(acctOf('during'), 'B', 'A could not serve anything between its refusal and reset');
+  assert.equal(acctOf('after'), 'B');
+});
+
+test('an account never holds two overlapping windows of the same kind', () => {
+  reset();
+  const t0 = Date.UTC(2026, 8, 10, 12, 0);
+  db().prepare("INSERT INTO accounts (account_uuid, email) VALUES ('A', 'a@x.com'), ('B', 'b@x.com')").run();
+  session('s1', t0, '/d1'); session('s2', t0, '/d2'); session('s3', t0, '/d3');
+  point('s1', t0, { email: 'a@x.com', source: 'context' });
+  refuse('s1', t0 + HOUR, t0 + 5 * HOUR);                              // A's window: t0 .. t0+5h
+  point('s2', t0, { account: 'A', source: 'bridge' });
+  point('s3', t0, { account: 'B', source: 'bridge' });
+  refuse('s2', t0 + 2 * HOUR, t0 + 6 * HOUR);                          // overlaps A's window,
+  refuse('s3', t0 + 2 * HOUR, t0 + 6 * HOUR);                          // so it cannot be A's too
+  attributeEvents({ all: true });
+  const owner = (sid) => db().prepare('SELECT account_uuid a FROM limit_events WHERE session_id = ?').get(sid).a;
+  assert.equal(owner('s1'), 'A');
+  assert.equal(owner('s2'), 'B');
+  assert.equal(owner('s3'), 'B');
+});
+
+test('every row survives a schema upgrade, not just account details', async () => {
+  const { spawnSync } = await import('node:child_process');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ct-upgrade-'));
+  const dbUrl = new URL('../src/db.js', import.meta.url).href;
+  const run = (code) => spawnSync(process.execPath, ['--no-warnings', '--input-type=module', '-e', code],
+    { env: { ...process.env, CLAUDE_TRACKER_DIR: dir }, encoding: 'utf8' });
+  let r = run(`const { db } = await import('${dbUrl}');
+    db().prepare("INSERT INTO events (call_id, ts, cost_usd) VALUES ('kept', 1, 2.5)").run();
+    db().prepare("INSERT INTO limit_events (ts, limit_type, resets_at, status) VALUES (1, 'five_hour', 99, 'rejected')").run();
+    db().prepare("UPDATE meta SET value = '1' WHERE key = 'schema_version'").run();`);
+  assert.equal(r.status, 0, r.stderr);
+  r = run(`const { db } = await import('${dbUrl}');
+    console.log(JSON.stringify({ e: db().prepare("SELECT cost_usd c FROM events WHERE call_id = 'kept'").get(),
+      l: db().prepare('SELECT COUNT(*) n FROM limit_events').get().n,
+      idx: db().prepare("SELECT COUNT(*) n FROM sqlite_master WHERE type = 'index' AND tbl_name = 'events'").get().n }));`);
+  assert.equal(r.status, 0, r.stderr);
+  const out = JSON.parse(r.stdout.trim());
+  assert.equal(out.e?.c, 2.5, 'history the transcripts may no longer hold is kept');
+  assert.equal(out.l, 1);
+  assert.ok(out.idx >= 4, 'indexes are rebuilt on the new table');
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+/* ------------------------------------------------------- exact utilization */
+
+test('status-line readings become utilization samples, once per change', async () => {
+  reset();
+  const { ingestLive, LIVE_DIR } = await import('../src/live.js');
+  fs.mkdirSync(LIVE_DIR, { recursive: true });
+  const base = Date.now();
+  const snap = (pct, dt) => fs.writeFileSync(path.join(LIVE_DIR, 'sess-x.json'), JSON.stringify({
+    ts: base + dt, session_id: 'sess-x', config_dir: '/home/me/.claude', account_uuid: 'A',
+    rate_limits: { five_hour: { used_percentage: pct, resets_at: Math.floor(base / 1000) + 3600 } } }));
+  snap(40, 0); ingestLive(); snap(40, 1000); ingestLive(); snap(41.5, 2000); ingestLive();
+  const rows = db().prepare("SELECT pct, account_uuid FROM utilization WHERE session_id = 'sess-x' ORDER BY ts").all();
+  assert.deepEqual(rows.map((r) => r.pct), [40, 41.5], 'an unchanged reading is not stored again');
+  assert.equal(rows[0].account_uuid, 'A');
+  fs.rmSync(LIVE_DIR, { recursive: true, force: true });
+});
+
+test('a bar anchors to the exact reading and moves with calls made since', async () => {
+  reset();
+  const { overview } = await import('../src/api.js');
+  const now = Date.now();
+  db().prepare("INSERT INTO accounts (account_uuid, email, last_seen) VALUES ('A', 'a@x.com', ?)").run(now);
+  const reading = now - 10 * MIN;
+  db().prepare(`INSERT INTO utilization (ts, session_id, account_uuid, limit_type, pct, resets_at)
+                VALUES (?, 'sx', 'A', 'five_hour', 50, ?)`).run(reading, now + 2 * HOUR);
+  const call = (id, ts, cost) => db().prepare('INSERT INTO events (call_id, ts, session_id, cost_usd, account_uuid) VALUES (?,?,?,?,?)').run(id, ts, 'sx', cost, 'A');
+  call('c1', reading - 30 * MIN, 10);   // $10 had bought 50% -> $0.20 a point
+  call('c2', reading + 5 * MIN, 5);     // $5 since -> another 25 points
+  const a = overview(now).accounts.find((x) => x.accountUuid === 'A');
+  const l = a.limits.find((x) => x.type === 'five_hour');
+  assert.equal(l.confidence, 'exact');
+  assert.ok(Math.abs(l.percent - 75) < 0.5, `expected ~75%, got ${l.percent}`);
+  assert.equal(l.end, now + 2 * HOUR, 'the reset time is the one Claude Code reported');
+});
+
+test('an old sighting does not claim a profile for months', () => {
+  reset();
+  const dir = '/home/me/.claude', april = Date.UTC(2026, 3, 9);
+  db().prepare("INSERT INTO accounts (account_uuid) VALUES ('old'), ('A')").run();
+  db().prepare("INSERT INTO account_observations (ts, config_dir, account_uuid, source) VALUES (?, ?, 'old', 'backup')").run(april, dir);
+  const later = april + 150 * 86400e3;
+  session('s', later, dir);
+  point('s', later, { account: 'A', source: 'bridge' });
+  rawEvent('c', 's', later + HOUR, dir);
+  attributeEvents({ all: true });
+  assert.equal(acctOf('c'), 'A', 'a lone April snapshot knows nothing about September');
+});
+
+test('a session refused seconds after the others still moves on at the reset', () => {
+  reset();
+  const t0 = Date.UTC(2026, 8, 10, 12, 0), dir = '/home/me/.claude';
+  db().prepare("INSERT INTO accounts (account_uuid, email) VALUES ('A', 'a@x.com'), ('B', 'b@x.com')").run();
+  session('first', t0, dir); session('late', t0, dir);
+  point('first', t0, { email: 'a@x.com', source: 'context' });
+  refuse('first', t0 + HOUR, t0 + 2 * HOUR);                 // the group's first refusal
+  refuse('late', t0 + HOUR + 20_000, t0 + 2 * HOUR);          // this session, 20s later
+  point('late', t0 + 3 * HOUR, { email: 'b@x.com', source: 'context' });
+  rawEvent('meanwhile', 'first', t0 + 1.5 * HOUR, dir);      // the profile carried on without A
+  rawEvent('after-reset', 'late', t0 + 2.5 * HOUR, dir);
+  attributeEvents({ all: true });
+  assert.equal(acctOf('after-reset'), 'B');
+});
+
+test('the watcher leaves a heartbeat, not just changes', async () => {
+  reset();
+  const { observeAccount } = await import('../src/accounts.js');
+  const t0 = Date.UTC(2026, 8, 11, 12, 0), acct = { accountUuid: 'A', configDir: '/home/me/.claude' };
+  observeAccount(acct, t0); observeAccount(acct, t0 + 5 * MIN); observeAccount(acct, t0 + 12 * MIN);
+  assert.equal(db().prepare('SELECT COUNT(*) n FROM account_observations').get().n, 2);
+});
+
+test('the calls leading up to a refusal belong to the refused account', () => {
+  reset();
+  const t0 = Date.UTC(2026, 8, 10, 12, 0), dir = '/home/me/.claude';
+  db().prepare("INSERT INTO accounts (account_uuid, email) VALUES ('A', 'a@x.com'), ('B', 'b@x.com')").run();
+  session('s1', t0 - 6 * HOUR, dir); session('s2', t0 - 6 * HOUR, dir);
+  point('s1', t0 - 6 * HOUR, { email: 'a@x.com', source: 'context' });
+  point('s2', t0 - 6 * HOUR, { account: 'B', source: 'bridge' });    // stale all along
+  refuse('s1', t0 + HOUR, t0 + 5 * HOUR);                              // A's window opened at t0
+  refuse('s2', t0 + HOUR, t0 + 5 * HOUR);
+  rawEvent('pre-window', 's2', t0 - HOUR, dir);
+  rawEvent('in-window', 's2', t0 + 30 * MIN, dir);
+  attributeEvents({ all: true });
+  assert.equal(acctOf('in-window'), 'A', 'refused on A, so its calls inside that window were A');
+  assert.equal(acctOf('pre-window'), 'B');
+});
+
+test('a session that waits out its limit carries on with the same account', () => {
+  reset();
+  const t0 = Date.UTC(2026, 8, 9, 2, 30), dir = '/home/me/.claude';
+  db().prepare("INSERT INTO accounts (account_uuid, email) VALUES ('A', 'a@x.com'), ('B', 'b@x.com')").run();
+  session('s', t0, dir); session('later', t0 + 6 * HOUR, dir);
+  point('s', t0, { account: 'A', source: 'bridge' });
+  point('later', t0 + 6 * HOUR, { account: 'B', source: 'bridge' });
+  rawEvent('opened', 's', t0 + 5 * MIN, dir);
+  refuse('s', t0 + 4 * HOUR, t0 + 5 * HOUR);                   // A is full until t0+5h
+  rawEvent('in-flight', 's', t0 + 4 * HOUR + 5_000, dir);       // answered just after the refusal
+  rawEvent('resumed', 's', t0 + 5 * HOUR + 5 * MIN, dir);       // nothing ran in between
+  attributeEvents({ all: true });
+  assert.equal(acctOf('in-flight'), 'A');
+  assert.equal(acctOf('resumed'), 'A', 'no call ran during the block, so the session waited for A');
+});
+
+test('a five-hour window cannot open on an account that hit its weekly limit', () => {
+  reset();
+  const t0 = Date.UTC(2026, 8, 9, 22, 0), dir = '/home/me/.claude', DAY = 86400e3;
+  db().prepare("INSERT INTO accounts (account_uuid, email) VALUES ('A', 'a@x.com'), ('B', 'b@x.com')").run();
+  session('old', t0 - 7 * DAY, dir); session('s', t0 - 3 * DAY, dir);
+  point('old', t0 - 7 * DAY, { account: 'B', source: 'bridge' });  // B was used here before
+  point('s', t0 - 3 * DAY, { account: 'A', source: 'bridge' });    // this bridge keeps naming A
+  refuse('s', t0, t0 + 5 * DAY, 'seven_day');                      // A is out for the week...
+  rawEvent('after', 's', t0 + 15 * MIN, dir);                       // ...yet the session carried on
+  refuse('s', t0 + 3 * HOUR, t0 + 5 * HOUR + 10 * MIN);             // until a window opened at t0+10m filled
+  attributeEvents({ all: true });
+  const owner = db().prepare("SELECT account_uuid a FROM limit_events WHERE limit_type = 'five_hour'").get().a;
+  assert.equal(owner, 'B', 'A could not have opened a window while out for the week');
+  assert.equal(acctOf('after'), 'B');
+});
+
+test('every session in a profile follows a /login typed into any one of them', () => {
+  reset();
+  const t0 = Date.UTC(2026, 8, 10, 12, 0), dir = '/home/me/.claude';
+  db().prepare("INSERT INTO accounts (account_uuid, email) VALUES ('A', 'a@x.com'), ('B', 'b@x.com')").run();
+  session('here', t0, dir); session('other', t0, dir);
+  point('here', t0, { email: 'a@x.com', source: 'context' });
+  point('other', t0, { email: 'a@x.com', source: 'context' });
+  point('here', t0 + HOUR, { email: 'b@x.com', source: 'context' });  // the /login, recorded here only
+  rawEvent('other-before', 'other', t0 + 30 * MIN, dir);
+  rawEvent('other-after', 'other', t0 + 2 * HOUR, dir);
+  attributeEvents({ all: true });
+  assert.equal(acctOf('other-before'), 'A');
+  assert.equal(acctOf('other-after'), 'B', 'the other session never recorded the switch, but made it');
+});
+
+test('readings that share a reset time are one account; a session left behind keeps its own', () => {
+  reset();
+  const t0 = Date.UTC(2026, 8, 11, 16, 0), dir = '/home/me/.claude';
+  db().prepare("INSERT INTO accounts (account_uuid, email) VALUES ('A', 'a@x.com'), ('B', 'b@x.com')").run();
+  // The profile moved from A to B while the tracker watched.
+  for (let m = 0; m <= 60; m += 10) {
+    db().prepare("INSERT INTO account_observations (ts, config_dir, account_uuid, source) VALUES (?, ?, ?, 'watch')")
+      .run(t0 + m * MIN, dir, m < 20 ? 'A' : 'B');
+  }
+  const sids = ['s1', 's2', 's3', 'stale'];
+  for (const s of sids) { session(s, t0 - HOUR, dir); point(s, t0 - HOUR, { email: 'a@x.com', source: 'context' }); }
+  point('stale', t0 + 45 * MIN, { email: 'a@x.com', source: 'context' });  // this one never picked up the switch
+  const read = (sid, resetsAt) => db().prepare(`INSERT INTO utilization (ts, session_id, config_dir, account_uuid, limit_type, pct, resets_at)
+    VALUES (?, ?, ?, 'B', 'five_hour', 50, ?)`).run(t0 + 50 * MIN, sid, dir, resetsAt);   // tagged with the profile's account
+  for (const s of ['s1', 's2', 's3']) read(s, t0 + 4 * HOUR + 20 * MIN);
+  read('stale', t0 + 3 * HOUR);
+  attributeEvents({ all: true });
+  const tag = (sid) => db().prepare('SELECT account_uuid a FROM utilization WHERE session_id = ?').get(sid).a;
+  assert.equal(tag('s1'), 'B');
+  assert.equal(tag('stale'), 'A', "its reading carries A's reset time, so it read A's window");
+});
+
+test('a bridge record is dated by the line after it, not the one before', async () => {
+  reset();
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ct-bridge-'));
+  const proj = path.join(root, 'projects', '-tmp-demo');
+  fs.mkdirSync(proj, { recursive: true });
+  fs.writeFileSync(path.join(root, 'settings.json'), '{}');
+  const usage = { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0,
+    cache_creation: { ephemeral_5m_input_tokens: 0, ephemeral_1h_input_tokens: 0 } };
+  const call = (id, ts) => JSON.stringify({ type: 'assistant', uuid: id, timestamp: ts, sessionId: 'sess-b', cwd: '/tmp/demo',
+    message: { id, model: 'claude-opus-5', content: [{ type: 'text' }], usage } });
+  fs.writeFileSync(path.join(proj, 'sess-b.jsonl'), [
+    call('m1', '2026-09-10T17:35:00.000Z'),
+    // Resumed hours later, after a /login: the bridge registers again first.
+    JSON.stringify({ type: 'bridge-session', sessionId: 'sess-b', ownerAccountUuid: 'acct-new' }),
+    JSON.stringify({ type: 'user', timestamp: '2026-09-10T19:05:00.000Z', sessionId: 'sess-b', message: { role: 'user', content: 'go on' } }),
+    call('m2', '2026-09-10T19:05:08.000Z'),
+  ].join('\n') + '\n');
+  const { ingestAll } = await import('../src/ingest.js');
+  await ingestAll({ profiles: [{ dir: root, name: 'demo', projectsDir: path.join(root, 'projects') }] });
+  const p = db().prepare("SELECT ts FROM identity_points WHERE source = 'bridge' AND session_id = 'sess-b'").get();
+  assert.equal(p?.ts, Date.parse('2026-09-10T19:05:00.000Z'));
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test('bridge records stored under the old dating move to the call that followed', async () => {
+  reset();
+  const { redateBridgePoints } = await import('../src/ingest.js');
+  db().prepare("DELETE FROM meta WHERE key = 'bridge_dating'").run();
+  const t1 = Date.UTC(2026, 8, 10, 17, 35), t2 = Date.UTC(2026, 8, 10, 19, 5);
+  rawEvent('before', 'sb', t1, '/home/me/.claude');
+  rawEvent('resumed', 'sb', t2, '/home/me/.claude');
+  point('sb', t1, { account: 'new', source: 'bridge' });
+  redateBridgePoints();
+  assert.deepEqual(db().prepare("SELECT ts FROM identity_points WHERE session_id = 'sb'").all().map((r) => r.ts), [t2]);
 });

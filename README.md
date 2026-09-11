@@ -13,20 +13,23 @@ Everything stays on your machine. There are no dependencies, no API calls, and
 no network access beyond a loopback HTTP server you start yourself.
 
 ```
-  Claude Tracker                                    ● live · 127.0.0.1:4785
+  Claude Tracker                     ● live · updated 09:32:16 · 127.0.0.1:4785
 
   Session (5h) · work@example.com
   24% used            ████████░░░░░░░░░░░░░░░░░░░░░░░░  resets in 1h 22m
 
-   ACCOUNTS ──────────────────────────────────────────────────────────────────
+  USE NOW  personal@example.com  96% headroom  CLAUDE_CONFIG_DIR=~/.claude-personal claude
 
-  ● work@example.com     max 20x                          $317 · 7 sessions
+   RUNNING NOW · 3 sessions ─────────────────────────────────────────────────
+  ● api-server           work@example.com               4s     $1.20/5m
+  ● docs-site            personal@example.com           1m     $0.35/5m
+  ○ nightly-job          work@example.com (bg)          12m
+
+   ACCOUNTS ─────────────────────────────────────────────────────────────────
+
+  ● work@example.com     max 20x                  exact · $317 · 7 sessions
     Session (5h)   ██████░░░░░░░░░░░░░░░░░  24% resets 1h 22m    plenty left
     Weekly (7d)    █░░░░░░░░░░░░░░░░░░░░░░   3% resets 6d 20h    plenty left
-
-  ○ personal@example.com                             $35.7k · 97 sessions
-    Session (5h)   ███░░░░░░░░░░░░░░░░░░░░  16% resets 4h 42m    plenty left
-    Weekly (7d)    █████████████████████   100% resets 4d 5h     limit reached
 ```
 
 ## Install
@@ -63,6 +66,8 @@ Run it from any directory once linked:
 | `claude-tracker verify` | check the window model against your own resets |
 | `claude-tracker accounts` | list accounts and their UUIDs |
 | `claude-tracker label a1b2c3d4 "work"` | name an account by UUID prefix |
+| `claude-tracker statusline install` | exact limit numbers, from each profile's status line |
+| `claude-tracker service install` | keep it running in the background from login (macOS) |
 
 Or from inside the repo, without linking — `yarn` and `npm run` both work:
 
@@ -79,6 +84,9 @@ Pass flags through with `--`: `yarn start --port 5000`, `npm start -- --port 500
 Leaving it running is worth it beyond the dashboard: while it runs it samples
 which account is signed into each profile, and notices new profiles appearing —
 so a newly added account starts being tracked without you doing anything.
+`claude-tracker service install` runs it in the background from login; opening
+`claude-tracker` in a terminal then attaches to that instead of starting a
+second copy.
 
 Both dashboards run in one process off a single file watcher, so the browser and
 the terminal never disagree and the transcripts are only scanned once.
@@ -128,32 +136,103 @@ get scanned twice.
 
 ### Which account did what
 
-Attribution is decided **per API call, not per session.** A session is not tied
-to one account:
+Attribution is decided **per API call, not per session**, because a session is
+not tied to one account.
 
-- An interactive session follows a `/login` onto the new account mid-run, and
-  records the moment in its own transcript (a fresh context record naming the
-  signed-in email, written the same second the switch happens).
-- A parked background job keeps the identity it started with, even after the
-  profile it runs under switches accounts.
+A `/login` moves every session in that profile, not just the one it was typed
+into: sessions refused together have been seen carrying on the moment another
+session signed in, on the account it signed into, though only that one session
+recorded the switch. So each call is resolved at its own timestamp from the
+**newest** evidence at or before it:
 
-So each call is resolved at its own timestamp, strongest evidence first:
+- **The session's own records** - the signed-in email Claude Code writes at
+  start, and again when a `/login` is typed into that session.
+- **Who was watched signed into its profile.** While running, the tracker
+  records each profile's login as it changes, plus a heartbeat every 10
+  minutes. A sighting only vouches for the stretch it was actually watching: an
+  isolated old config snapshot does not get to claim the months around it.
+- **The profile's other sessions** - each one's first record, and any record
+  where it changed account. That is how a `/login` made elsewhere reaches a
+  session that never recorded it.
+- **Bridge records**, which name the account a session's remote-control bridge
+  registered with. They can be days out of date, so they count only when
+  nothing newer does. They carry no timestamp of their own, so each is dated by
+  the line after it - one written on resume can follow hours of silence.
 
-- **session** — the latest identity record inside that same session: a signed-in
-  email record, or a bridge record naming the owner.
-- **profile** — who was signed into the call's config directory at that moment,
-  from the watcher's observations and the profile's rotating config backups.
-  Where the profile was watched directly, that is the authority; sessions' own
-  records only fill in stretches the profile's observations don't cover.
-- **inferred** — the session sits between two moments that agree on the account.
+Ties go to the stronger kind, in that order. A session whose own record is newer
+than the profile's switch keeps its account: some long-running sessions carry
+on with the account they had.
 
-Two rules keep it honest. When the evidence disagrees, the call is left
-unattributed rather than guessed at, and the unattributed total is shown on the
-dashboard. And a call is never attributed to an account the API had rate limited
-at that moment — hitting a limit is exactly when you switch accounts.
+Refusals and status-line readings settle the rest. When an account hits a
+limit, every session on it is refused with the same reset time, and every status
+line on it reads the same one - so a shared reset time names one account,
+whatever each session's records say. Those groups are settled by vote, within
+what is possible:
+
+- an account never holds two overlapping windows of the same kind;
+- an account that is out - for five hours or for the week - cannot take the
+  call that opens a new five-hour window;
+- a refused account serves nothing until its reset, beyond requests already in
+  flight. If its profile made no calls until then, the session simply waited and
+  carries on with the same account; if the profile carried on, it had moved.
+
+A group nothing else settles goes to the most recent account seen in its profile
+that could have held the window - never a later one, so history does not drift
+onto an account signed in afterwards. Where the evidence runs out entirely, the
+call is left unattributed rather than guessed at; the dashboard shows that total.
 
 Historical attribution is imperfect by nature; the further back you look, the
-more of it is inferred. It becomes exact from the moment you start running this.
+more of it is inferred. It becomes exact from the moment you start running this
+with the status line installed.
+
+### Exact numbers, from the status line
+
+Claude Code knows exactly how full each window is — the server reports it on
+every response — and hands that to a profile's status-line command, if it has
+one. `claude-tracker statusline install` points each profile's status line at a
+small script that records those numbers for the tracker and shows them where you
+work:
+
+    work · 5h 42% 1h20 · 7d 18% 5d
+
+With that in place, every account with a session open shows its **exact**
+percentage and reset time, straight from the server — which also counts usage
+this machine never sees, from claude.ai or another device. Between reports the
+bar is carried forward with the calls made since. Accounts with nothing running
+fall back to an estimate, marked `≈`, until their next session. Each reading
+carries its window's reset time, so it is filed under the account that reset
+belongs to: a session still running on an old account after a `/login` reads -
+and is counted as - that old account.
+
+The installer changes only the `statusLine` key of each profile's
+`settings.json`, writes a backup first, and will not replace a status line you
+configured yourself unless you pass `--force`. `claude-tracker statusline
+uninstall` removes it.
+
+### Which account to use
+
+Both dashboards and `claude-tracker status` name the account to use right now:
+never one refused on any limit, preferring one already signed into a profile,
+then the most headroom in its tightest window. It comes with the exact command —
+`CLAUDE_CONFIG_DIR=~/.claude-personal claude`, say — which the web dashboard
+copies with one click.
+
+### Notifications
+
+On macOS the tracker notifies you when a window reaches 80% and 95%, when a limit
+is actually hit (naming the account to switch to), and when a refused account is
+usable again. Only trustworthy readings alert — exact numbers, ceilings measured
+from repeated refusals, or the API's own refusals — so an estimate never cries
+wolf. Each alert is sent once, however many copies of the tracker are running.
+Turn them off with `--no-notify` or `CLAUDE_TRACKER_NOTIFY=0`.
+
+### Running at login
+
+`claude-tracker service install` adds a per-user launchd agent that runs the web
+dashboard from login and restarts it if it stops; `service status` and `service
+uninstall` do what they say. It matters for accuracy as much as convenience: the
+tracker only sees the moment you switch accounts while it is running. The log is
+`~/.claude/tracker/service.log`.
 
 ### Realtime
 
@@ -173,18 +252,22 @@ Both dashboards run off one watcher inside the tracker process:
   The terminal header shows when its numbers were read.
 
 Measured with 20 simulated sessions writing 40 calls a second on top of a copy of
-a real 248,000-call index, terminal and web dashboards running together:
+a real 249,000-call index, every interactive session reporting through the status
+line, and terminal and web dashboards running together:
 
 | | median | p95 | max |
 |---|---|---|---|
-| Age of the numbers on screen, web | 0.60s | 1.12s | 1.53s |
-| Age of the numbers on screen, terminal | 0.85s | 1.32s | 1.64s |
+| Age of the numbers on screen, web | 0.72s | 1.28s | 1.76s |
+| Age of the numbers on screen, terminal | 0.94s | 1.44s | 1.85s |
 
-After a mid-run `/login`, the new account showed as billing in 0.7s on the web
-and 1.4s in the terminal; the longest gap between pushes was 1.0s. Every call was
-checked against the account that actually made it, with a background job kept
-on its original account throughout. `python3 bench/run_load.py` reproduces
-this.
+Halfway through, a `/login` is typed into one session; the other interactive
+sessions record nothing, as real ones don't. The new account showed as billing
+in 0.4s on both dashboards, and every running session had moved over in the live
+list within 1.4s; the longest gap between pushes was 1.2s. Every call was checked
+against the account that actually made it, with a background job kept on its
+original account throughout - a call made in the second between the config
+changing and its session noticing counts as either. `python3 bench/run_load.py`
+reproduces this.
 
 ### What the dollar figures mean
 
@@ -267,51 +350,61 @@ far off each reconstructed boundary was:
 A reported reset that has not yet passed always wins over reconstruction — it
 names the current window's exact end, so no inference is needed at all.
 
+Besides these two, Claude Code tracks separate weekly caps for Opus and Sonnet.
+Their fill level isn't exposed anywhere the tracker can read, so they appear
+only when a refusal reveals one — and the account is then shown blocked on that
+limit until it resets.
+
 ### Where the ceiling comes from
 
 Anthropic does not publish subscription limits as a token or dollar figure, so a
-hardcoded ceiling would be fiction. What is available is every moment the API
-refused a request: at that instant the window was, by definition, full. Summing
-usage in that window up to the refusal measures the capacity directly.
+hardcoded ceiling would be fiction. Two things measure it instead:
 
-Because different models draw down quota at very different rates, usage is
-normalised to a common unit — list API price — before being summed. The dollar
-figures are that unit, not your bill. On a subscription you are not billed per
-token; `$317` means "as much quota as $317 of API usage would consume."
+- **Exact readings**, with the status line installed. When Claude Code reports a
+  window as p% full, the spend in it so far, scaled to 100%, is the ceiling. No
+  limit has to be hit.
+- **Refusals.** At the moment the API refuses a request the window was full, so
+  the spend in it up to the refusal is the ceiling.
 
-Each reading is labelled with how much to trust it:
+Because models draw down quota at very different rates, spend is normalised to a
+common unit — list API price — before being compared.
 
 | Label | Meaning |
 |---|---|
-| measured | two or more observed limits on this account |
-| approximate | a single observed limit |
-| borrowed | no limit seen yet; using a ceiling measured on another account |
+| exact | reported by Claude Code; nothing estimated |
+| measured | two or more refusals on this account |
+| approximate | a single refusal |
+| borrowed | nothing on this account yet; another account's solid ceiling |
 | estimated | nothing measured anywhere yet |
 
-An account that has never been rate limited starts out estimated and sharpens
-itself the first time it hits a wall.
+Only solid ceilings — exact, or two or more refusals — are lent to other
+accounts. A single refusal can be badly off, and lending it spreads the error
+to every account on the plan.
 
 ## Accuracy, honestly
 
-- **Percentages are estimates until an account has been limited at least once.**
-  Reset times are exact whenever the API has reported one.
-- **Only what is on this machine is visible.** Usage from claude.ai, other
-  devices, or other machines counts against the same limits but leaves no local
-  trace, so a reading can understate.
-- **Renewal dates assume a monthly cycle** projected from the subscription start
-  date; see above.
-- **Transcripts are eventually cleaned up.** Windows that extend past the oldest
-  retained transcript will read low.
-- **Attribution is per call.** A session that switches accounts mid-run is
-  split between them at the moment of the switch; a background job keeps its own
-  account. Calls with no identity evidence at all are shown as unattributed.
+- **Exact where a session is running**, with the status line installed.
+  Otherwise percentages are estimates, marked `≈`. Reset times are exact
+  whenever Claude Code or the API has reported one.
+- **Estimates only see this machine.** Usage from claude.ai or other devices
+  counts against the same limits but leaves no local trace; exact readings do
+  include it.
+- **Renewal dates assume a monthly cycle**, projected from the subscription
+  start, and aren't shown for prepaid or organisation seats.
+- **Attribution is per call**, exact from the moment the tracker runs; older
+  history leans more on inference, and anything unresolvable is shown as
+  unattributed.
+- **Weekly Opus and Sonnet caps** show only once a refusal reveals them.
+- **History is kept.** Claude Code deletes old transcripts; the tracker's index
+  keeps every call it has seen, across upgrades.
 
 ## Privacy
 
-Reads local transcripts, `~/.claude.json`, and — only to learn the plan tier —
-the subscription fields of the Claude keychain entries. Tokens are never read
-into storage, logged, or transmitted. The HTTP server binds to `127.0.0.1` only.
-The index lives in `~/.claude/tracker/` and never leaves the machine.
+Everything stays on this machine. The tracker reads Claude Code's transcripts and
+config files, and never reads credentials. `statusline install` edits only the
+`statusLine` key of each profile's `settings.json`, after writing a backup.
+Notifications go through macOS's own notification centre. The web server binds
+to `127.0.0.1` only, and the index lives in `~/.claude/tracker/`.
 
 ## Development
 
@@ -333,6 +426,11 @@ depend on your own usage history.
 | `src/calibrate.js` | learns each plan's ceiling from observed limits |
 | `src/watcher.js` | throttled file watching, account-switch detection |
 | `src/aggregates.js` | cached per-account totals for cheap live reads |
+| `bin/statusline.js` | status-line command: records exact utilization, prints it |
+| `src/statusline.js` | installs that command into each profile |
+| `src/live.js` | turns status-line snapshots into exact readings |
+| `src/notify.js` | deduplicated desktop notifications |
+| `src/service.js` | the launchd login service |
 | `src/billing.js` | projects the subscription cycle from its start date |
 | `src/api.js` | aggregation for both dashboards |
 | `src/tui.js` | terminal dashboard |

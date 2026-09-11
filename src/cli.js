@@ -1,4 +1,5 @@
 import { ingestAll, ingestPaths } from './ingest.js';
+import { ingestLive } from './live.js';
 import {
   discoverAccounts, attributeSessions, attributeLimitEvents,
   listAccounts, accountLabel, resolveAccountEmails, setLabel, attributeEvents,
@@ -58,7 +59,8 @@ async function refresh({ quiet = false, force = false, reattribute = 'recent' } 
   // Per-call attribution. A full pass on startup and explicit ingests; otherwise
   // re-check the last six hours so late-arriving identity records still land.
   const a = attributeEvents(reattribute === 'all' ? { all: true } : { since: Date.now() - 6 * 3600_000 });
-  invalidateCaches(reattribute === 'all', res.minNewTs, a.minChangedTs);
+  const live = ingestLive();
+  invalidateCaches(reattribute === 'all', res.minNewTs, a.minChangedTs, live.oldest);
   calibrateAll();
   return { ...res, ms: Date.now() - t0 };
 }
@@ -74,8 +76,9 @@ async function fastRefresh(paths = []) {
   const t0 = Date.now();
   const r = paths.length ? await ingestPaths(paths) : { scanned: 0, newEvents: 0 };
   const a = attributeEvents({ since: Date.now() - 10 * 60_000, includeNull: false });
-  invalidateCaches(false, r.minNewTs, a.minChangedTs);
-  return { ...r, attributed: a.changed, ms: Date.now() - t0 };
+  const live = ingestLive();
+  invalidateCaches(false, r.minNewTs, a.minChangedTs, live.oldest);
+  return { ...r, attributed: a.changed, exact: live.samples, ms: Date.now() - t0 };
 }
 
 /**
@@ -104,7 +107,7 @@ function cmdStatus() {
   for (const a of o.accounts) {
     const marker = a.isCurrent ? `${c.green}●${c.reset}` : `${c.gray}○${c.reset}`;
     const tier = a.tier ? ` ${c.dim}${a.tier.replace('default_claude_', '')}${c.reset}` : '';
-    console.log(`${marker} ${c.bold}${a.label}${c.reset}${tier}  ${c.dim}${money(a.totalCost)} tracked · ${a.sessions} sessions${c.reset}`);
+    console.log(`${marker} ${c.bold}${a.label}${c.reset}${tier}  ${c.dim}${money(a.totalCost)} tracked · ${a.sessions} session${a.sessions === 1 ? '' : 's'}${c.reset}`);
     for (const l of a.limits) {
       const blocked = l.blocked ? ` ${c.red}LIMIT HIT${c.reset}` : '';
       const conf = l.confidence === 'default' ? `${c.dim}(est)${c.reset}` : l.confidence === 'partial' ? `${c.dim}(~)${c.reset}` : '';
@@ -121,6 +124,13 @@ function cmdStatus() {
 
   if (o.unattributed.events) {
     console.log(`  ${c.dim}${o.unattributed.events.toLocaleString()} events (${money(o.unattributed.cost)}) could not be tied to an account.${c.reset}`);
+  }
+  const rec = o.recommendation;
+  if (rec) {
+    const how = rec.command ? `  ${c.dim}→${c.reset} ${rec.command}` : `  ${c.dim}(${rec.note})${c.reset}`;
+    console.log(`  ${c.green}Use now:${c.reset} ${c.bold}${rec.label}${c.reset} ${c.dim}${Math.round(rec.headroom)}% headroom${rec.exact ? '' : ' (est)'}${c.reset}${how}`);
+  } else {
+    console.log(`  ${c.red}Every account is refused right now.${c.reset}`);
   }
   const live = liveSessions();
   if (live.length) {
@@ -202,6 +212,30 @@ function cmdVerify() {
   console.log(`\n  ${ok}/${rows.length} reset times matched a reconstructed window boundary.\n`);
 }
 
+async function cmdStatusline(action, flags) {
+  const { installStatusLine, uninstallStatusLine, statusLineState } = await import('./statusline.js');
+  if (action === 'install' || action === 'uninstall') {
+    const res = action === 'install' ? installStatusLine({ force: !!flags.force }) : uninstallStatusLine();
+    for (const r of res) console.log(`  ${pad(r.profile, 20)} ${r.result}${r.reason ? ` ${c.dim}- ${r.reason}${c.reset}` : ''}`);
+    if (action === 'install') console.log(`\n${c.dim}New and running Claude Code sessions pick it up on their next render; the tracker then shows exact numbers.${c.reset}`);
+    return;
+  }
+  for (const r of statusLineState()) console.log(`  ${pad(r.profile, 20)} ${r.state}`);
+}
+
+async function cmdService(action, flags) {
+  const { installService, uninstallService, serviceStatus } = await import('./service.js');
+  if (action === 'install') {
+    const r = installService({ port: Number(flags.port ?? 4785) });
+    console.log(`${c.green}✓${c.reset} running at login - ${r.url}\n  ${c.dim}log: ${r.log}${c.reset}`);
+  } else if (action === 'uninstall') {
+    console.log(uninstallService().removed ? `${c.green}✓${c.reset} removed` : 'not installed');
+  } else {
+    const s = serviceStatus();
+    console.log(s.installed ? `installed · ${s.state ?? 'not loaded'}${s.pid ? ` · pid ${s.pid}` : ''}\n  ${c.dim}log: ${s.log}${c.reset}` : 'not installed');
+  }
+}
+
 function help() {
   console.log(`
 ${c.bold}claude-tracker${c.reset} — local usage and rate-limit tracking for Claude accounts
@@ -217,6 +251,8 @@ ${c.bold}claude-tracker${c.reset} — local usage and rate-limit tracking for Cl
   ${c.bold}models${c.reset} [--days N]           per-model usage breakdown
   ${c.bold}verify${c.reset}                      check the window model against observed resets
   ${c.bold}where${c.reset}                       print data locations
+  ${c.bold}statusline${c.reset} install|uninstall  exact limits via each profile's status line
+  ${c.bold}service${c.reset} install|uninstall     run in the background at login (macOS)
 
 ${c.dim}In the terminal dashboard: q quit · r refresh · a cycle account · w switch
 window · space pause · ↑↓/jk scroll${c.reset}
@@ -261,6 +297,8 @@ export async function runCli(argv) {
       case 'status': await refresh({ quiet: true }); cmdStatus(); break;
       case 'accounts': await refresh({ quiet: true }); cmdAccounts(); break;
       case 'label': cmdLabel(rest.slice(1)); break;
+      case 'statusline': await cmdStatusline(rest[1] ?? 'status', flags); break;
+      case 'service': await cmdService(rest[1] ?? 'status', flags); break;
       case 'models': await refresh({ quiet: true }); cmdModels(Number(flags.days ?? 30)); break;
       case 'verify': await refresh({ quiet: true }); cmdVerify(); break;
       case 'where':
@@ -276,6 +314,7 @@ export async function runCli(argv) {
           open: !!flags.open,
           tui: cmd === 'tui' ? process.stdout.isTTY : wantTui,
           web: !flags['no-web'] && cmd !== 'tui',
+          notifications: !flags['no-notify'] && process.env.CLAUDE_TRACKER_NOTIFY !== '0',
           refresh,
           fastRefresh,
         });

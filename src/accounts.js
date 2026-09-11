@@ -1,6 +1,5 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { execFileSync } from 'node:child_process';
 import { discoverProfiles } from './paths.js';
 import { db, tx } from './db.js';
 import { accountAggregates } from './aggregates.js';
@@ -16,10 +15,10 @@ import { accountAggregates } from './aggregates.js';
  *
  * In order of authority:
  *
- *   1. bridge   - the transcript states the owner outright.
- *   2. email    - the session recorded the address it was signed in as.
- *   3. profile  - the profile's account timeline at the session's start.
- *   4. inferred - the session sits between two anchors that agree.
+ * Per-call attribution (attributeEvents) weighs, strongest first: the session's
+ * own signed-in records, observed logins, refusal consensus, bridge records, and
+ * other sessions in the profile - see createResolver. Session-level attribution
+ * (attributeSessions) is the older, coarser answer, kept as a last resort.
  *
  * Sessions that remain ambiguous are left unattributed rather than guessed at,
  * so the dashboard can show honestly how much is unaccounted for.
@@ -63,31 +62,6 @@ export function currentAccount() {
 }
 
 /**
- * Subscription tier from the macOS keychain, if it is readable without a prompt.
- * Only the plan descriptors are read - tokens are never stored or logged.
- */
-export function keychainTiers() {
-  if (process.platform !== 'darwin') return [];
-  const out = [];
-  for (const service of ['Claude Code-credentials', 'Claude Code-credentials-e5f6a7b8']) {
-    try {
-      const raw = execFileSync('security', ['find-generic-password', '-s', service, '-w'], {
-        encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 4000,
-      });
-      const o = JSON.parse(raw)?.claudeAiOauth;
-      if (!o) continue;
-      out.push({
-        service,
-        subscriptionType: o.subscriptionType ?? null,
-        rateLimitTier: o.rateLimitTier ?? null,
-        expiresAt: o.expiresAt ?? null,
-      });
-    } catch { /* locked, absent, or denied - not required */ }
-  }
-  return out;
-}
-
-/**
  * Account sightings recovered from a profile's rotating config backups. Each
  * backup is a dated snapshot of who was signed into that profile, which is what
  * makes it possible to attribute sessions from before the tracker existed.
@@ -127,12 +101,13 @@ function backupObservations(profile) {
 export function observeAccount(account, ts = Date.now(), source = 'watch') {
   if (!account?.accountUuid) return false;
   const dir = account.configDir ?? '';
-  // Only a change of account is news. Recording the same sighting on every
-  // refresh bloated this table to thousands of identical rows.
-  const last = db().prepare(`SELECT account_uuid FROM account_observations
+  // A change of account is always recorded; otherwise one heartbeat every 10
+  // minutes - enough to prove the profile was being watched in between (see
+  // createResolver), without a row on every refresh.
+  const last = db().prepare(`SELECT account_uuid, ts FROM account_observations
     WHERE config_dir = ? AND ts <= ? ORDER BY ts DESC LIMIT 1`).get(dir, ts);
   const changed = last?.account_uuid !== account.accountUuid;
-  if (changed) {
+  if (changed || ts - (last?.ts ?? 0) > 10 * 60_000) {
     db().prepare(`INSERT INTO account_observations (ts, config_dir, account_uuid, email, source)
                   VALUES (?,?,?,?,?) ON CONFLICT(ts, config_dir) DO NOTHING`)
       .run(ts, dir, account.accountUuid, account.email ?? null, source);
@@ -173,19 +148,12 @@ export function upsertAccount(a, ts = Date.now()) {
 export function discoverAccounts() {
   const d = db();
   const profiles = discoverProfiles();
-  const tiers = keychainTiers();
   const seen = [];
 
   tx(() => {
     for (const profile of profiles) {
       const cur = profileAccount(profile);
       if (cur) {
-        // Only trust the keychain's plan fields when there is one entry to read;
-        // with several profiles there is no way to tell which entry is whose.
-        if (tiers.length === 1) {
-          cur.subscriptionType = tiers[0].subscriptionType;
-          cur.rateLimitTier ||= tiers[0].rateLimitTier;
-        }
         upsertAccount(cur);
         observeAccount(cur, Date.now(), 'config');
         seen.push(cur);
@@ -406,8 +374,11 @@ function resolverSignature(d) {
   const a = d.prepare('SELECT COUNT(*) n, MAX(ts) m FROM identity_points').get();
   const b = d.prepare('SELECT COUNT(*) n, MAX(ts) m FROM account_observations').get();
   const c = d.prepare('SELECT COUNT(*) n, COUNT(email) e FROM accounts').get();
-  const s = d.prepare('SELECT COUNT(account_uuid) n FROM sessions').get();
-  return `${a.n}:${a.m}|${b.n}:${b.m}|${c.n}:${c.e}|${s.n}`;
+  const s = d.prepare('SELECT COUNT(*) n, COUNT(account_uuid) k FROM sessions').get();
+  const l = d.prepare('SELECT COUNT(*) n, MAX(ts) m FROM limit_events').get();
+  // Readings matter per session and window, not per reading.
+  const u = d.prepare('SELECT COUNT(*) n FROM (SELECT DISTINCT session_id, limit_type, resets_at FROM utilization)').get();
+  return `${a.n}:${a.m}|${b.n}:${b.m}|${c.n}:${c.e}|${s.n}:${s.k}|${l.n}:${l.m}|${u.n}`;
 }
 
 function buildResolver() {
@@ -422,57 +393,279 @@ function buildResolver() {
 function createResolver(d) {
   const byEmail = new Map(d.prepare(
     'SELECT LOWER(email) e, account_uuid a FROM accounts WHERE email IS NOT NULL').all().map((r) => [r.e, r.a]));
+  const sessionDir = new Map(d.prepare('SELECT session_id, config_dir FROM sessions').all()
+    .map((r) => [r.session_id, r.config_dir]));
 
-  const sessionTl = new Map();
-  for (const r of d.prepare('SELECT session_id, ts, email, account_uuid FROM identity_points ORDER BY ts').all()) {
-    const acct = r.account_uuid ?? (r.email ? byEmail.get(r.email) : null);
-    if (!acct) continue;
-    if (!sessionTl.has(r.session_id)) sessionTl.set(r.session_id, []);
-    const tl = sessionTl.get(r.session_id);
-    if (!tl.length || tl[tl.length - 1].account !== acct) tl.push({ ts: r.ts, account: acct });
-  }
-
-  const profileTl = new Map();
-  const pts = d.prepare('SELECT ts, config_dir dir, account_uuid account FROM account_observations WHERE config_dir != \'\'').all();
-  const firstObs = new Map();
-  for (const p of pts) firstObs.set(p.dir, Math.min(firstObs.get(p.dir) ?? Infinity, p.ts));
-  // A session's own identity records are dated evidence about its profile - but
-  // only for stretches the profile's own observations don't cover. Where the
-  // profile was watched directly, that is the authority: a background job keeps
-  // its identity after the profile switches, and must not drag it back.
-  for (const r of d.prepare(`SELECT p.ts, s.config_dir dir, p.session_id FROM identity_points p
-      JOIN sessions s ON s.session_id = p.session_id WHERE s.config_dir IS NOT NULL`).all()) {
-    if (r.ts >= (firstObs.get(r.dir) ?? Infinity)) continue;
-    const tl = sessionTl.get(r.session_id);
-    const hit = tl && [...tl].reverse().find((e) => e.ts <= r.ts);
-    if (hit) pts.push({ ts: r.ts, dir: r.dir, account: hit.account });
-  }
-  for (const p of pts.sort((x, y) => x.ts - y.ts)) {
-    if (!profileTl.has(p.dir)) profileTl.set(p.dir, []);
-    const tl = profileTl.get(p.dir);
-    if (!tl.length || tl[tl.length - 1].account !== p.account) tl.push({ ts: p.ts, account: p.account });
-  }
-
-  // Latest entry at or before t; before the first, only when there is no rival.
-  const at = (tl, t) => {
+  /*
+   * Evidence, by kind:
+   *
+   *   S  the session's own context records (the signed-in email, written at
+   *      start and again when a /login is typed into that session), plus the
+   *      refusals and status-line readings those corroborate;
+   *   O  who was seen signed into the profile, while the tracker watched;
+   *   C  refusal and reading consensus (below);
+   *   F  the profile's switches: every session's first record, and every record
+   *      that changed account. A /login moves every session in the profile, not
+   *      just the one it was typed into - sessions refused together have been
+   *      seen carrying on at once under the account just signed in, though only
+   *      one of them recorded it;
+   *   W  bridge records, which name the account a session's remote-control
+   *      bridge registered with and can be days out of date.
+   *
+   * The newest evidence at or before a call decides, so a session follows its
+   * profile's latest login unless its own records are more recent. S, C and O
+   * keep every point; F and W only the moments the account changed, since their
+   * repeats confirm nothing.
+   */
+  const push = (map, key, ts, account) => {
+    if (!account || key == null || ts == null) return;
+    if (!map.has(key)) map.set(key, []);
+    map.get(key).push({ ts, account });
+  };
+  const sortAll = (map) => { for (const tl of map.values()) tl.sort((a, b) => a.ts - b.ts); };
+  const collapse = (map) => {
+    for (const [k, tl] of map) {
+      tl.sort((a, b) => a.ts - b.ts);
+      map.set(k, tl.filter((e, i) => i === 0 || e.account !== tl[i - 1].account));
+    }
+  };
+  const latest = (tl, t) => {
     if (!tl?.length) return null;
-    let hit = null;
-    for (const e of tl) { if (e.ts <= t) hit = e.account; else break; }
-    if (hit) return hit;
-    return new Set(tl.map((e) => e.account)).size === 1 ? tl[0].account : null;
+    let lo = 0, hi = tl.length;
+    while (lo < hi) { const m = (lo + hi) >> 1; if (tl[m].ts <= t) lo = m + 1; else hi = m; }
+    return lo ? tl[lo - 1] : null;
+  };
+  const firstAfter = (tl, t) => {
+    if (!tl?.length) return -1;
+    let lo = 0, hi = tl.length;
+    while (lo < hi) { const m = (lo + hi) >> 1; if (tl[m].ts <= t) lo = m + 1; else hi = m; }
+    return lo < tl.length ? lo : -1;
+  };
+  // Does the timeline name anyone but `acct` between `from` and `to`?
+  const namesOther = (tl, from, to, acct) => {
+    for (let i = firstAfter(tl, from - 1); i !== -1 && i < tl.length && tl[i].ts <= to; i++) {
+      if (tl[i].account !== acct) return true;
+    }
+    return false;
+  };
+  // Before the first record, a timeline only speaks if it never names anyone else.
+  const soleAccount = (tl) => (tl?.length && tl.every((e) => e.account === tl[0].account) ? tl[0] : null);
+
+  const S = new Map(), W = new Map(), O = new Map(), C = new Map(), F = new Map();
+  const prev = new Map();
+  for (const r of d.prepare('SELECT session_id, ts, email, account_uuid, source FROM identity_points ORDER BY ts').all()) {
+    const acct = r.account_uuid ?? (r.email ? byEmail.get(r.email.toLowerCase()) : null);
+    if (!acct) continue;
+    push(r.source === 'context' ? S : W, r.session_id, r.ts, acct);
+    const k = `${r.source}|${r.session_id}`;
+    if (prev.get(k) === acct) continue;
+    prev.set(k, acct);
+    const dir = sessionDir.get(r.session_id);
+    if (dir) push(F, dir, r.ts, acct);
+  }
+  for (const r of d.prepare("SELECT ts, config_dir, account_uuid FROM account_observations WHERE config_dir != '' ORDER BY ts").all()) {
+    push(O, r.config_dir, r.ts, r.account_uuid);
+  }
+  sortAll(S); sortAll(O); collapse(W); collapse(F);
+  // The session's own records, before refusals and readings add to S.
+  const own = new Map([...S].map(([k, tl]) => [k, tl.slice()]));
+
+  // A sighting vouches for a profile only while it was being watched. The
+  // tracker records one at least every 10 minutes while it runs, so a longer gap
+  // means nobody was looking - and an isolated old snapshot must not claim
+  // months of history it knows nothing about.
+  const OBS_GAP = 25 * 60_000;
+  const observedAt = (dir, t) => {
+    if (!dir) return null;
+    const e = latest(O.get(dir), t);
+    return e && t - e.ts <= OBS_GAP ? e : null;
+  };
+  // When each watched login began: a change of account, or the first sighting after a gap.
+  const OC = new Map();
+  for (const [dir, tl] of O) {
+    OC.set(dir, tl.filter((e, i) => i === 0 || e.account !== tl[i - 1].account || e.ts - tl[i - 1].ts > OBS_GAP));
+  }
+
+  const WEIGHT = { S: 3, O: 2, W: 1, F: 0.5 };
+  // Everything known about a session at `t`, newest first; ties go to the
+  // stronger kind, listed first.
+  const evidence = (sid, dir, t, consensus = true) => {
+    const o = observedAt(dir, t);
+    return [
+      [latest(S.get(sid), t), 'session', WEIGHT.S],
+      [o && { ts: latest(OC.get(dir), t)?.ts ?? o.ts, account: o.account }, 'profile', WEIGHT.O],
+      [consensus ? latest(C.get(sid), t) : null, 'consensus', WEIGHT.W],
+      [dir ? latest(F.get(dir), t) : null, 'profile', WEIGHT.F],
+      [latest(W.get(sid), t), 'bridge', WEIGHT.W],
+    ].filter(([e]) => e).sort((a, b) => b[0].ts - a[0].ts);
+  };
+
+  /*
+   * Refusals and status-line readings. Every session on an account is refused -
+   * and reads - with that account's reset time, so a (limit, reset) pair names
+   * exactly one account, whatever each session's own stale records claim. Each
+   * group is settled by vote, most certain first, within what is possible: an
+   * account never holds two overlapping windows of one kind, and an account
+   * that is blocked cannot take the call that opens a five-hour window.
+   */
+  const spanOf = (type) => (type === 'five_hour' ? 5 * 3600e3 : 7 * 86400e3);
+  const SLOT = 10 * 60e3;     // a five-hour window starts on the 10-minute boundary before its first call
+  const GRACE = 60e3;         // requests already in flight when a refusal lands still complete
+  const groups = new Map();
+  const member = (type, resetsAtSec, m) => {
+    const key = `${type}|${resetsAtSec}`;
+    if (!groups.has(key)) groups.set(key, { key, type, resetsAt: resetsAtSec * 1000, members: [], refusals: [], overage: null });
+    const g = groups.get(key);
+    g.members.push(m);
+    return g;
+  };
+  for (const r of d.prepare(`SELECT l.limit_type, l.resets_at, l.ts, l.session_id, l.overage, s.config_dir
+      FROM limit_events l LEFT JOIN sessions s ON s.session_id = l.session_id
+      WHERE l.status = 'rejected'`).all()) {
+    const m = { sid: r.session_id, dir: r.config_dir, ts: r.ts };
+    const g = member(r.limit_type, r.resets_at, m);
+    g.refusals.push(m);
+    g.overage ??= r.overage;
+  }
+  for (const r of d.prepare(`SELECT u.limit_type, u.resets_at, u.ts, u.session_id, COALESCE(u.config_dir, s.config_dir) config_dir
+      FROM utilization u LEFT JOIN sessions s ON s.session_id = u.session_id
+      WHERE u.resets_at IS NOT NULL AND u.limit_type IN ('five_hour', 'seven_day')`).all()) {
+    member(r.limit_type, Math.round(r.resets_at / 1000), { sid: r.session_id, dir: r.config_dir, ts: r.ts });
+  }
+  for (const g of groups.values()) {
+    g.members.sort((a, b) => a.ts - b.ts);
+    g.refusals.sort((a, b) => a.ts - b.ts);
+    const votes = new Map();
+    // One vote per session, from the newest evidence at its latest record here.
+    for (const m of new Map(g.members.map((x) => [x.sid, x])).values()) {
+      const top = evidence(m.sid, m.dir, m.ts, false)[0];
+      if (!top) continue;
+      const v = votes.get(top[0].account) ?? { total: 0, max: 0 };
+      v.total += top[2]; v.max = Math.max(v.max, top[2]);
+      votes.set(top[0].account, v);
+    }
+    g.ranked = [...votes.entries()].sort((a, b) => b[1].max - a[1].max || b[1].total - a[1].total);
+    g.strength = g.ranked[0]?.[1].max ?? 0;
+    g.start = g.resetsAt - spanOf(g.type);
+    g.first = g.members[0].ts;
+    // From the refusal to the reset the account served nothing - unless overage
+    // was letting calls through.
+    g.block = g.refusals.length && !String(g.overage ?? '').startsWith('allowed')
+      ? [g.refusals[0].ts, g.resetsAt] : null;
+  }
+
+  const owned = new Map();      // `${acct}|${type}` -> its windows
+  const opens = new Map();      // acct -> when its five-hour windows opened
+  const blocked = new Map();    // acct -> spans it could serve nothing
+  const groupAccount = new Map();
+  const fits = (acct, g) => {
+    if ((owned.get(`${acct}|${g.type}`) ?? []).some(([s0, e0]) => s0 < g.resetsAt && g.start < e0)) return false;
+    if (g.type === 'five_hour' && (blocked.get(acct) ?? []).some(([f, u]) => f <= g.start && u >= g.start + SLOT)) return false;
+    if (g.block && (opens.get(acct) ?? []).some((s) => g.block[0] <= s && g.block[1] >= s + SLOT)) return false;
+    return true;
+  };
+  const firstCall = d.prepare('SELECT MIN(ts) m FROM events WHERE ts >= ? AND ts <= ? AND +session_id = ?');
+  const assign = (g, acct, tier) => {
+    const key = `${acct}|${g.type}`;
+    if (!owned.has(key)) owned.set(key, []);
+    owned.get(key).push([g.start, g.resetsAt]);
+    if (g.type === 'five_hour') { if (!opens.has(acct)) opens.set(acct, []); opens.get(acct).push(g.start); }
+    if (g.block) { if (!blocked.has(acct)) blocked.set(acct, []); blocked.get(acct).push(g.block); }
+    groupAccount.set(g.key, acct);
+    for (const m of g.members) push(tier, m.sid, m.ts, acct);
+    // A five-hour window opens with a call, so a refused session's calls since
+    // it opened were the refused account's too - unless its own records or its
+    // watched profile show it arriving there part-way.
+    if (g.type !== 'five_hour') return;
+    for (const m of new Map([...g.refusals].reverse().map((x) => [x.sid, x])).values()) {
+      const c = m.sid ? firstCall.get(g.start, m.ts, m.sid)?.m : null;
+      if (c == null || namesOther(own.get(m.sid), c, m.ts, acct) || namesOther(OC.get(m.dir), c, m.ts, acct)) continue;
+      push(tier, m.sid, c, acct);
+    }
+  };
+  for (const g of [...groups.values()].sort((a, b) => b.strength - a.strength || a.first - b.first)) {
+    const pick = g.ranked.find(([acct]) => fits(acct, g));
+    // A refusal corroborated by strong evidence is itself strong evidence.
+    if (pick) assign(g, pick[0], pick[1].max >= WEIGHT.O ? S : C);
+  }
+  // A group nothing could settle goes to the most recent account seen in its
+  // profile that could have held the window. Never a later one: history must
+  // not drift onto an account signed in afterwards.
+  for (const g of [...groups.values()].filter((x) => !groupAccount.has(x.key)).sort((a, b) => a.first - b.first)) {
+    const tried = new Set();
+    for (const dir of new Set(g.members.map((m) => m.dir).filter(Boolean))) {
+      const tl = F.get(dir) ?? [];
+      const j = firstAfter(tl, g.first);
+      for (let i = (j === -1 ? tl.length : j) - 1; i >= 0 && !groupAccount.has(g.key); i--) {
+        const a = tl[i].account;
+        if (tried.has(a)) continue;
+        tried.add(a);
+        if (fits(a, g)) assign(g, a, C);
+      }
+    }
+  }
+  sortAll(S); sortAll(C);
+
+  const blockedAt = (acct, t) => (blocked.get(acct) ?? []).some(([f, u]) => t >= f + GRACE && t < u);
+  // Did the profile carry on during a block? One that made no calls until the
+  // reset simply waited it out, still on the same account.
+  const carriedOn = d.prepare('SELECT 1 FROM events WHERE ts >= ? AND ts < ? AND config_dir = ? LIMIT 1');
+  const movedCache = new Map();
+  const movedDuring = (dir, f, u) => {
+    if (!dir) return true;
+    const k = `${dir}|${f}|${u}`;
+    if (!movedCache.has(k)) movedCache.set(k, !!carriedOn.get(f + GRACE, u, dir));
+    return movedCache.get(k);
+  };
+  // Forced off: the account was refused between this evidence and the call, and
+  // either still is, or the profile carried on without it in the meantime.
+  const forcedOff = (acct, from, t, dir) => (blocked.get(acct) ?? []).some(([f, u]) =>
+    f + GRACE <= t && u > from && (t < u || movedDuring(dir, f, u)));
+  // Where a refused session went: the first thing seen of it, or of its
+  // profile, after the call that names an account able to serve it.
+  const nextAccount = (sid, dir, t, leaving) => {
+    let best = null;
+    for (const tl of [S.get(sid), C.get(sid), dir && OC.get(dir), dir && F.get(dir), W.get(sid)]) {
+      for (let i = firstAfter(tl, t); i !== -1 && i < tl.length; i++) {
+        const e = tl[i];
+        if (best && e.ts >= best.ts) break;
+        if (e.account !== leaving && !blockedAt(e.account, t)) { best = e; break; }
+      }
+    }
+    return best;
+  };
+
+  // The first account a session is seen on, for calls made before any record.
+  const firstSeen = (sid) => {
+    let best = null;
+    for (const tl of [S.get(sid), C.get(sid), W.get(sid)]) if (tl?.length && (!best || tl[0].ts < best.ts)) best = tl[0];
+    return best;
   };
 
   const sessionAcct = new Map(d.prepare(
-    'SELECT session_id, account_uuid FROM sessions WHERE account_uuid IS NOT NULL').all().map((r) => [r.session_id, r.account_uuid]));
+    'SELECT session_id, account_uuid, first_ts FROM sessions WHERE account_uuid IS NOT NULL').all()
+    .map((r) => [r.session_id, { account: r.account_uuid, ts: r.first_ts ?? 0 }]));
 
-  return (sessionId, configDir, ts) => {
-    const s = at(sessionTl.get(sessionId), ts);
-    if (s) return [s, 'session'];
-    const p = configDir ? at(profileTl.get(configDir), ts) : null;
-    if (p) return [p, 'profile'];
-    const i = sessionAcct.get(sessionId);
-    return i ? [i, 'inferred'] : [null, null];
+  const resolve = (sid, dir, t) => {
+    const o = observedAt(dir, t);
+    for (const [e, src] of evidence(sid, dir, t)) {
+      if (!forcedOff(e.account, Math.min(e.ts, t), t, dir)) return [e.account, src];
+      // Refused since. A watched profile is the best witness of where the
+      // session went - and if it still shows that account, the call was served.
+      if (o) return [o.account, o.account === e.account ? 'profile' : 'moved'];
+      const n = nextAccount(sid, dir, t, e.account);
+      if (n) return [n.account, 'moved'];
+    }
+    // Nothing usable at or before the call: the first record after it speaks.
+    for (const [e, src] of [
+      [firstSeen(sid), 'session'], [sessionAcct.get(sid), 'inferred'], [dir ? soleAccount(F.get(dir)) : null, 'profile'],
+    ]) {
+      if (e && !blockedAt(e.account, t)) return [e.account, src];
+    }
+    return [null, null];
   };
+  resolve.groupAccount = (type, resetsAtSec) => groupAccount.get(`${type}|${resetsAtSec}`) ?? null;
+  return resolve;
 }
 
 /**
@@ -496,15 +689,27 @@ export function attributeEvents({ since = 0, all = false, includeNull = true } =
       const [acct, src] = resolve(r.session_id, r.config_dir, r.ts);
       if (acct !== r.account_uuid) { upd.run(acct, src, r.call_id); changed++; minChangedTs = Math.min(minChangedTs, r.ts); }
     }
-    // Rejections belong to whoever made the refused call.
-    for (const l of d.prepare(`SELECT l.id, l.session_id, l.ts, s.config_dir FROM limit_events l
+    // A refusal belongs to the account its whole group was settled on.
+    for (const l of d.prepare(`SELECT l.id, l.session_id, l.ts, l.limit_type, l.resets_at, s.config_dir FROM limit_events l
         LEFT JOIN sessions s ON s.session_id = l.session_id
         WHERE ${includeNull || all ? 'l.account_uuid IS NULL OR ' : ''}l.ts >= ?`).all(all ? 0 : since)) {
-      const [acct] = resolve(l.session_id, l.config_dir, l.ts);
+      const acct = resolve.groupAccount(l.limit_type, l.resets_at) ?? resolve(l.session_id, l.config_dir, l.ts)[0];
       if (acct) d.prepare('UPDATE limit_events SET account_uuid = ? WHERE id = ?').run(acct, l.id);
+    }
+    // So does a status-line reading: its reset time says whose window it read.
+    const updU = d.prepare('UPDATE utilization SET account_uuid = ? WHERE rowid = ?');
+    const from = all ? 0 : Math.min(since, Date.now() - 8 * 86400e3);
+    for (const u of d.prepare('SELECT rowid id, limit_type, resets_at, account_uuid FROM utilization WHERE resets_at IS NOT NULL AND ts >= ?').all(from)) {
+      const acct = resolve.groupAccount(u.limit_type, Math.round(u.resets_at / 1000));
+      if (acct && acct !== u.account_uuid) updU.run(acct, u.id);
     }
   });
   return { checked: rows.length, changed, minChangedTs: Number.isFinite(minChangedTs) ? minChangedTs : null };
+}
+
+/** The rules calls are billed by, for asking which account a session is on. */
+export function accountResolver() {
+  return buildResolver();
 }
 
 /**

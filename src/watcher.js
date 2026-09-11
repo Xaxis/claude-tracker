@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { discoverProfiles, HOME } from './paths.js';
 import { profileAccount, observeAccount } from './accounts.js';
+import { LIVE_DIR } from './live.js';
 
 /**
  * Live watching.
@@ -108,6 +109,10 @@ export function startWatcher({ onChange }) {
         });
       }
     }
+    // Exact utilization, dropped by the status line on every render.
+    try { fs.mkdirSync(LIVE_DIR, { recursive: true }); } catch { /* read-only data dir */ }
+    tryWatch(LIVE_DIR, {}, (_e, name) => { if (name && String(name).endsWith('.json')) schedule('live'); });
+
     // A new ~/.claude-* directory is a new account to track.
     tryWatch(HOME, {}, (_e, name) => {
       if (name && String(name).startsWith('.claude') && !String(name).includes('.json')) attach();

@@ -1,60 +1,109 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { db } from './db.js';
-import { discoverProfiles } from './paths.js';
-import { accountLabel, listAccounts, currentAccount, profileAccount } from './accounts.js';
+import { discoverProfiles, HOME, tildify } from './paths.js';
+import { accountLabel, listAccounts, currentAccount, profileAccount, accountResolver } from './accounts.js';
 import { capacityFor } from './calibrate.js';
-import { LIMIT_TYPES, currentWindow, burnRate, recentWindows } from './windows.js';
+import { LIMIT_TYPES, currentWindow, burnRate, recentWindows, sumBetween } from './windows.js';
 import { modelLabel } from './pricing.js';
 import { billingPeriod, periodSpend } from './billing.js';
 import { accountAggregates } from './aggregates.js';
 
 const UNATTRIBUTED = '__unattributed__';
 
-/** Percent used, clamped for display but reported raw in `raw`. */
-function pct(used, capacity) {
-  if (!capacity) return { value: 0, raw: 0 };
-  const raw = (used / capacity) * 100;
-  return { value: Math.max(0, Math.min(100, raw)), raw };
+/** Every limit Claude Code knows about, including ones only a refusal reveals. */
+const EXTRA_LABELS = {
+  seven_day_opus: 'Weekly Opus (7d)', seven_day_sonnet: 'Weekly Sonnet (7d)',
+  seven_day_oauth_apps: 'Weekly apps (7d)', spend_limit: 'Spend limit',
+};
+export const limitLabel = (type) => LIMIT_TYPES[type]?.label ?? EXTRA_LABELS[type] ?? type;
+
+/** The newest exact reading for an account's window that has not reset yet. */
+function exactReading(accountUuid, type, now) {
+  return db().prepare(`SELECT ts, pct, resets_at FROM utilization
+     WHERE account_uuid = ? AND limit_type = ? AND (resets_at > ? OR (resets_at IS NULL AND ts > ?))
+     ORDER BY ts DESC LIMIT 1`).get(accountUuid, type, now, now - 30 * 60_000) ?? null;
 }
 
 /**
- * Status of one limit window: how full it is, when it frees up, and - while a
- * window is open and burning - roughly how long the remaining headroom lasts.
+ * Status of one limit window: how full it is, when it frees up, and - while it
+ * is open and burning - roughly how long the headroom lasts.
+ *
+ * Where Claude Code has reported the window's exact utilization (through a
+ * session's status line), that is the reading, and its reset time is the one
+ * the server gave. Between reports it is carried forward with the calls made
+ * since, at the rate the report itself implies - local spend per point. Only
+ * with no report does the bar fall back to an estimated ceiling.
  */
 function windowStatus(accountUuid, type, tier, now) {
   const w = currentWindow(accountUuid, type, now);
   const cap = capacityFor(accountUuid, type, tier);
-  const used = w.cost ?? 0;
-  const p = pct(used, cap.capacity);
-  const rate = w.active ? burnRate(accountUuid, type === 'five_hour' ? 30 : 180, now) : null;
+  const rate = burnRate(accountUuid, type === 'five_hour' ? 30 : 180, now);
+  const ex = exactReading(accountUuid, type, now);
+
+  let percent, used = w.cost ?? 0, capacity = cap.capacity, confidence = cap.confidence;
+  let start = w.start, end = w.end, active = w.active;
+  if (ex) {
+    end = ex.resets_at ?? end;
+    start = end ? end - LIMIT_TYPES[type].span : start;
+    const before = sumBetween(accountUuid, start ?? ex.ts, ex.ts).cost;
+    const after = sumBetween(accountUuid, ex.ts, now).cost;
+    const perPoint = ex.pct >= 3 && before > 0 ? before / ex.pct : capacity ? capacity / 100 : null;
+    percent = ex.pct + (perPoint ? after / perPoint : 0);
+    used = before + after;
+    if (perPoint) capacity = perPoint * 100;
+    confidence = 'exact';
+    active = true;
+  } else {
+    percent = capacity ? (used / capacity) * 100 : 0;
+  }
+  const percentRaw = percent;
+  percent = Math.max(0, Math.min(100, percent));
 
   // A window that is already full has nothing left to project.
   let exhaustsAt = null;
-  if (w.active && used < cap.capacity && rate && rate.perHour > 0) {
-    const remaining = Math.max(0, cap.capacity - used);
-    const hours = remaining / rate.perHour;
-    const projected = now + hours * 3600 * 1000;
-    // Only meaningful if the burn would exhaust the window before it resets.
-    if (projected < w.end) exhaustsAt = projected;
+  if (active && percent < 100 && rate.perHour > 0 && capacity) {
+    const projected = now + ((((100 - percent) / 100) * capacity) / rate.perHour) * 3600e3;
+    if (end && projected < end) exhaustsAt = projected;
   }
 
   return {
-    type,
-    label: LIMIT_TYPES[type].label,
-    active: w.active,
-    start: w.start,
-    end: w.end,
-    resetsInMs: w.end ? Math.max(0, w.end - now) : null,
-    used,
-    capacity: cap.capacity,
-    confidence: cap.confidence,
-    samples: cap.samples,
-    percent: p.value,
-    percentRaw: p.raw,
-    events: w.events ?? 0,
-    burnPerHour: rate?.perHour ?? 0,
-    exhaustsAt,
+    type, label: limitLabel(type), active, start, end,
+    resetsInMs: end ? Math.max(0, end - now) : null,
+    used, capacity, confidence, samples: cap.samples,
+    percent, percentRaw, events: w.events ?? 0,
+    burnPerHour: rate.perHour, exhaustsAt, exactAt: ex?.ts ?? null,
+  };
+}
+
+/**
+ * The account to use right now: never one that is refused on any limit,
+ * preferring one already signed into a profile (usable immediately), then the
+ * most headroom in its tightest window. An idle window counts as empty - the
+ * next request opens a fresh one.
+ */
+function recommend(rows) {
+  const signedIn = new Map();
+  for (const p of discoverProfiles()) {
+    const acct = profileAccount(p);
+    if (acct && !signedIn.has(acct.accountUuid)) signedIn.set(acct.accountUuid, p);
+  }
+  const scored = rows.filter((a) => !a.limits.some((l) => l.blocked)).map((a) => {
+    const core = a.limits.filter((l) => LIMIT_TYPES[l.type]);
+    const headroom = core.length ? Math.min(...core.map((l) => 100 - (l.active ? l.percent : 0))) : 100;
+    return {
+      a, headroom, profile: signedIn.get(a.accountUuid) ?? null,
+      exact: core.every((l) => !l.active || l.confidence === 'exact'),
+    };
+  }).sort((x, y) => (Number(!!y.profile) - Number(!!x.profile)) || y.headroom - x.headroom);
+  const best = scored[0];
+  if (!best) return null;
+  const p = best.profile;
+  return {
+    accountUuid: best.a.accountUuid, label: best.a.label, headroom: best.headroom, exact: best.exact,
+    profile: p?.name ?? null,
+    command: p ? (p.isDefault ? 'claude' : `CLAUDE_CONFIG_DIR=${tildify(p.dir)} claude`) : null,
+    note: p ? null : 'not signed into any profile - /login with it first',
   };
 }
 
@@ -91,6 +140,26 @@ export function overview(now = Date.now()) {
       }
       return st;
     });
+    // Limits only a refusal reveals - weekly Opus and Sonnet caps and the like.
+    for (const r of rejections.filter((x) => x.account_uuid === a.account_uuid && !LIMIT_TYPES[x.limit_type])) {
+      limits.push({
+        type: r.limit_type, label: limitLabel(r.limit_type), active: true, blocked: true,
+        start: null, end: r.resets_at * 1000, resetsInMs: Math.max(0, r.resets_at * 1000 - now),
+        used: null, capacity: null, confidence: 'measured', samples: 0, percent: 100, percentRaw: 100,
+        events: 0, burnPerHour: 0, exhaustsAt: null, exactAt: null,
+      });
+    }
+    // A gateway spend limit, when Claude Code reports one.
+    const spend = exactReading(a.account_uuid, 'spend_limit', now);
+    if (spend) {
+      limits.push({
+        type: 'spend_limit', label: limitLabel('spend_limit'), active: true, blocked: spend.pct >= 100,
+        start: null, end: spend.resets_at, resetsInMs: spend.resets_at ? Math.max(0, spend.resets_at - now) : null,
+        used: null, capacity: null, confidence: 'exact', samples: 0,
+        percent: Math.min(100, spend.pct), percentRaw: spend.pct,
+        events: 0, burnPerHour: 0, exhaustsAt: null, exactAt: spend.ts,
+      });
+    }
     const totals = agg.get(a.account_uuid) ?? { events: 0, cost: 0 };
 
     // Only a monthly subscription has a cycle to project. A prepaid or org seat
@@ -123,6 +192,7 @@ export function overview(now = Date.now()) {
     accounts: rows,
     unattributed: { events: unattributed.events, cost: unattributed.cost },
     current: cur ? { accountUuid: cur.accountUuid, email: cur.email } : null,
+    recommendation: recommend(rows),
   };
 }
 
@@ -168,7 +238,7 @@ export function history(days = 30, accountUuid = null) {
 /** Recent sessions with their cost and owning account. */
 export function sessions(limit = 40, accountUuid = null) {
   const { clause: where, params } = accountFilter(accountUuid, 'WHERE');
-  return db().prepare(`
+  const rows = db().prepare(`
     SELECT s.session_id, s.project, s.cwd, s.git_branch, s.first_ts, s.last_ts,
            s.account_uuid, s.account_source, s.version,
            COALESCE(SUM(e.cost_usd), 0) AS cost,
@@ -179,31 +249,34 @@ export function sessions(limit = 40, accountUuid = null) {
      GROUP BY s.session_id
      HAVING events > 0
      ORDER BY s.last_ts DESC LIMIT @limit`).all({ limit, ...params });
+  // A session that switched accounts billed each for part of it - list both.
+  const split = db().prepare(`SELECT account_uuid a, SUM(cost_usd) c FROM events
+     WHERE session_id = ? GROUP BY account_uuid ORDER BY MIN(ts)`);
+  for (const r of rows) r.accounts = split.all(r.session_id).map((x) => ({ accountUuid: x.a, cost: x.c }));
+  return rows;
 }
 
 /**
  * Claude Code processes running right now, across every profile, each with the
  * account it is running as *at this moment*.
  *
- * That is per session, not per profile. An interactive session follows a /login
- * onto the new account and records the switch in its own transcript; a parked
- * background job keeps the identity it started with. So a session's current
- * account is its own latest identity record, and only a session that has never
- * written one falls back to whoever is signed into its profile.
+ * A session's current account is decided by the same rules its calls are
+ * billed by - the newest of its own records and its profile's latest login - so
+ * a /login typed into one session shows on every session it moved.
  */
 export function liveSessions(now = Date.now()) {
   const d = db();
   const acctRows = d.prepare('SELECT * FROM accounts').all();
   const byUuid = new Map(acctRows.map((a) => [a.account_uuid, a]));
-  const byEmail = new Map(acctRows.filter((a) => a.email).map((a) => [a.email.toLowerCase(), a]));
 
   // Prefix match written as a range so it can use the index - LIKE 'x%' can't
   // here, and forced a full scan of every call for every running session.
-  const lastIdentity = d.prepare(`SELECT ts, email, account_uuid FROM identity_points
+  const lastIdentity = d.prepare(`SELECT session_id sid, ts FROM identity_points
      WHERE session_id >= ? AND session_id < ? || '~' ORDER BY ts DESC LIMIT 1`);
   const recent = d.prepare(`SELECT COUNT(*) calls, COALESCE(SUM(cost_usd),0) cost, MAX(ts) last
      FROM events WHERE session_id >= ? AND session_id < ? || '~' AND ts >= ?`);
-  const lastCall = d.prepare(`SELECT MAX(ts) last FROM events WHERE session_id >= ? AND session_id < ? || '~'`);
+  const lastCall = d.prepare(`SELECT session_id sid, MAX(ts) last FROM events WHERE session_id >= ? AND session_id < ? || '~'`);
+  const who = accountResolver();
 
   const out = [];
   for (const profile of discoverProfiles()) {
@@ -220,15 +293,18 @@ export function liveSessions(now = Date.now()) {
 
       // A parked job writes its transcript under its job id, not the host session's.
       const keys = [s.sessionId, s.parkedJobId].filter(Boolean);
-      let ident = null;
+      // The transcript's own id: whichever key has the newest record or call.
+      let sid = null, seen = -Infinity;
       for (const k of keys) {
-        const r = lastIdentity.get(k, k);
-        if (r && (!ident || r.ts > ident.ts)) ident = r;
+        for (const r of [lastIdentity.get(k, k), lastCall.get(k, k)]) {
+          const ts = r?.ts ?? r?.last;
+          if (r?.sid && ts > seen) { sid = r.sid; seen = ts; }
+        }
       }
       let acct = null, source = null;
-      if (ident) {
-        acct = ident.account_uuid ? byUuid.get(ident.account_uuid) : byEmail.get(ident.email);
-        source = 'session';
+      if (sid) {
+        const [uuid, src] = who(sid, profile.dir, now);
+        if (uuid) { acct = byUuid.get(uuid) ?? { account_uuid: uuid }; source = src; }
       }
       if (!acct && signedIn) { acct = byUuid.get(signedIn.accountUuid); source = 'profile'; }
 
