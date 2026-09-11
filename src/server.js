@@ -150,7 +150,7 @@ export async function serve({ port = 4785, open = false, refresh, fastRefresh, t
       // Bind to loopback only: this exposes local usage history and should
       // never be reachable from the network. As a background service, wait for
       // the port rather than exit - a foreground tracker may be holding it.
-      let waited = false;
+      let waited = false, lost = null;
       for (;;) {
         try {
           // Each attempt removes both of its listeners, whichever way it ends -
@@ -164,15 +164,23 @@ export async function serve({ port = 4785, open = false, refresh, fastRefresh, t
           });
           break;
         } catch (err) {
-          if (err.code !== 'EADDRINUSE' || tui) throw err;
+          if (err.code !== 'EADDRINUSE') throw err;
+          // A dashboard that loses the port between the probe and the bind -
+          // usually to the login service starting up - joins whoever took it.
+          if (tui) { lost = await probe(port); break; }
           waited = true;
           await new Promise((r) => setTimeout(r, 5000));
         }
       }
-      // Whatever held the port may have been an older tracker re-attributing
-      // with its own rules meanwhile; settle everything again under ours.
-      if (waited) await serial(() => refresh({ quiet: true, reattribute: 'all' }));
-      addr = `http://127.0.0.1:${port}`;
+      if (lost) {
+        web = false;
+        if (lost === 'tracker') { attached = true; addr = `http://127.0.0.1:${port}`; }
+      } else {
+        // Whatever held the port may have been an older tracker re-attributing
+        // with its own rules meanwhile; settle everything again under ours.
+        if (waited) await serial(() => refresh({ quiet: true, reattribute: 'all' }));
+        addr = `http://127.0.0.1:${port}`;
+      }
     }
   }
 
