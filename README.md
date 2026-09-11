@@ -96,7 +96,10 @@ it is billing right now, whether it is busy, when it last did anything, and what
 it has spent in the last five minutes.
 
 In the terminal dashboard: `q` quit · `r` refresh · `a` cycle account ·
-`w` switch window · `space` pause · `↑↓`/`jk` scroll.
+`w` switch window · `space` pause · `↑↓`/`jk` scroll · `o` open the web
+dashboard. The address in its header is a link as well: Cmd-click it in
+terminals that support hyperlinks, such as iTerm2, Ghostty, kitty, WezTerm and
+VS Code's.
 
 ## How it works
 
