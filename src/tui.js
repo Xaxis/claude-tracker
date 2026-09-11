@@ -218,6 +218,17 @@ export function startTui({ webUrl, onQuit }) {
       L.push('');
     }
 
+    // ---- which account to use right now
+    const rec = ov.recommendation;
+    if (rec) {
+      const how = rec.command ? `  ${C.accent}${rec.command}${C.reset}` : `  ${C.muted}${rec.note}${C.reset}`;
+      L.push(`  ${C.good}USE NOW${C.reset}  ${A.bold}${rec.label}${A.reset}  ` +
+        `${C.muted}${Math.round(rec.headroom)}% headroom${rec.exact ? '' : ' (est)'}${C.reset}${how}`);
+    } else {
+      L.push(`  ${C.critical}Every account is refused right now${C.reset} ${C.muted}- see resets below${C.reset}`);
+    }
+    L.push('');
+
     // ---- running now, each with the account it is billing *right now*
     rule(`RUNNING NOW · ${data.live.length} session${data.live.length === 1 ? '' : 's'}`);
     const shown = data.live.slice(0, 10);
@@ -242,7 +253,8 @@ export function startTui({ webUrl, onQuit }) {
     for (const a of ov.accounts) {
       const mark = a.isCurrent ? `${C.good}●${C.reset}` : `${C.muted}○${C.reset}`;
       const tier = a.tier ? `${C.muted}${a.tier.replace('default_claude_', '').replace(/_/g, ' ')}${C.reset}` : '';
-      const stats = `${C.muted}${money(a.totalCost)} · ${a.sessions} sessions${C.reset}`;
+      const exact = a.limits.some((l) => l.confidence === 'exact') ? `${C.good}exact${C.reset} ${C.muted}·${C.reset} ` : '';
+      const stats = `${exact}${C.muted}${money(a.totalCost)} · ${a.sessions} session${a.sessions === 1 ? '' : 's'}${C.reset}`;
       const name = `${mark} ${A.bold}${a.label}${A.reset} ${tier}`;
       L.push(`  ${padEnd(truncate(name, inner - vlen(stats) - 2), inner - vlen(stats))}${stats}`);
 
@@ -273,7 +285,7 @@ export function startTui({ webUrl, onQuit }) {
         L.push([
           `    ${C.muted}${padEnd(l.label, LABEL)}${C.reset}`,
           meterBar(l.percent, barW, sev.color),
-          `${sev.color}${String(Math.round(l.percent)).padStart(3)}%${C.reset}${l.confidence === 'measured' ? ' ' : `${C.muted}≈${C.reset}`}`,
+          `${sev.color}${String(Math.round(l.percent)).padStart(3)}%${C.reset}${l.confidence === 'measured' || l.confidence === 'exact' ? ' ' : `${C.muted}≈${C.reset}`}`,
           showWhen ? `${C.muted}${padEnd(when, whenW)}${C.reset}` : '',
           `${sev.color}${sev.word}${C.reset}`,
         ].filter(Boolean).join(' '));
@@ -290,7 +302,7 @@ export function startTui({ webUrl, onQuit }) {
         tier: 'borrowed from another account on the same plan',
         default: 'estimated — no limit observed anywhere yet',
       };
-      const soft = a.limits.filter((l) => l.confidence !== 'measured');
+      const soft = a.limits.filter((l) => l.confidence !== 'measured' && l.confidence !== 'exact');
       if (soft.length) {
         // Group so two limits sharing a confidence produce one line, not two.
         const seen = new Set();

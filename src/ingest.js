@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import readline from 'node:readline';
 import { discoverProfiles, prettyProject } from './paths.js';
-import { db, tx } from './db.js';
+import { db, tx, getMeta, setMeta } from './db.js';
 import { costOf } from './pricing.js';
 
 /**
@@ -137,6 +137,11 @@ function prepare(d) {
   return STMT;
 }
 
+function flushBridge(ctx, ts) {
+  STMT.identity.run(ctx.pendingBridge.sid, ts, null, ctx.pendingBridge.acct, 'bridge');
+  ctx.pendingBridge = null;
+}
+
 /** Parse one JSONL line and write whatever it carries. Returns 1 if it was a usage event. */
 function handleLine(line, ctx) {
   if (!line || line.length < 2 || line[0] !== '{') return 0;
@@ -144,12 +149,16 @@ function handleLine(line, ctx) {
   try { d = JSON.parse(line); } catch { return 0; }
 
   const type = d.type;
+  const at0 = tsMs(d.timestamp);
+  if (at0 && ctx.pendingBridge) flushBridge(ctx, at0);
 
   // Owner of a bridged session - the only place a transcript names its account.
   if (type === 'bridge-session') {
     if (d.sessionId && d.ownerAccountUuid) {
       STMT.bridge.run(d.sessionId, d.ownerAccountUuid);
-      if (ctx.lastTs) STMT.identity.run(d.sessionId, ctx.lastTs, null, d.ownerAccountUuid, 'bridge');
+      // It carries no timestamp. It is written as a session starts or resumes,
+      // so the line after it says when - the one before can be hours older.
+      ctx.pendingBridge = { sid: d.sessionId, acct: d.ownerAccountUuid };
       STMT.acctSeen.run(d.ownerAccountUuid, d.ownerOrganizationUuid ?? null, ctx.now, ctx.now);
     }
     return 0;
@@ -266,6 +275,9 @@ async function ingestFile(file, from) {
       }
       consumed = from + pendingBytes;
     }
+    // A bridge record with nothing after it was written as the file last changed.
+    const at = ctx.pendingBridge && (file.mtime ?? ctx.lastTs);
+    if (at) { begin(); inTx++; flushBridge(ctx, at); }
     commit();
   } catch (err) {
     try { if (inTx) d.exec('ROLLBACK'); } catch { /* nothing to roll back */ }
@@ -281,7 +293,36 @@ async function ingestFile(file, from) {
  * Scan every transcript, ingesting only what is new.
  * @param {{force?: boolean, onProgress?: (done:number,total:number)=>void}} opts
  */
+/**
+ * Bridge records used to be dated by the line before them, which backdates one
+ * written when a session is resumed - by hours, onto an account signed in only
+ * since. Re-date each one already stored by the call that followed it. Once.
+ */
+export function redateBridgePoints() {
+  if (getMeta('bridge_dating') === '2') return;
+  const d = db();
+  const calls = new Map();
+  for (const r of d.prepare('SELECT session_id s, ts FROM events WHERE session_id IS NOT NULL ORDER BY ts').all()) {
+    if (!calls.has(r.s)) calls.set(r.s, []);
+    calls.get(r.s).push(r.ts);
+  }
+  const move = d.prepare("UPDATE OR IGNORE identity_points SET ts = ? WHERE session_id = ? AND ts = ? AND source = 'bridge'");
+  const drop = d.prepare("DELETE FROM identity_points WHERE session_id = ? AND ts = ? AND source = 'bridge'");
+  tx(() => {
+    for (const p of d.prepare("SELECT session_id s, ts FROM identity_points WHERE source = 'bridge'").all()) {
+      const tl = calls.get(p.s);
+      if (!tl) continue;
+      let lo = 0, hi = tl.length;
+      while (lo < hi) { const m = (lo + hi) >> 1; if (tl[m] <= p.ts) lo = m + 1; else hi = m; }
+      if (lo === tl.length) continue;                                  // nothing followed it
+      if (!move.run(tl[lo], p.s, p.ts).changes) drop.run(p.s, p.ts);   // one already stands there
+    }
+    setMeta('bridge_dating', '2');
+  });
+}
+
 export async function ingestAll(opts = {}) {
+  redateBridgePoints();
   const d = db();
   prepare(d);
   const profiles = opts.profiles ?? discoverProfiles();

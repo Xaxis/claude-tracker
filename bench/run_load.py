@@ -36,7 +36,7 @@ env = dict(os.environ, HOME=home, CLAUDE_TRACKER_DIR=f'{root}/db', TERM='xterm-2
 
 pid, fd = pty.fork()                       # the tracker: TUI + web, one process
 if pid == 0:
-    os.chdir(REPO); os.execvpe('node', ['node', 'bin/cli.js', 'serve', '--port', str(PORT)], env)
+    os.chdir(REPO); os.execvpe('node', ['node', 'bin/cli.js', 'serve', '--port', str(PORT), '--no-notify'], env)
 fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack('HHHH', 160, 130, 0, 0))
 frames, buf = [], [b'']
 def reader():
@@ -71,8 +71,10 @@ time.sleep(3)
 cdp = subprocess.Popen(['node', f'{S}/cdp-sample.mjs', f'http://127.0.0.1:{PORT}/', f'{root}/dom.jsonl', '56000', str(CDP)])
 time.sleep(4)
 
+live = f'{root}/db/live'; os.makedirs(live, exist_ok=True)
+RESET_BASE = int(time.time()) // 600 * 600
 T0 = time.time()
-writers = [subprocess.Popen(['node', f'{S}/writer.mjs', proj, sess, f'{i:08d}-aaaa-bbbb-cccc-{i:012d}', f'load-{i:02d}', '1' if i == 0 else '0', root])
+writers = [subprocess.Popen(['node', f'{S}/writer.mjs', proj, sess, f'{i:08d}-aaaa-bbbb-cccc-{i:012d}', f'load-{i:02d}', '1' if i == 0 else '0', root, live, str(RESET_BASE)])
            for i in range(N)]
 time.sleep(20)
 T_SWITCH = time.time()
@@ -89,8 +91,19 @@ chrome.terminate()
 
 # ---------------------------------------------------------------- analysis
 log = [l.split() for l in open(f'{root}/calls.log')]
+db = sqlite3.connect(f'{root}/db/tracker.db')
+stored = dict(db.execute(f'''SELECT e.call_id, a.email FROM events e LEFT JOIN accounts a ON a.account_uuid = e.account_uuid
+    WHERE e.call_id IN ({','.join('?' * len(log))})''', [row[3] for row in log]))
+# A session that did not type the /login moves when its process picks up the new
+# login - within the second after the config changed. A call in that second is
+# ambiguous by nature, so it counts as whichever account the tracker chose.
+BG = '00000000-aaaa-bbbb-cccc-000000000000'
+ambiguous = 0
+for row in log:
+    if row[2] != BG and row[1] == 'alice@test.dev' and T_SWITCH <= int(row[0]) / 1000 < T_SWITCH + 1 and stored.get(row[3]) == 'bob@test.dev':
+        row[1] = 'bob@test.dev'; ambiguous += 1
 writes = {'alice@test.dev': [], 'bob@test.dev': []}
-for ms, acct, sid in log: writes[acct].append(int(ms) / 1000)
+for ms, acct, sid, cid in log: writes[acct].append(int(ms) / 1000)
 for v in writes.values(): v.sort()
 def staleness(t, acct, cost):
     """How old the displayed number is: now minus when that many calls had been written."""
@@ -144,16 +157,24 @@ r = first([(t, strip.sub('', raw)) for t, raw in frames], lambda x: re.search(r'
 print(f'  terminal shows bob billing   +{r:.2f}s' if r is not None else '  terminal NEVER showed bob billing')
 
 want, sids = {}, set()
-for ms, acct, sid in log: want[(sid, acct)] = want.get((sid, acct), 0) + 1; sids.add(sid)
-db = sqlite3.connect(f'{root}/db/tracker.db')
+for ms, acct, sid, cid in log: want[(sid, acct)] = want.get((sid, acct), 0) + 1; sids.add(sid)
 # Only the simulated sessions - a seeded index also holds real history.
 got = {(s, e): n for s, e, n in db.execute(f'''SELECT e.session_id, a.email, COUNT(*) FROM events e
     LEFT JOIN accounts a ON a.account_uuid = e.account_uuid
     WHERE e.session_id IN ({','.join('?' * len(sids))}) GROUP BY 1, 2''', sorted(sids))}
 bad = {k: (want.get(k, 0), got.get(k, 0)) for k in set(want) | set(got) if want.get(k, 0) != got.get(k, 0)}
 print(f'\nattribution, call by call: {sum(want.values())} written, {sum(got.values())} stored, {len(bad)} session/account mismatches')
+print(f'  ({ambiguous} calls fell in the second between the config switch and their session noticing it)')
 for k, v in list(bad.items())[:6]: print('  mismatch', k, 'written/stored', v)
-last = strip.sub('', frames[-3][1]) if len(frames) > 3 else ''
+# Exact utilization reached both dashboards through the status-line path.
+last_dom = dom[-1] if dom else {'cards': []}
+exact_web = sorted((c['name'] or '').strip() for c in last_dom['cards'] if c.get('exact'))
+last_txt = strip.sub('', frames[-3][1]) if len(frames) > 3 else ''
+exact_tui = sorted(a for a in writes if re.search(re.escape(a) + r'[^\n]*exact ·', last_txt))
+print(f'\nexact readings shown  web: {exact_web or "none"}   terminal: {exact_tui or "none"}')
+print(f'"use now" on the web: {last_dom.get("useNow")}')
+bad = bad or ({} if 'bob@test.dev' in exact_web and 'bob@test.dev' in exact_tui else {'exact': 'not shown'})
+last = last_txt
 print('\nlast terminal frame (top):'); print('\n'.join(l.rstrip() for l in last.split('\n')[:22]))
 
 print(f'\nartifacts: {root}')

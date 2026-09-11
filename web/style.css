@@ -299,3 +299,22 @@ td { font-variant-numeric: tabular-nums; }
 .status-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--baseline); vertical-align: middle; }
 .status-dot.is-busy { background: var(--warning); }
 .ago { font-variant-numeric: tabular-nums; }
+
+/* --- use now -------------------------------------------------------------- */
+.recommend { display: flex; align-items: center; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
+.recommend-body { min-width: 0; }
+.recommend-name { margin: 0; font-size: 20px; font-weight: 600; word-break: break-word; }
+.command {
+  font: 13px ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: var(--text-primary); background: var(--page);
+  border: 1px solid var(--border); border-radius: 8px;
+  padding: 8px 12px; cursor: pointer; max-width: 100%;
+  overflow-x: auto; white-space: nowrap;
+}
+.command:hover { border-color: var(--baseline); }
+.command[data-copied]::after { content: '  copied'; color: var(--text-muted); }
+.live-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 10px 24px; }
+.exact-tag {
+  margin-left: 6px; font-size: 10px; letter-spacing: .04em; text-transform: uppercase;
+  color: var(--good); border: 1px solid currentColor; border-radius: 4px; padding: 0 4px;
+}

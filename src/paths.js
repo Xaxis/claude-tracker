@@ -3,6 +3,14 @@ import path from 'node:path';
 import fs from 'node:fs';
 
 export const HOME = os.homedir();
+// Profiles are resolved through symlinks, so home must be too if it is to match them.
+const REAL_HOME = (() => { try { return fs.realpathSync(HOME); } catch { return HOME; } })();
+
+/** A path with the home directory shortened to ~. */
+export function tildify(p) {
+  for (const h of [REAL_HOME, HOME]) if (p === h || p.startsWith(h + path.sep)) return '~' + p.slice(h.length);
+  return p;
+}
 
 /**
  * Claude profiles.
@@ -87,7 +95,7 @@ export function discoverProfiles() {
     configFile: configFileFor(dir),
     backupsDir: path.join(dir, 'backups'),
     sessionsDir: path.join(dir, 'sessions'),
-    isDefault: dir === path.join(HOME, '.claude'),
+    isDefault: [HOME, REAL_HOME].some((h) => dir === path.join(h, '.claude')),
   }));
 }
 
@@ -118,4 +126,28 @@ export function prettyProject(slug, cwd) {
   if (cwd) return path.basename(cwd) || cwd;
   const parts = String(slug).split('-').filter(Boolean);
   return parts[parts.length - 1] || slug;
+}
+
+/** The repository root, for launching the tracker's own scripts. */
+export const REPO_DIR = path.resolve(path.dirname(new URL(import.meta.url).pathname), '..');
+
+/**
+ * A node binary that survives upgrades: the one on PATH (a stable symlink), not
+ * the versioned install path the current process happens to be running from.
+ */
+export function nodeBinary() {
+  for (const dir of (process.env.PATH ?? '').split(path.delimiter)) {
+    if (!dir) continue;
+    const p = path.join(dir, 'node');
+    try { fs.accessSync(p, fs.constants.X_OK); return p; } catch { /* keep looking */ }
+  }
+  return process.execPath;
+}
+
+/** The config file of the profile in `dir`, wherever that profile keeps it. */
+export function configFileOf(dir) {
+  const inside = path.join(dir, '.claude.json');
+  if (fs.existsSync(inside)) return inside;
+  const beside = path.join(path.dirname(dir), `${path.basename(dir)}.json`);
+  return fs.existsSync(beside) ? beside : null;
 }

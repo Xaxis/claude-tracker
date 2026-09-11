@@ -7,6 +7,7 @@ import { overview, history, sessions, modelBreakdown, liveSessions, windowHistor
 import { verifyWindowModel } from './calibrate.js';
 import { startWatcher } from './watcher.js';
 import { listAccounts } from './accounts.js';
+import { notify } from './notify.js';
 
 const WEB_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'web');
 
@@ -62,6 +63,7 @@ function handleApi(req, res, url) {
   const days = Math.min(365, Math.max(1, Number(q.get('days') ?? 30)));
 
   switch (url.pathname) {
+    case '/api/health': return sendJson(res, { app: 'claude-tracker', pid: process.pid });
     case '/api/overview': return sendJson(res, overview());
     case '/api/history': return sendJson(res, history(days, account));
     case '/api/sessions': return sendJson(res, sessions(Math.min(200, Number(q.get('limit') ?? 40)), account));
@@ -97,7 +99,17 @@ function handleEvents(req, res) {
  * and the terminal always show the same numbers and the transcripts are only
  * scanned once no matter how many views are open.
  */
-export async function serve({ port = 4785, open = false, refresh, fastRefresh, tui = true, web = true }) {
+/** Is another claude-tracker already serving on this port? */
+async function probe(port) {
+  try {
+    const r = await fetch(`http://127.0.0.1:${port}/api/health`, { signal: AbortSignal.timeout(800) });
+    return (await r.json())?.app === 'claude-tracker' ? 'tracker' : 'other';
+  } catch (err) {
+    return err?.cause?.code === 'ECONNREFUSED' || err?.name === 'TypeError' ? 'free' : 'other';
+  }
+}
+
+export async function serve({ port = 4785, open = false, refresh, fastRefresh, tui = true, web = true, notifications = true }) {
   // Refreshes share one database connection and ingest in chunked transactions
   // that span awaits, so two must never interleave. Everything that writes goes
   // through this queue, one at a time.
@@ -125,20 +137,50 @@ export async function serve({ port = 4785, open = false, refresh, fastRefresh, t
   });
 
   let addr = null;
+  let attached = false;
   if (web) {
-    // Bind to loopback only: this exposes local usage history and should never
-    // be reachable from the network.
-    await new Promise((resolve, reject) => {
-      server.once('error', reject);
-      server.listen(port, '127.0.0.1', resolve);
-    });
-    addr = `http://127.0.0.1:${port}`;
+    // One web server per port. If a tracker already serves it - usually the
+    // login service - the terminal dashboard attaches to that instead.
+    const who = await probe(port);
+    if (who === 'tracker' && tui) {
+      web = false; attached = true; addr = `http://127.0.0.1:${port}`;
+    } else if (who !== 'free' && tui) {
+      web = false;
+    } else {
+      // Bind to loopback only: this exposes local usage history and should
+      // never be reachable from the network. As a background service, wait for
+      // the port rather than exit - a foreground tracker may be holding it.
+      let waited = false;
+      for (;;) {
+        try {
+          await new Promise((resolve, reject) => {
+            server.once('error', reject);
+            server.listen(port, '127.0.0.1', () => { server.off('error', reject); resolve(); });
+          });
+          break;
+        } catch (err) {
+          if (err.code !== 'EADDRINUSE' || tui) throw err;
+          waited = true;
+          await new Promise((r) => setTimeout(r, 5000));
+        }
+      }
+      // Whatever held the port may have been an older tracker re-attributing
+      // with its own rules meanwhile; settle everything again under ours.
+      if (waited) await serial(() => refresh({ quiet: true, reattribute: 'all' }));
+      addr = `http://127.0.0.1:${port}`;
+    }
   }
 
   let ui = null;
+  // Alerts are checked at most every 10s, whatever the push rate.
+  let lastNotify = 0;
   const push = (info) => {
     if (web) broadcast('update', { reason: info.reason, at: Date.now(), newEvents: info.newEvents ?? 0 });
     ui?.update();
+    if (notifications && Date.now() - lastNotify > 10_000) {
+      lastNotify = Date.now();
+      try { notify(overview()); } catch { /* an alert must never take the dashboards down */ }
+    }
   };
 
   // Full rescan on a slow cadence: files the watches missed, keychain, calibration.
@@ -186,7 +228,7 @@ export async function serve({ port = 4785, open = false, refresh, fastRefresh, t
 
   if (tui) {
     const { startTui } = await import('./tui.js');
-    ui = startTui({ webUrl: addr ?? 'web dashboard off', onQuit: shutdown });
+    ui = startTui({ webUrl: addr ? `${addr}${attached ? ' (service)' : ''}` : 'web dashboard off', onQuit: shutdown });
   } else if (web) {
     console.log(`\n  claude-tracker  →  ${addr}\n  watching for new usage… (ctrl-c to stop)\n`);
   }

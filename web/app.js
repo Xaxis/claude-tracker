@@ -136,7 +136,7 @@ function renderAccounts(data) {
     idBox.append(el('div', 'account-name', a.label));
     const meta = [];
     if (a.tier) meta.push(a.tier.replace('default_claude_', '').replace(/_/g, ' '));
-    meta.push(`${a.sessions} sessions`);
+    meta.push(`${a.sessions} session${a.sessions === 1 ? '' : 's'}`);
     meta.push(`${money(a.totalCost)} tracked`);
     idBox.append(el('div', 'account-meta', meta.join(' · ')));
     head.append(idBox);
@@ -150,6 +150,11 @@ function renderAccounts(data) {
         ? `resets in ${duration(l.resetsInMs)}`
         : 'idle — next request opens a new window';
       const m = meter({ label: l.label, percent: l.percent, blocked: l.blocked, foot });
+      if (l.confidence === 'exact') {
+        const tag = el('span', 'exact-tag', 'exact');
+        tag.title = `Reported by Claude Code ${duration(Date.now() - l.exactAt)} ago, carried forward with calls since`;
+        m.querySelector('.meter-name').append(tag);
+      }
       m.dataset.resetAt = l.end ?? '';
       m.dataset.active = l.blocked || l.active ? '1' : '';
       card.append(m);
@@ -161,7 +166,7 @@ function renderAccounts(data) {
       }
       // Every unmeasured ceiling says so, on its own row - suppressing one to
       // reduce clutter would leave an estimate looking like a measurement.
-      if (l.confidence !== 'measured') {
+      if (l.confidence !== 'measured' && l.confidence !== 'exact') {
         const note = {
           partial: '≈ ceiling from one observed limit',
           tier: '≈ ceiling borrowed from a same-plan account',
@@ -205,6 +210,25 @@ function renderAccounts(data) {
   $('#accounts-note').textContent = note.join(' · ');
 }
 
+/** Which account to use right now, and the exact command that uses it. */
+function renderRecommendation(ov) {
+  const box = $('#recommend');
+  const r = ov.recommendation;
+  const btn = $('#rec-command');
+  box.hidden = false;
+  if (!r) {
+    $('#rec-name').textContent = 'Every account is refused right now';
+    $('#rec-why').textContent = 'The accounts below show which frees up first.';
+    btn.hidden = true;
+    return;
+  }
+  $('#rec-name').textContent = r.label;
+  $('#rec-why').textContent = `${Math.round(r.headroom)}% headroom in its tightest window` +
+    `${r.exact ? '' : ' (estimated)'}${r.note ? ` · ${r.note}` : ''}`;
+  btn.hidden = !r.command;
+  btn.textContent = r.command ?? '';
+}
+
 /** The single number the page leads with: the tightest live limit anywhere. */
 function renderHero(data) {
   let worst = null;
@@ -235,7 +259,8 @@ function renderHero(data) {
     label: 'Window fill',
     percent: limit.percent,
     blocked: limit.blocked,
-    foot: `${money(limit.used)} of ~${money(limit.capacity)}`,
+    foot: limit.confidence === 'exact' ? 'exact, reported by Claude Code'
+      : limit.used == null ? '' : `${money(limit.used)} of ~${money(limit.capacity)}`,
   }));
   const m = host.firstChild;
   m.dataset.resetAt = limit.end ?? '';
@@ -534,7 +559,9 @@ function renderSessions(rows, accounts) {
     const row = el('div', 'row');
     const main = el('div', 'row-main');
     main.append(el('div', 'row-title', s.project || s.cwd || s.session_id.slice(0, 8)));
-    const who = s.account_uuid ? (nameOf.get(s.account_uuid) ?? s.account_uuid.slice(0, 8)) : 'unattributed';
+    // A session that switched accounts billed each for its part: show the path.
+    const name = (u) => (u ? nameOf.get(u) ?? `${u.slice(0, 8)}…` : 'unattributed');
+    const who = s.accounts?.length ? s.accounts.map((x) => name(x.accountUuid)).join(' → ') : name(s.account_uuid);
     main.append(el('div', 'row-sub',
       `${dayOf(s.last_ts)} ${timeOf(s.last_ts)} · ${who}${s.git_branch ? ' · ' + s.git_branch : ''}`));
     row.append(main);
@@ -575,6 +602,7 @@ async function loadFast() {
     const [ov, live] = await Promise.all([getJson('/api/overview'), getJson('/api/live')]);
     state.overview = ov;
     renderHero(ov);
+    renderRecommendation(ov);
     renderAccounts(ov);
     renderLive(live);
     syncAccountFilter(ov);
@@ -683,4 +711,14 @@ function connect() {
 loadAll().then(connect).catch((err) => {
   document.querySelector('main').prepend(
     Object.assign(el('p', 'empty'), { textContent: `Could not load data: ${err.message}` }));
+});
+
+// Copy the recommended command with one click.
+$('#rec-command').addEventListener('click', async (e) => {
+  const btn = e.currentTarget;
+  try {
+    await navigator.clipboard.writeText(btn.textContent);
+    btn.dataset.copied = '1';
+    setTimeout(() => { delete btn.dataset.copied; }, 1400);
+  } catch { /* clipboard unavailable - the command is still selectable */ }
 });

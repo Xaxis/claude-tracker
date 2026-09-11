@@ -38,6 +38,23 @@
     </div>
   </section>
 
+  <section class="panel recommend" id="recommend" hidden>
+    <div class="recommend-body">
+      <p class="hero-label">Use now</p>
+      <p class="recommend-name" id="rec-name"></p>
+      <p class="panel-note" id="rec-why"></p>
+    </div>
+    <button class="command" id="rec-command" type="button" title="Copy command"></button>
+  </section>
+
+  <section class="panel">
+    <div class="panel-head">
+      <h2>Running now</h2>
+      <p class="panel-note" id="live-count"></p>
+    </div>
+    <div id="live-sessions" class="session-list live-grid"></div>
+  </section>
+
   <section class="panel">
     <div class="panel-head">
       <h2>Accounts</h2>
@@ -99,20 +116,10 @@
     </section>
   </div>
 
-  <div class="panel-row">
-    <section class="panel">
-      <div class="panel-head">
-        <h2>Running now</h2>
-        <p class="panel-note" id="live-count"></p>
-      </div>
-      <div id="live-sessions" class="session-list"></div>
-    </section>
-
-    <section class="panel">
-      <div class="panel-head"><h2>Recent sessions</h2></div>
-      <div id="sessions" class="session-list"></div>
-    </section>
-  </div>
+  <section class="panel">
+    <div class="panel-head"><h2>Recent sessions</h2></div>
+    <div id="sessions" class="session-list"></div>
+  </section>
 
   <footer class="foot">
     <p id="foot-note"></p>
