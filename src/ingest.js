@@ -91,8 +91,8 @@ function prepare(d) {
   STMT.event ||= d.prepare(`
     INSERT INTO events (call_id, uuid, ts, session_id, request_id, model, input_tokens, output_tokens,
                         thinking_tokens, cache_write_5m, cache_write_1h, cache_read, web_search,
-                        service_tier, speed, cost_usd, is_sidechain)
-    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                        service_tier, speed, cost_usd, is_sidechain, config_dir)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
     ON CONFLICT(call_id) DO NOTHING`);
   STMT.limit ||= d.prepare(`
     INSERT INTO limit_events (ts, session_id, account_uuid, limit_type, resets_at, status, overage)
@@ -127,6 +127,9 @@ function prepare(d) {
       org_uuid   = COALESCE(accounts.org_uuid, excluded.org_uuid),
       first_seen = MIN(COALESCE(accounts.first_seen, excluded.first_seen), excluded.first_seen),
       last_seen  = MAX(COALESCE(accounts.last_seen, excluded.last_seen), excluded.last_seen)`);
+  STMT.identity ||= d.prepare(`
+    INSERT INTO identity_points (session_id, ts, email, account_uuid, source) VALUES (?,?,?,?,?)
+    ON CONFLICT(session_id, ts, source) DO NOTHING`);
   STMT.fileMark ||= d.prepare(`
     INSERT INTO files (path, size, offset, mtime, scanned_at) VALUES (?,?,?,?,?)
     ON CONFLICT(path) DO UPDATE SET size = excluded.size, offset = excluded.offset,
@@ -146,6 +149,7 @@ function handleLine(line, ctx) {
   if (type === 'bridge-session') {
     if (d.sessionId && d.ownerAccountUuid) {
       STMT.bridge.run(d.sessionId, d.ownerAccountUuid);
+      if (ctx.lastTs) STMT.identity.run(d.sessionId, ctx.lastTs, null, d.ownerAccountUuid, 'bridge');
       STMT.acctSeen.run(d.ownerAccountUuid, d.ownerOrganizationUuid ?? null, ctx.now, ctx.now);
     }
     return 0;
@@ -159,7 +163,11 @@ function handleLine(line, ctx) {
     const raw = d.attachment.context?.userEmail;
     if (raw && d.sessionId) {
       const m = /email address is\s+([^\s,;]+@[^\s,;]+?)[.,;]?(?:\s|$)/i.exec(String(raw));
-      if (m) STMT.sessEmail.run(d.sessionId, m[1]);
+      if (m) {
+        STMT.sessEmail.run(d.sessionId, m[1]);
+        const at = tsMs(d.timestamp) ?? ctx.lastTs;
+        if (at) STMT.identity.run(d.sessionId, at, m[1].toLowerCase(), null, 'context');
+      }
     }
     return 0;
   }
@@ -173,6 +181,7 @@ function handleLine(line, ctx) {
   }
 
   const ts = tsMs(d.timestamp);
+  if (ts) ctx.lastTs = ts;
 
   // Rate-limit rejection: ground truth for calibration.
   const q = d.quotaLimits;
@@ -204,11 +213,12 @@ function handleLine(line, ctx) {
   const res = STMT.event.run(
     callId, d.uuid ?? null, ts, d.sessionId ?? null, d.requestId ?? null, model,
     u.input, u.output, u.thinking, u.cacheWrite5m, u.cacheWrite1h, u.cacheRead,
-    u.webSearch, u.serviceTier, u.speed, cost, d.isSidechain ? 1 : 0,
+    u.webSearch, u.serviceTier, u.speed, cost, d.isSidechain ? 1 : 0, ctx.configDir,
   );
   // A repeat of a response we already have contributes nothing; report only
   // rows actually stored so the ingest count means what it says.
   const stored = res.changes > 0 ? 1 : 0;
+  if (stored) ctx.minNewTs = Math.min(ctx.minNewTs ?? Infinity, ts);
 
   if (d.sessionId) {
     STMT.sessMeta.run(
@@ -234,7 +244,7 @@ async function ingestFile(file, from) {
   const d = db();
   const stream = fs.createReadStream(file.path, { start: from, encoding: 'utf8' });
   const rl = readline.createInterface({ input: stream, crlfDelay: Infinity });
-  const ctx = { slug: file.slug, configDir: file.configDir ?? null, now: Date.now() };
+  const ctx = { slug: file.slug, configDir: file.configDir ?? null, now: Date.now(), lastTs: null };
   let consumed = from;
   let events = 0;
   let pendingBytes = 0;
@@ -264,7 +274,7 @@ async function ingestFile(file, from) {
     rl.close();
     stream.destroy();
   }
-  return { consumed: Math.min(consumed, file.size), events };
+  return { consumed: Math.min(consumed, file.size), events, minNewTs: ctx.minNewTs ?? null };
 }
 
 /**
@@ -280,7 +290,7 @@ export async function ingestAll(opts = {}) {
     d.prepare('SELECT path, size, offset, mtime FROM files').all().map((r) => [r.path, r]),
   );
 
-  let scanned = 0, skipped = 0, newEvents = 0, bytes = 0;
+  let scanned = 0, skipped = 0, newEvents = 0, bytes = 0, minTs = Infinity;
   let batch = [];
 
   const flush = () => {
@@ -299,7 +309,8 @@ export async function ingestAll(opts = {}) {
       from = f.size >= prev.size ? prev.offset : 0;
     }
 
-    const { consumed, events } = await ingestFile(f, from);
+    const { consumed, events, minNewTs } = await ingestFile(f, from);
+    if (minNewTs != null) minTs = Math.min(minTs, minNewTs);
     newEvents += events;
     bytes += consumed - from;
     scanned++;
@@ -309,7 +320,40 @@ export async function ingestAll(opts = {}) {
   }
   flush();
 
-  return { files: files.length, scanned, skipped, newEvents, bytes, profiles: profiles.length };
+  return { files: files.length, scanned, skipped, newEvents, bytes, profiles: profiles.length,
+    minNewTs: Number.isFinite(minTs) ? minTs : null };
 }
 
 export { listTranscripts };
+
+/**
+ * Ingest only the transcripts named in `paths` - the watcher's fast path.
+ *
+ * A full scan stats every transcript on disk (thousands of files), which is fine
+ * as a periodic safety net but far too slow to run on every write when dozens
+ * of sessions are active. The watcher knows which file changed, so read just it.
+ */
+export async function ingestPaths(paths, opts = {}) {
+  const d = db();
+  prepare(d);
+  const profiles = opts.profiles ?? discoverProfiles();
+  const known = d.prepare('SELECT size, offset, mtime FROM files WHERE path = ?');
+  let scanned = 0, newEvents = 0, minTs = Infinity;
+  for (const p of new Set(paths)) {
+    if (!p || !p.endsWith('.jsonl')) continue;
+    const profile = profiles.find((pr) => p.startsWith(pr.projectsDir + path.sep));
+    if (!profile) continue;
+    let st;
+    try { st = fs.statSync(p); } catch { continue; }
+    const mtime = Math.floor(st.mtimeMs);
+    const prev = known.get(p);
+    if (prev && prev.size === st.size && prev.mtime === mtime) continue;
+    const from = prev && st.size >= prev.size ? prev.offset : 0;
+    const slug = path.relative(profile.projectsDir, p).split(path.sep)[0];
+    const { consumed, events, minNewTs } = await ingestFile({ path: p, slug, configDir: profile.dir, size: st.size, mtime }, from);
+    STMT.fileMark.run(p, st.size, consumed, mtime, Date.now());
+    scanned++; newEvents += events;
+    if (minNewTs != null) minTs = Math.min(minTs, minNewTs);
+  }
+  return { scanned, newEvents, minNewTs: Number.isFinite(minTs) ? minTs : null };
+}

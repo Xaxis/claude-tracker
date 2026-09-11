@@ -13,7 +13,7 @@ const { db, closeDb } = await import('../src/db.js');
 const { costOf, modelInfo, modelLabel } = await import('../src/pricing.js');
 const { buildWindows, currentWindow, FIVE_HOUR, SEVEN_DAY } = await import('../src/windows.js');
 const { calibrateAll, capacityFor } = await import('../src/calibrate.js');
-const { attributeSessions } = await import('../src/accounts.js');
+const { attributeSessions, attributeEvents } = await import('../src/accounts.js');
 
 process.on('exit', () => {
   try { closeDb(); fs.rmSync(TMP, { recursive: true, force: true }); } catch { /* best effort */ }
@@ -24,15 +24,17 @@ const MIN = 60_000;
 
 function reset() {
   const d = db();
-  for (const t of ['events', 'sessions', 'accounts', 'limit_events', 'calibration', 'account_observations', 'files']) {
+  for (const t of ['events', 'sessions', 'accounts', 'limit_events', 'calibration', 'account_observations', 'files', 'identity_points']) {
     d.exec(`DELETE FROM ${t}`);
   }
 }
 
 let seq = 0;
 function addEvent(sessionId, ts, cost) {
-  db().prepare(`INSERT INTO events (call_id, ts, session_id, model, cost_usd) VALUES (?,?,?,?,?)`)
-    .run(`e${seq++}`, ts, sessionId, 'claude-opus-5', cost);
+  // Calls carry their own account; in these fixtures it is the session's.
+  const acct = db().prepare('SELECT account_uuid a FROM sessions WHERE session_id = ?').get(sessionId)?.a ?? null;
+  db().prepare(`INSERT INTO events (call_id, ts, session_id, model, cost_usd, account_uuid) VALUES (?,?,?,?,?,?)`)
+    .run(`e${seq++}`, ts, sessionId, 'claude-opus-5', cost, acct);
 }
 function addSession(sessionId, firstTs, account, source = 'bridge') {
   db().prepare(`INSERT INTO sessions (session_id, first_ts, last_ts, account_uuid, account_source)
@@ -373,4 +375,81 @@ test('history is never attributed backwards to a newly signed-in account', () =>
   const got = db().prepare('SELECT account_uuid a FROM sessions WHERE session_id=?').get('old-work').a;
   assert.notEqual(got, 'just-logged-in', 'July usage must not land on an account that appeared in September');
   assert.equal(got, 'old-account');
+});
+
+
+/* ------------------------------------------------------ per-call attribution */
+
+function rawEvent(id, sessionId, ts, configDir) {
+  db().prepare(`INSERT INTO events (call_id, ts, session_id, model, cost_usd, config_dir)
+                VALUES (?,?,?,'claude-opus-5',1,?)`).run(id, ts, sessionId, configDir);
+}
+const acctOf = (id) => db().prepare('SELECT account_uuid a FROM events WHERE call_id = ?').get(id).a;
+
+test('a session that follows a /login bills each account for its own part', () => {
+  reset();
+  const dir = '/home/me/.claude';
+  const t0 = Date.UTC(2026, 8, 11, 13, 0);
+  const sw = t0 + 3 * HOUR;                      // the /login
+  db().prepare("INSERT INTO accounts (account_uuid, email) VALUES ('old', 'old@x.com'), ('new', 'new@x.com')").run();
+  db().prepare('INSERT INTO sessions (session_id, first_ts, last_ts, config_dir) VALUES (?,?,?,?)').run('s', t0, sw + HOUR, dir);
+  // The running session writes a context record at start, and again at the switch.
+  db().prepare("INSERT INTO identity_points (session_id, ts, email, source) VALUES ('s', ?, 'old@x.com', 'context')").run(t0);
+  db().prepare("INSERT INTO identity_points (session_id, ts, email, source) VALUES ('s', ?, 'new@x.com', 'context')").run(sw);
+  rawEvent('before', 's', sw - MIN, dir);
+  rawEvent('after', 's', sw + MIN, dir);
+
+  attributeEvents({ all: true });
+  assert.equal(acctOf('before'), 'old');
+  assert.equal(acctOf('after'), 'new', 'calls after the switch must not stay on the old account');
+});
+
+test('a background job keeps its own account when the profile switches', () => {
+  reset();
+  const dir = '/home/me/.claude';
+  const t0 = Date.UTC(2026, 8, 11, 13, 0);
+  const sw = t0 + HOUR;
+  db().prepare("INSERT INTO accounts (account_uuid, email) VALUES ('old', 'old@x.com'), ('new', 'new@x.com')").run();
+  // The profile moved to the new account...
+  db().prepare("INSERT INTO account_observations (ts, config_dir, account_uuid, source) VALUES (?, ?, 'old', 'watch')").run(t0, dir);
+  db().prepare("INSERT INTO account_observations (ts, config_dir, account_uuid, source) VALUES (?, ?, 'new', 'watch')").run(sw, dir);
+  // ...but the job's own transcript still says the old one after the switch.
+  db().prepare('INSERT INTO sessions (session_id, first_ts, last_ts, config_dir) VALUES (?,?,?,?)').run('job', t0, sw + HOUR, dir);
+  db().prepare("INSERT INTO identity_points (session_id, ts, email, source) VALUES ('job', ?, 'old@x.com', 'context')").run(sw + 30 * MIN);
+  rawEvent('job-call', 'job', sw + 40 * MIN, dir);
+  // An ordinary session with no records of its own follows the profile.
+  db().prepare('INSERT INTO sessions (session_id, first_ts, last_ts, config_dir) VALUES (?,?,?,?)').run('plain', sw, sw + HOUR, dir);
+  rawEvent('plain-call', 'plain', sw + 40 * MIN, dir);
+
+  attributeEvents({ all: true });
+  assert.equal(acctOf('job-call'), 'old', "the session's own record outranks the profile");
+  assert.equal(acctOf('plain-call'), 'new');
+});
+
+/* --------------------------------------------------------- schema rebuilds */
+
+test('account rows survive a schema rebuild', async () => {
+  // Plan tier and subscription dates come from config snapshots that rotate
+  // away within hours; a rebuild that drops them loses them for good.
+  const { spawnSync } = await import('node:child_process');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ct-rebuild-'));
+  const dbUrl = new URL('../src/db.js', import.meta.url).href;
+  const run = (code) => spawnSync(process.execPath, ['--no-warnings', '--input-type=module', '-e', code],
+    { env: { ...process.env, CLAUDE_TRACKER_DIR: dir }, encoding: 'utf8' });
+
+  let r = run(`const { db } = await import('${dbUrl}');
+    db().prepare("INSERT INTO accounts (account_uuid, email, rate_limit_tier, subscription_at, label) VALUES ('keep', 'k@x.com', 'max_20x', '2026-09-10T12:00:00Z', 'mine')").run();
+    db().prepare("UPDATE meta SET value = '1' WHERE key = 'schema_version'").run();`);
+  assert.equal(r.status, 0, r.stderr);
+
+  // Reopening at an older version forces a rebuild.
+  r = run(`const { db } = await import('${dbUrl}');
+    const row = db().prepare("SELECT email, rate_limit_tier, subscription_at, label FROM accounts WHERE account_uuid = 'keep'").get();
+    const v = db().prepare("SELECT value FROM meta WHERE key = 'schema_version'").get().value;
+    console.log(JSON.stringify({ row, rebuilt: v !== '1' }));`);
+  assert.equal(r.status, 0, r.stderr);
+  const out = JSON.parse(r.stdout.trim());
+  assert.equal(out.rebuilt, true, 'the rebuild actually ran');
+  assert.deepEqual({ ...out.row }, { email: 'k@x.com', rate_limit_tier: 'max_20x', subscription_at: '2026-09-10T12:00:00Z', label: 'mine' });
+  fs.rmSync(dir, { recursive: true, force: true });
 });

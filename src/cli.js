@@ -1,11 +1,12 @@
-import { ingestAll } from './ingest.js';
+import { ingestAll, ingestPaths } from './ingest.js';
 import {
   discoverAccounts, attributeSessions, attributeLimitEvents,
-  listAccounts, accountLabel, resolveAccountEmails, setLabel,
+  listAccounts, accountLabel, resolveAccountEmails, setLabel, attributeEvents,
 } from './accounts.js';
 import { calibrateAll, verifyWindowModel } from './calibrate.js';
 import { overview, modelBreakdown, liveSessions } from './api.js';
-import { LIMIT_TYPES } from './windows.js';
+import { LIMIT_TYPES, resetWindowCache, earliestCachedChain } from './windows.js';
+import { invalidateAggregates, aggregatesCutoff } from './aggregates.js';
 import { closeDb } from './db.js';
 import { DATA_DIR, DB_PATH } from './paths.js';
 
@@ -36,7 +37,7 @@ function bar(percent, width = 28) {
 }
 
 /** Full refresh: read new transcript data, then re-derive everything from it. */
-async function refresh({ quiet = false, force = false } = {}) {
+async function refresh({ quiet = false, force = false, reattribute = 'recent' } = {}) {
   const t0 = Date.now();
   discoverAccounts();
   let last = 0;
@@ -54,8 +55,39 @@ async function refresh({ quiet = false, force = false } = {}) {
   attributeSessions();
   attributeLimitEvents();
   resolveAccountEmails();
+  // Per-call attribution. A full pass on startup and explicit ingests; otherwise
+  // re-check the last six hours so late-arriving identity records still land.
+  const a = attributeEvents(reattribute === 'all' ? { all: true } : { since: Date.now() - 6 * 3600_000 });
+  invalidateCaches(reattribute === 'all', res.minNewTs, a.minChangedTs);
   calibrateAll();
   return { ...res, ms: Date.now() - t0 };
+}
+
+/**
+ * The live path, run on every burst of transcript writes.
+ *
+ * Reads only the files that changed and re-attributes only recent calls - no
+ * directory walk, no keychain, no recalibration. It has to stay cheap enough to
+ * run several times a second while dozens of sessions are writing at once.
+ */
+async function fastRefresh(paths = []) {
+  const t0 = Date.now();
+  const r = paths.length ? await ingestPaths(paths) : { scanned: 0, newEvents: 0 };
+  const a = attributeEvents({ since: Date.now() - 10 * 60_000, includeNull: false });
+  invalidateCaches(false, r.minNewTs, a.minChangedTs);
+  return { ...r, attributed: a.changed, ms: Date.now() - t0 };
+}
+
+/**
+ * Drop the cached window chains and account totals only when something they
+ * were built from changed - a new or re-attributed call older than what they
+ * already cover. Dropping them on every rescan made the next read rebuild whole
+ * histories once a minute.
+ */
+function invalidateCaches(all, ...times) {
+  const touched = Math.min(...times.map((t) => t ?? Infinity));
+  if (all || touched < earliestCachedChain()) resetWindowCache();
+  if (all || touched < aggregatesCutoff()) invalidateAggregates();
 }
 
 function cmdStatus() {
@@ -221,7 +253,7 @@ export async function runCli(argv) {
   try {
     switch (cmd) {
       case 'ingest': {
-        const r = await refresh({ force: !!flags.force });
+        const r = await refresh({ force: !!flags.force, reattribute: 'all' });
         console.log(`${c.green}✓${c.reset} ${r.scanned} transcripts read (${r.skipped} unchanged), ` +
           `${r.newEvents.toLocaleString()} new events in ${(r.ms / 1000).toFixed(1)}s`);
         break;
@@ -245,6 +277,7 @@ export async function runCli(argv) {
           tui: cmd === 'tui' ? process.stdout.isTTY : wantTui,
           web: !flags['no-web'] && cmd !== 'tui',
           refresh,
+          fastRefresh,
         });
         return; // the dashboards own the process from here
       }

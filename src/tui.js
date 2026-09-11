@@ -131,21 +131,26 @@ export function startTui({ webUrl, onQuit }) {
   };
 
   let data = { overview: null, live: [], models: [], windows: [] };
+  let slowAt = 0;
 
-  function collect() {
+  // Accounts and running sessions refresh on every push. The history panels are
+  // costlier and change slowly, so they refresh at most every 10s.
+  function collect(force = false) {
     const ov = overview();
     const accounts = ov.accounts;
     const picked = state.accountIdx > 0 ? accounts[state.accountIdx - 1] : null;
     // With no account selected, chart the busiest one - a freshly added account
     // has only a single window and makes the history look broken.
     const focus = picked ?? [...accounts].sort((a, b) => b.totalEvents - a.totalEvents)[0];
+    const slow = force || Date.now() - slowAt > 10_000;
     data = {
       overview: ov,
       live: liveSessions(),
-      models: modelBreakdown(7, picked?.accountUuid ?? null),
-      windows: focus ? windowHistory(focus.accountUuid, state.windowType, 24) : [],
+      models: slow ? modelBreakdown(7, picked?.accountUuid ?? null) : data.models,
+      windows: slow ? (focus ? windowHistory(focus.accountUuid, state.windowType, 24) : []) : data.windows,
       focus,
     };
+    if (slow) slowAt = Date.now();
   }
 
   /** Build the frame as an array of lines, each already fitted to `width`. */
@@ -163,7 +168,9 @@ export function startTui({ webUrl, onQuit }) {
 
     // ---- header
     const liveMark = state.live ? `${C.good}●${C.reset} live` : `${C.critical}●${C.reset} paused`;
-    const right = `${liveMark} ${C.muted}·${C.reset} ${C.accent}${webUrl}${C.reset}`;
+    // When the numbers below were read - proof at a glance that they are moving.
+    const stamp = `${C.muted}updated ${new Date(state.lastRefresh).toTimeString().slice(0, 8)}${C.reset}`;
+    const right = `${liveMark} ${C.muted}·${C.reset} ${stamp} ${C.muted}·${C.reset} ${C.accent}${webUrl}${C.reset}`;
     const left = `${A.bold}Claude Tracker${A.reset}`;
     L.push(`  ${padEnd(left, Math.max(0, inner - vlen(right)))}${right}`);
     L.push('');
@@ -210,6 +217,24 @@ export function startTui({ webUrl, onQuit }) {
       }
       L.push('');
     }
+
+    // ---- running now, each with the account it is billing *right now*
+    rule(`RUNNING NOW · ${data.live.length} session${data.live.length === 1 ? '' : 's'}`);
+    const shown = data.live.slice(0, 10);
+    for (const s of shown) {
+      const busy = s.status === 'busy';
+      const dot = busy ? `${C.warning}●${C.reset}` : `${C.muted}○${C.reset}`;
+      const ago = s.lastActivityAt ? duration(now - s.lastActivityAt) : '—';
+      const burn = s.recent.calls ? `${money(s.recent.cost)}/5m` : '';
+      const who = s.account ? `${s.account}${s.background ? ' (bg)' : ''}` : 'unknown account';
+      const name = s.name || s.sessionId.slice(0, 8);
+      const tail = `${C.muted}${padEnd(ago, 6)}${C.reset} ${padEnd(burn, 10)}`;
+      const whoW = Math.max(12, Math.min(30, inner - 22 - 18));
+      L.push(`  ${dot} ${padEnd(truncate(name, 20), 21)}${C.accent}${padEnd(truncate(who, whoW), whoW + 1)}${C.reset}${tail}`);
+    }
+    if (data.live.length > shown.length) L.push(`    ${C.muted}+${data.live.length - shown.length} more${C.reset}`);
+    if (!data.live.length) L.push(`  ${C.muted}no Claude Code sessions running${C.reset}`);
+    L.push('');
 
     // ---- accounts
     rule('ACCOUNTS');
@@ -310,18 +335,6 @@ export function startTui({ webUrl, onQuit }) {
     if (!data.models.length) L.push(`  ${C.muted}no usage in the last 7 days${C.reset}`);
     L.push('');
 
-    // ---- running now
-    rule(`RUNNING NOW · ${data.live.length} session${data.live.length === 1 ? '' : 's'}`);
-    L.push('');
-    for (const s of data.live.slice(0, 6)) {
-      const badge = s.status === 'busy' ? `${C.warning}busy${C.reset}` : `${C.muted}${s.status ?? 'idle'}${C.reset}`;
-      const name = `${s.name || s.sessionId.slice(0, 8)}`;
-      const cwd = `${C.muted}${(s.cwd ?? '').replace(process.env.HOME ?? '', '~')}${C.reset}`;
-      L.push(`  ${padEnd(truncate(name, 24), 26)}${padEnd(truncate(cwd, inner - 36), inner - 34)}${badge}`);
-    }
-    if (!data.live.length) L.push(`  ${C.muted}no Claude Code sessions running${C.reset}`);
-    L.push('');
-
     if (ov.unattributed.events) {
       L.push(`  ${C.muted}${ov.unattributed.events.toLocaleString()} events (${money(ov.unattributed.cost)}) not tied to an account${C.reset}`);
       L.push('');
@@ -354,9 +367,9 @@ export function startTui({ webUrl, onQuit }) {
     out.write(A.home + lines.join('\n') + A.reset);
   }
 
-  function refreshAndRender() {
+  function refreshAndRender(force = false) {
     try {
-      collect();
+      collect(force);
       state.error = null;
       state.lastRefresh = Date.now();
     } catch (err) {
@@ -380,13 +393,13 @@ export function startTui({ webUrl, onQuit }) {
     const accounts = data.overview?.accounts ?? [];
     switch (key) {
       case 'q': case '': quit(); return;
-      case 'r': refreshAndRender(); return;
+      case 'r': refreshAndRender(true); return;
       case 'a':
         state.accountIdx = (state.accountIdx + 1) % (accounts.length + 1);
-        refreshAndRender(); return;
+        refreshAndRender(true); return;
       case 'w':
         state.windowType = state.windowType === 'five_hour' ? 'seven_day' : 'five_hour';
-        refreshAndRender(); return;
+        refreshAndRender(true); return;
       case ' ':
         state.live = !state.live; render(); return;
       case '[A': case 'k': state.scroll = Math.max(0, state.scroll - 1); render(); return;

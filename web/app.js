@@ -499,15 +499,28 @@ function renderModels(rows) {
 function renderLive(rows) {
   const host = $('#live-sessions');
   host.textContent = '';
-  $('#live-count').textContent = rows.length ? `${rows.length} active` : '';
+  const busy = rows.filter((r) => r.status === 'busy').length;
+  $('#live-count').textContent = rows.length ? `${rows.length} running · ${busy} busy` : '';
   if (!rows.length) { host.append(el('p', 'empty', 'No Claude Code sessions running.')); return; }
   for (const s of rows) {
     const row = el('div', 'row');
     const main = el('div', 'row-main');
-    main.append(el('div', 'row-title', s.name || s.sessionId.slice(0, 8)));
-    main.append(el('div', 'row-sub', `${s.cwd ?? ''} · pid ${s.pid}`));
+    const title = el('div', 'row-title');
+    const dot = el('span', `status-dot ${s.status === 'busy' ? 'is-busy' : ''}`);
+    title.append(dot, document.createTextNode(' ' + (s.name || s.sessionId.slice(0, 8))));
+    main.append(title);
+    // The account this session is billing right now - per session, since a
+    // background job can keep an account the rest of its profile has left.
+    const who = s.account ? `${s.account}${s.background ? ' · background' : ''}` : 'unknown account';
+    main.append(el('div', 'row-sub', `${who} · ${(s.cwd ?? '').replace(/^\/Users\/[^/]+/, '~')}`));
     row.append(main);
-    row.append(el('div', 'row-value', s.status ?? ''));
+    const val = el('div', 'row-value');
+    const ago = el('span', 'ago');
+    if (s.lastActivityAt) ago.dataset.since = s.lastActivityAt;
+    ago.textContent = s.lastActivityAt ? `${duration(Date.now() - s.lastActivityAt)} ago` : '—';
+    val.append(ago);
+    if (s.recent?.calls) val.append(document.createTextNode(` · ${money(s.recent.cost)}/5m`));
+    row.append(val);
     host.append(row);
   }
 }
@@ -532,9 +545,14 @@ function renderSessions(rows, accounts) {
 
 /* --- countdown ------------------------------------------------------------ */
 
-/** Tick every reset countdown without refetching. */
+setInterval(() => { loadSlow().catch(() => {}); }, 10_000);
+
+/** Tick every reset countdown and "last active" label without refetching. */
 setInterval(() => {
   const now = Date.now();
+  for (const a of document.querySelectorAll('.ago[data-since]')) {
+    a.textContent = `${duration(now - Number(a.dataset.since))} ago`;
+  }
   for (const m of document.querySelectorAll('.meter[data-active="1"]')) {
     const end = Number(m.dataset.resetAt);
     if (!end) continue;
@@ -547,41 +565,57 @@ setInterval(() => {
 
 /* --- load ----------------------------------------------------------------- */
 
-async function loadAll() {
-  const ov = await getJson('/api/overview');
-  state.overview = ov;
-  renderHero(ov);
-  renderAccounts(ov);
+/** Accounts, hero and running sessions - cheap, and refreshed on every push. */
+let fastBusy = false, fastAgain = false;
+async function loadFast() {
+  // Coalesce: pushes can arrive faster than a round trip; never stack requests.
+  if (fastBusy) { fastAgain = true; return; }
+  fastBusy = true;
+  try {
+    const [ov, live] = await Promise.all([getJson('/api/overview'), getJson('/api/live')]);
+    state.overview = ov;
+    renderHero(ov);
+    renderAccounts(ov);
+    renderLive(live);
+    syncAccountFilter(ov);
+    $('#foot-note').textContent =
+      `Updated ${new Date().toLocaleTimeString()} · reading local transcripts only, nothing leaves this machine.`;
+  } finally {
+    fastBusy = false;
+    if (fastAgain) { fastAgain = false; loadFast().catch(() => {}); }
+  }
+}
 
-  // Keep the account filter in sync with what we know about.
+function syncAccountFilter(ov) {
   const sel = $('#filter-account');
   const want = ['all', ...ov.accounts.map((a) => a.accountUuid)].join(',');
-  if (sel.dataset.keys !== want) {
-    sel.dataset.keys = want;
-    const prev = state.account;
-    sel.textContent = '';
-    sel.append(new Option('All accounts', 'all'));
-    for (const a of ov.accounts) sel.append(new Option(a.label, a.accountUuid));
-    sel.value = [...sel.options].some((o) => o.value === prev) ? prev : 'all';
-    state.account = sel.value;
-  }
+  if (sel.dataset.keys === want) return;
+  sel.dataset.keys = want;
+  const prev = state.account;
+  sel.textContent = '';
+  sel.append(new Option('All accounts', 'all'));
+  for (const a of ov.accounts) sel.append(new Option(a.label, a.accountUuid));
+  sel.value = [...sel.options].some((o) => o.value === prev) ? prev : 'all';
+  state.account = sel.value;
+}
 
+/** Charts, model split, session history - heavier, and slow-moving. */
+async function loadSlow() {
   const acct = state.account === 'all' ? '' : `&account=${encodeURIComponent(state.account)}`;
-  const [daily, models, live, sess] = await Promise.all([
+  const [daily, models, sess] = await Promise.all([
     getJson(`/api/history?days=${state.days}${acct}`),
     getJson(`/api/models?days=${state.days}${acct}`),
-    getJson('/api/live'),
     getJson(`/api/sessions?limit=40${acct}`),
   ]);
-
   renderDaily(daily);
   renderModels(models);
-  renderLive(live);
-  renderSessions(sess, ov.accounts);
+  renderSessions(sess, state.overview?.accounts ?? []);
   await loadWindows();
+}
 
-  $('#foot-note').textContent =
-    `Updated ${new Date().toLocaleTimeString()} · reading local transcripts only, nothing leaves this machine.`;
+async function loadAll() {
+  await loadFast();
+  await loadSlow();
 }
 
 /**
@@ -637,7 +671,8 @@ function connect() {
   const label = $('#live-label');
   const box = $('#live-state');
   es.onopen = () => { box.className = 'live on'; label.textContent = 'live'; };
-  es.addEventListener('update', () => { loadAll().catch(() => {}); });
+  // Every push refreshes accounts and running sessions immediately.
+  es.addEventListener('update', () => { loadFast().catch(() => {}); });
   es.onerror = () => {
     box.className = 'live off';
     label.textContent = 'reconnecting…';

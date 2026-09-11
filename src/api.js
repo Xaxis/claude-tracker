@@ -2,11 +2,12 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { db } from './db.js';
 import { discoverProfiles } from './paths.js';
-import { accountLabel, listAccounts, currentAccount } from './accounts.js';
+import { accountLabel, listAccounts, currentAccount, profileAccount } from './accounts.js';
 import { capacityFor } from './calibrate.js';
 import { LIMIT_TYPES, currentWindow, burnRate, recentWindows } from './windows.js';
 import { modelLabel } from './pricing.js';
 import { billingPeriod, periodSpend } from './billing.js';
+import { accountAggregates } from './aggregates.js';
 
 const UNATTRIBUTED = '__unattributed__';
 
@@ -68,14 +69,12 @@ function activeRejections(now) {
 
 export function overview(now = Date.now()) {
   const d = db();
-  const accounts = listAccounts();
+  const agg = accountAggregates(now);
+  const accounts = listAccounts(agg);
   const cur = currentAccount();
   const rejections = activeRejections(now);
 
-  const unattributed = d.prepare(`
-    SELECT COUNT(*) AS events, COALESCE(SUM(e.cost_usd),0) AS cost
-      FROM events e LEFT JOIN sessions s ON s.session_id = e.session_id
-     WHERE s.account_uuid IS NULL`).get();
+  const unattributed = agg.get(null) ?? { events: 0, cost: 0 };
 
   const rows = accounts.map((a) => {
     const tier = a.rate_limit_tier;
@@ -92,12 +91,12 @@ export function overview(now = Date.now()) {
       }
       return st;
     });
-    const totals = d.prepare(`
-      SELECT COUNT(*) AS events, COALESCE(SUM(e.cost_usd),0) AS cost
-        FROM events e JOIN sessions s ON s.session_id = e.session_id
-       WHERE s.account_uuid = ?`).get(a.account_uuid);
+    const totals = agg.get(a.account_uuid) ?? { events: 0, cost: 0 };
 
-    const period = billingPeriod(a.subscription_at, 'month', now);
+    // Only a monthly subscription has a cycle to project. A prepaid or org seat
+    // records a start date too, but projecting monthly renewals from it is fiction.
+    const projectable = !a.billing_type || a.billing_type === 'stripe_subscription';
+    const period = projectable ? billingPeriod(a.subscription_at, 'month', now) : null;
     return {
       accountUuid: a.account_uuid,
       label: accountLabel(a),
@@ -135,8 +134,10 @@ export function overview(now = Date.now()) {
  */
 function accountFilter(accountUuid, prefix = 'AND') {
   if (!accountUuid || accountUuid === 'all') return { clause: '', params: {} };
-  if (accountUuid === UNATTRIBUTED) return { clause: `${prefix} s.account_uuid IS NULL`, params: {} };
-  return { clause: `${prefix} s.account_uuid = @acct`, params: { acct: accountUuid } };
+  // Filter on the call's own account: a session that switched mid-run then
+  // shows up under each account for exactly the part it billed there.
+  if (accountUuid === UNATTRIBUTED) return { clause: `${prefix} e.account_uuid IS NULL`, params: {} };
+  return { clause: `${prefix} e.account_uuid = @acct`, params: { acct: accountUuid } };
 }
 
 /** Daily totals for the trailing `days`, split by model. */
@@ -149,7 +150,7 @@ export function history(days = 30, accountUuid = null) {
            COUNT(*) AS events,
            SUM(e.input_tokens + e.output_tokens + e.cache_write_5m + e.cache_write_1h + e.cache_read) AS tokens,
            SUM(e.cost_usd) AS cost
-      FROM events e LEFT JOIN sessions s ON s.session_id = e.session_id
+      FROM events e
      WHERE e.ts >= @since ${where}
      GROUP BY day, model ORDER BY day`).all({ since, ...params });
 
@@ -181,36 +182,79 @@ export function sessions(limit = 40, accountUuid = null) {
 }
 
 /**
- * Claude Code processes running right now, across every profile.
- * Each profile keeps its own session registry, so all of them are read.
+ * Claude Code processes running right now, across every profile, each with the
+ * account it is running as *at this moment*.
+ *
+ * That is per session, not per profile. An interactive session follows a /login
+ * onto the new account and records the switch in its own transcript; a parked
+ * background job keeps the identity it started with. So a session's current
+ * account is its own latest identity record, and only a session that has never
+ * written one falls back to whoever is signed into its profile.
  */
-export function liveSessions() {
-  const out = [];
-  const byUuid = new Map(
-    db().prepare('SELECT config_dir, account_uuid FROM accounts WHERE config_dir IS NOT NULL')
-      .all().map((r) => [r.config_dir, r.account_uuid]));
+export function liveSessions(now = Date.now()) {
+  const d = db();
+  const acctRows = d.prepare('SELECT * FROM accounts').all();
+  const byUuid = new Map(acctRows.map((a) => [a.account_uuid, a]));
+  const byEmail = new Map(acctRows.filter((a) => a.email).map((a) => [a.email.toLowerCase(), a]));
 
+  // Prefix match written as a range so it can use the index - LIKE 'x%' can't
+  // here, and forced a full scan of every call for every running session.
+  const lastIdentity = d.prepare(`SELECT ts, email, account_uuid FROM identity_points
+     WHERE session_id >= ? AND session_id < ? || '~' ORDER BY ts DESC LIMIT 1`);
+  const recent = d.prepare(`SELECT COUNT(*) calls, COALESCE(SUM(cost_usd),0) cost, MAX(ts) last
+     FROM events WHERE session_id >= ? AND session_id < ? || '~' AND ts >= ?`);
+  const lastCall = d.prepare(`SELECT MAX(ts) last FROM events WHERE session_id >= ? AND session_id < ? || '~'`);
+
+  const out = [];
   for (const profile of discoverProfiles()) {
     let names = [];
     try { names = fs.readdirSync(profile.sessionsDir); } catch { continue; }
+    const signedIn = profileAccount(profile);
     for (const n of names) {
       if (!n.endsWith('.json')) continue;
-      try {
-        const s = JSON.parse(fs.readFileSync(path.join(profile.sessionsDir, n), 'utf8'));
-        if (!s.sessionId) continue;
-        // The registry keeps entries for exited processes; drop anything whose pid is gone.
-        try { process.kill(s.pid, 0); } catch { continue; }
-        out.push({
-          sessionId: s.sessionId, pid: s.pid, cwd: s.cwd, name: s.name,
-          status: s.status, startedAt: s.startedAt, updatedAt: s.updatedAt,
-          version: s.version, kind: s.kind,
-          profile: profile.name,
-          accountUuid: byUuid.get(profile.dir) ?? null,
-        });
-      } catch { /* mid-write or malformed */ }
+      let s;
+      try { s = JSON.parse(fs.readFileSync(path.join(profile.sessionsDir, n), 'utf8')); } catch { continue; }
+      if (!s.sessionId) continue;
+      // The registry keeps entries for exited processes; drop anything whose pid is gone.
+      try { process.kill(s.pid, 0); } catch { continue; }
+
+      // A parked job writes its transcript under its job id, not the host session's.
+      const keys = [s.sessionId, s.parkedJobId].filter(Boolean);
+      let ident = null;
+      for (const k of keys) {
+        const r = lastIdentity.get(k, k);
+        if (r && (!ident || r.ts > ident.ts)) ident = r;
+      }
+      let acct = null, source = null;
+      if (ident) {
+        acct = ident.account_uuid ? byUuid.get(ident.account_uuid) : byEmail.get(ident.email);
+        source = 'session';
+      }
+      if (!acct && signedIn) { acct = byUuid.get(signedIn.accountUuid); source = 'profile'; }
+
+      let calls = 0, cost = 0, last = null;
+      for (const k of keys) {
+        const r = recent.get(k, k, now - 5 * 60_000);
+        calls += r.calls; cost += r.cost;
+        const lc = lastCall.get(k, k).last;
+        if (lc && (!last || lc > last)) last = lc;
+      }
+
+      out.push({
+        sessionId: s.sessionId, pid: s.pid, cwd: s.cwd, name: s.name,
+        status: s.status, kind: s.kind, background: !!s.parkedJobId,
+        startedAt: s.startedAt, updatedAt: s.updatedAt,
+        lastCallAt: last,
+        lastActivityAt: Math.max(s.updatedAt ?? 0, last ?? 0) || null,
+        profile: profile.name,
+        accountUuid: acct?.account_uuid ?? null,
+        account: acct ? accountLabel(acct) : null,
+        accountSource: source,
+        recent: { calls, cost, perHour: cost * 12 },
+      });
     }
   }
-  return out.sort((a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0));
+  return out.sort((a, b) => (b.lastActivityAt ?? 0) - (a.lastActivityAt ?? 0));
 }
 
 /** Per-model totals over the trailing `days`. */
@@ -223,7 +267,7 @@ export function modelBreakdown(days = 30, accountUuid = null) {
            SUM(e.thinking_tokens) AS thinking,
            SUM(e.cache_write_5m + e.cache_write_1h) AS cache_write,
            SUM(e.cache_read) AS cache_read
-      FROM events e LEFT JOIN sessions s ON s.session_id = e.session_id
+      FROM events e
      WHERE e.ts >= @since ${where}
      GROUP BY e.model ORDER BY cost DESC`).all({ since, ...params });
   return rows.map((r) => ({ ...r, label: modelLabel(r.model) }));

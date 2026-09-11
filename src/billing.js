@@ -76,9 +76,8 @@ export function billingPeriod(startedAt, cycle = 'month', now = Date.now()) {
 export function periodSpend(db, accountUuid, period) {
   if (!period) return { cost: 0, events: 0 };
   const row = db.prepare(`
-    SELECT COUNT(*) AS events, COALESCE(SUM(e.cost_usd), 0) AS cost
-      FROM events e JOIN sessions s ON s.session_id = e.session_id
-     WHERE s.account_uuid = ? AND e.ts >= ? AND e.ts <= ?`)
+    SELECT COUNT(*) AS events, COALESCE(SUM(cost_usd), 0) AS cost
+      FROM events WHERE account_uuid = ? AND ts >= ? AND ts <= ?`)
     .get(accountUuid, period.start, period.end);
   return { cost: row.cost, events: row.events };
 }
