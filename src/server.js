@@ -153,9 +153,14 @@ export async function serve({ port = 4785, open = false, refresh, fastRefresh, t
       let waited = false;
       for (;;) {
         try {
+          // Each attempt removes both of its listeners, whichever way it ends -
+          // a service can wait on the port for hours.
           await new Promise((resolve, reject) => {
-            server.once('error', reject);
-            server.listen(port, '127.0.0.1', () => { server.off('error', reject); resolve(); });
+            const onError = (err) => { server.off('listening', onListening); reject(err); };
+            const onListening = () => { server.off('error', onError); resolve(); };
+            server.once('error', onError);
+            server.once('listening', onListening);
+            server.listen(port, '127.0.0.1');
           });
           break;
         } catch (err) {
