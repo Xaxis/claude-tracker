@@ -3,6 +3,7 @@ import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { discoverProfiles } from './paths.js';
 import { db, tx } from './db.js';
+import { accountAggregates } from './aggregates.js';
 
 /**
  * Account identity and attribution.
@@ -92,28 +93,52 @@ export function keychainTiers() {
  * makes it possible to attribute sessions from before the tracker existed.
  */
 function backupObservations(profile) {
-  let names = [];
-  try { names = fs.readdirSync(profile.backupsDir); } catch { return []; }
   const out = [];
+  // A backup is a full config snapshot, so it carries the same identity and
+  // billing fields as a live one. That is the only way to recover details for
+  // an account that has since been signed out - or replaced in that profile.
+  const take = (file, ts) => {
+    const account = accountFromConfig(readJson(file), profile.dir);
+    if (account) out.push({ ts, account, source: 'backup' });
+  };
+  let names = [];
+  try { names = fs.readdirSync(profile.backupsDir); } catch { /* none */ }
   for (const n of names) {
     const m = /\.claude\.json\.backup\.(\d+)$/.exec(n);
-    if (!m) continue;
-    // A backup is a full config snapshot, so it carries the same identity and
-    // billing fields as a live one. That is the only way to recover details for
-    // an account that has since been signed out - or replaced in that profile.
-    const account = accountFromConfig(readJson(path.join(profile.backupsDir, n)), profile.dir);
-    if (account) out.push({ ts: Number(m[1]), account, source: 'backup' });
+    if (m) take(path.join(profile.backupsDir, n), Number(m[1]));
+  }
+  // Claude Code also leaves `<config>.backup` beside the config itself.
+  if (profile.configFile) {
+    const dir = path.dirname(profile.configFile), base = path.basename(profile.configFile);
+    let siblings = [];
+    try { siblings = fs.readdirSync(dir).filter((n) => n.startsWith(`${base}.backup`)); } catch { /* none */ }
+    for (const n of siblings) {
+      const file = path.join(dir, n);
+      const m = /\.backup\.(\d+)$/.exec(n);
+      let ts = m ? Number(m[1]) : null;
+      if (!ts) { try { ts = Math.floor(fs.statSync(file).mtimeMs); } catch { continue; } }
+      take(file, ts);
+    }
   }
   return out;
 }
 
 /** Record that `account` was signed into a profile at `ts`. */
 export function observeAccount(account, ts = Date.now(), source = 'watch') {
-  if (!account?.accountUuid) return;
-  db().prepare(`INSERT INTO account_observations (ts, config_dir, account_uuid, email, source)
-                VALUES (?,?,?,?,?) ON CONFLICT(ts, config_dir) DO NOTHING`)
-    .run(ts, account.configDir ?? '', account.accountUuid, account.email ?? null, source);
+  if (!account?.accountUuid) return false;
+  const dir = account.configDir ?? '';
+  // Only a change of account is news. Recording the same sighting on every
+  // refresh bloated this table to thousands of identical rows.
+  const last = db().prepare(`SELECT account_uuid FROM account_observations
+    WHERE config_dir = ? AND ts <= ? ORDER BY ts DESC LIMIT 1`).get(dir, ts);
+  const changed = last?.account_uuid !== account.accountUuid;
+  if (changed) {
+    db().prepare(`INSERT INTO account_observations (ts, config_dir, account_uuid, email, source)
+                  VALUES (?,?,?,?,?) ON CONFLICT(ts, config_dir) DO NOTHING`)
+      .run(ts, dir, account.accountUuid, account.email ?? null, source);
+  }
   upsertAccount(account, ts);
+  return changed;
 }
 
 export function upsertAccount(a, ts = Date.now()) {
@@ -363,6 +388,126 @@ export function attributeSessions() {
 }
 
 /**
+ * Build a resolver for "which account made this call?".
+ *
+ * A session is not tied to one account. Running sessions follow a /login onto
+ * the new account mid-run, writing a fresh session_context record at that exact
+ * moment; background jobs keep their own identity even after the profile they
+ * run under switches. So the question is answered per call, at its timestamp:
+ *
+ *   1. session  - the latest identity record inside that same session.
+ *   2. profile  - who was signed into the call's config directory then.
+ *   3. inferred - the session-level answer from attributeSessions().
+ */
+let resolverCache = { sig: null, fn: null };
+
+/** Cheap fingerprint of everything the resolver is built from. */
+function resolverSignature(d) {
+  const a = d.prepare('SELECT COUNT(*) n, MAX(ts) m FROM identity_points').get();
+  const b = d.prepare('SELECT COUNT(*) n, MAX(ts) m FROM account_observations').get();
+  const c = d.prepare('SELECT COUNT(*) n, COUNT(email) e FROM accounts').get();
+  const s = d.prepare('SELECT COUNT(account_uuid) n FROM sessions').get();
+  return `${a.n}:${a.m}|${b.n}:${b.m}|${c.n}:${c.e}|${s.n}`;
+}
+
+function buildResolver() {
+  const d = db();
+  const sig = resolverSignature(d);
+  if (resolverCache.sig === sig) return resolverCache.fn;
+  const fn = createResolver(d);
+  resolverCache = { sig, fn };
+  return fn;
+}
+
+function createResolver(d) {
+  const byEmail = new Map(d.prepare(
+    'SELECT LOWER(email) e, account_uuid a FROM accounts WHERE email IS NOT NULL').all().map((r) => [r.e, r.a]));
+
+  const sessionTl = new Map();
+  for (const r of d.prepare('SELECT session_id, ts, email, account_uuid FROM identity_points ORDER BY ts').all()) {
+    const acct = r.account_uuid ?? (r.email ? byEmail.get(r.email) : null);
+    if (!acct) continue;
+    if (!sessionTl.has(r.session_id)) sessionTl.set(r.session_id, []);
+    const tl = sessionTl.get(r.session_id);
+    if (!tl.length || tl[tl.length - 1].account !== acct) tl.push({ ts: r.ts, account: acct });
+  }
+
+  const profileTl = new Map();
+  const pts = d.prepare('SELECT ts, config_dir dir, account_uuid account FROM account_observations WHERE config_dir != \'\'').all();
+  const firstObs = new Map();
+  for (const p of pts) firstObs.set(p.dir, Math.min(firstObs.get(p.dir) ?? Infinity, p.ts));
+  // A session's own identity records are dated evidence about its profile - but
+  // only for stretches the profile's own observations don't cover. Where the
+  // profile was watched directly, that is the authority: a background job keeps
+  // its identity after the profile switches, and must not drag it back.
+  for (const r of d.prepare(`SELECT p.ts, s.config_dir dir, p.session_id FROM identity_points p
+      JOIN sessions s ON s.session_id = p.session_id WHERE s.config_dir IS NOT NULL`).all()) {
+    if (r.ts >= (firstObs.get(r.dir) ?? Infinity)) continue;
+    const tl = sessionTl.get(r.session_id);
+    const hit = tl && [...tl].reverse().find((e) => e.ts <= r.ts);
+    if (hit) pts.push({ ts: r.ts, dir: r.dir, account: hit.account });
+  }
+  for (const p of pts.sort((x, y) => x.ts - y.ts)) {
+    if (!profileTl.has(p.dir)) profileTl.set(p.dir, []);
+    const tl = profileTl.get(p.dir);
+    if (!tl.length || tl[tl.length - 1].account !== p.account) tl.push({ ts: p.ts, account: p.account });
+  }
+
+  // Latest entry at or before t; before the first, only when there is no rival.
+  const at = (tl, t) => {
+    if (!tl?.length) return null;
+    let hit = null;
+    for (const e of tl) { if (e.ts <= t) hit = e.account; else break; }
+    if (hit) return hit;
+    return new Set(tl.map((e) => e.account)).size === 1 ? tl[0].account : null;
+  };
+
+  const sessionAcct = new Map(d.prepare(
+    'SELECT session_id, account_uuid FROM sessions WHERE account_uuid IS NOT NULL').all().map((r) => [r.session_id, r.account_uuid]));
+
+  return (sessionId, configDir, ts) => {
+    const s = at(sessionTl.get(sessionId), ts);
+    if (s) return [s, 'session'];
+    const p = configDir ? at(profileTl.get(configDir), ts) : null;
+    if (p) return [p, 'profile'];
+    const i = sessionAcct.get(sessionId);
+    return i ? [i, 'inferred'] : [null, null];
+  };
+}
+
+/**
+ * Resolve an account for every call that needs one: all unattributed calls,
+ * plus everything since `since`. The recent re-check covers the race where calls
+ * land a moment before the record announcing the switch that produced them.
+ */
+export function attributeEvents({ since = 0, all = false, includeNull = true } = {}) {
+  const d = db();
+  const resolve = buildResolver();
+  const cols = 'call_id, session_id, config_dir, ts, account_uuid';
+  const rows = all
+    ? d.prepare(`SELECT ${cols} FROM events`).all()
+    : includeNull
+      ? d.prepare(`SELECT ${cols} FROM events WHERE account_uuid IS NULL OR ts >= ?`).all(since)
+      : d.prepare(`SELECT ${cols} FROM events WHERE ts >= ?`).all(since);
+  const upd = d.prepare('UPDATE events SET account_uuid = ?, account_source = ? WHERE call_id = ?');
+  let changed = 0, minChangedTs = Infinity;
+  tx(() => {
+    for (const r of rows) {
+      const [acct, src] = resolve(r.session_id, r.config_dir, r.ts);
+      if (acct !== r.account_uuid) { upd.run(acct, src, r.call_id); changed++; minChangedTs = Math.min(minChangedTs, r.ts); }
+    }
+    // Rejections belong to whoever made the refused call.
+    for (const l of d.prepare(`SELECT l.id, l.session_id, l.ts, s.config_dir FROM limit_events l
+        LEFT JOIN sessions s ON s.session_id = l.session_id
+        WHERE ${includeNull || all ? 'l.account_uuid IS NULL OR ' : ''}l.ts >= ?`).all(all ? 0 : since)) {
+      const [acct] = resolve(l.session_id, l.config_dir, l.ts);
+      if (acct) d.prepare('UPDATE limit_events SET account_uuid = ? WHERE id = ?').run(acct, l.id);
+    }
+  });
+  return { checked: rows.length, changed, minChangedTs: Number.isFinite(minChangedTs) ? minChangedTs : null };
+}
+
+/**
  * Give accounts a human name wherever a session recorded one.
  *
  * Sessions that captured the signed-in email are joined back to their account,
@@ -409,11 +554,9 @@ export function attributeLimitEvents() {
      WHERE account_uuid IS NULL AND session_id IS NOT NULL`);
 }
 
-export function listAccounts() {
-  return db().prepare(`
-    SELECT a.*,
-           (SELECT COUNT(*) FROM sessions s WHERE s.account_uuid = a.account_uuid) AS sessions
-      FROM accounts a ORDER BY a.last_seen DESC`).all();
+export function listAccounts(agg = accountAggregates()) {
+  return db().prepare('SELECT * FROM accounts ORDER BY last_seen DESC').all()
+    .map((a) => ({ ...a, sessions: agg.get(a.account_uuid)?.sessions ?? 0 }));
 }
 
 /** Human-friendly name for an account, without leaking a full email by default. */

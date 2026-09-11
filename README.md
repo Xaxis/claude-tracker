@@ -83,6 +83,10 @@ so a newly added account starts being tracked without you doing anything.
 Both dashboards run in one process off a single file watcher, so the browser and
 the terminal never disagree and the transcripts are only scanned once.
 
+Running sessions are listed at the top of both dashboards, each with the account
+it is billing right now, whether it is busy, when it last did anything, and what
+it has spent in the last five minutes.
+
 In the terminal dashboard: `q` quit · `r` refresh · `a` cycle account ·
 `w` switch window · `space` pause · `↑↓`/`jk` scroll.
 
@@ -109,9 +113,10 @@ Running several accounts on one machine means several *config directories*:
 independent Claude state tree with its own `projects/`, its own history, and its
 own signed-in account.
 
-That last part is the important one. **A config directory holds exactly one
-account at a time, so the directory a transcript lives under is the account that
-paid for it.** No inference required.
+That makes the profile the first place to look: whoever is signed into a
+directory is normally who its sessions bill. Normally, not always — a running
+session follows a `/login` in its profile partway through, and a background job
+keeps the account it started with. How those are handled is below.
 
 `claude-tracker` discovers every profile at runtime — `~/.claude`, any
 `~/.claude-*` sibling, anything named in `CLAUDE_CONFIG_DIR`, and anything listed
@@ -123,25 +128,63 @@ get scanned twice.
 
 ### Which account did what
 
-Attribution is recorded with its source, strongest first:
+Attribution is decided **per API call, not per session.** A session is not tied
+to one account:
 
-- **bridge** — the transcript states the owner outright.
-- **profile** — the profile's account timeline at the moment the session started.
-  Each profile's config *and its rotating backups* form a dated record of who was
-  signed into it, so this dates old sessions too, and handles a profile that
-  changed accounts partway through.
-- **observed** — the watcher saw who was signed in at that moment.
+- An interactive session follows a `/login` onto the new account mid-run, and
+  records the moment in its own transcript (a fresh context record naming the
+  signed-in email, written the same second the switch happens).
+- A parked background job keeps the identity it started with, even after the
+  profile it runs under switches accounts.
+
+So each call is resolved at its own timestamp, strongest evidence first:
+
+- **session** — the latest identity record inside that same session: a signed-in
+  email record, or a bridge record naming the owner.
+- **profile** — who was signed into the call's config directory at that moment,
+  from the watcher's observations and the profile's rotating config backups.
+  Where the profile was watched directly, that is the authority; sessions' own
+  records only fill in stretches the profile's observations don't cover.
 - **inferred** — the session sits between two moments that agree on the account.
 
-Two rules keep it honest. When the evidence disagrees, the session is left
+Two rules keep it honest. When the evidence disagrees, the call is left
 unattributed rather than guessed at, and the unattributed total is shown on the
-dashboard so the size of the gap is visible. And a session is never attributed to
-an account the API had rate limited at that moment — hitting a limit is exactly
-when you switch accounts, which is exactly when naive inference would otherwise
-keep crediting the account you just left.
+dashboard. And a call is never attributed to an account the API had rate limited
+at that moment — hitting a limit is exactly when you switch accounts.
 
 Historical attribution is imperfect by nature; the further back you look, the
 more of it is inferred. It becomes exact from the moment you start running this.
+
+### Realtime
+
+Both dashboards run off one watcher inside the tracker process:
+
+- **Throttled, not debounced.** Transcript writes are coalesced for at most
+  200ms, and no change is ever held longer than 800ms. (Waiting for a quiet gap
+  starves: with many sessions running, one never comes.)
+- **Only changed files are read.** The watcher passes the paths that changed, so
+  a refresh reads just those instead of statting thousands of transcripts.
+- **A `/login` shows within about 2 seconds**, even if the OS drops the file
+  event — each profile's signed-in account is also polled every 2s.
+- **Cheap reads.** Lifetime totals are cached and only recent calls re-summed;
+  window reconstruction resumes where it left off. A dashboard update costs about
+  20ms on a quarter-million-call index.
+- Accounts and running sessions re-render on every push; the charts every 10s.
+  The terminal header shows when its numbers were read.
+
+Measured with 20 simulated sessions writing 40 calls a second on top of a copy of
+a real 248,000-call index, terminal and web dashboards running together:
+
+| | median | p95 | max |
+|---|---|---|---|
+| Age of the numbers on screen, web | 0.60s | 1.12s | 1.53s |
+| Age of the numbers on screen, terminal | 0.85s | 1.32s | 1.64s |
+
+After a mid-run `/login`, the new account showed as billing in 0.7s on the web
+and 1.4s in the terminal; the longest gap between pushes was 1.0s. Every call was
+checked against the account that actually made it, with a background job kept
+on its original account throughout. `python3 bench/run_load.py` reproduces
+this.
 
 ### What the dollar figures mean
 
@@ -259,9 +302,9 @@ itself the first time it hits a wall.
   date; see above.
 - **Transcripts are eventually cleaned up.** Windows that extend past the oldest
   retained transcript will read low.
-- **One account per profile at a time.** That is how the CLI works, and it is
-  what makes profile attribution exact. Several profiles running at once is fine
-  and fully supported - each is tracked separately.
+- **Attribution is per call.** A session that switches accounts mid-run is
+  split between them at the moment of the switch; a background job keeps its own
+  account. Calls with no identity evidence at all are shown as unattributed.
 
 ## Privacy
 
@@ -273,7 +316,8 @@ The index lives in `~/.claude/tracker/` and never leaves the machine.
 ## Development
 
 ```sh
-node --test          # unit tests over the window, pricing and attribution logic
+node --test                     # unit tests: windows, pricing, attribution
+python3 bench/run_load.py   # end-to-end realtime test (needs Chrome)
 ```
 
 The tests run against a scratch database and synthetic fixtures, so they do not
@@ -287,6 +331,8 @@ depend on your own usage history.
 | `src/accounts.js` | account discovery and attribution |
 | `src/windows.js` | rolling-window reconstruction |
 | `src/calibrate.js` | learns each plan's ceiling from observed limits |
+| `src/watcher.js` | throttled file watching, account-switch detection |
+| `src/aggregates.js` | cached per-account totals for cheap live reads |
 | `src/billing.js` | projects the subscription cycle from its start date |
 | `src/api.js` | aggregation for both dashboards |
 | `src/tui.js` | terminal dashboard |

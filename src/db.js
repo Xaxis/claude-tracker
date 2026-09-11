@@ -44,9 +44,24 @@ CREATE TABLE IF NOT EXISTS events (
   service_tier    TEXT,
   speed           TEXT,
   cost_usd        REAL NOT NULL DEFAULT 0,
-  is_sidechain    INTEGER NOT NULL DEFAULT 0
+  is_sidechain    INTEGER NOT NULL DEFAULT 0,
+  -- Attribution is per call, not per session: a running session follows a
+  -- /login onto the new account partway through, so one session can bill
+  -- several accounts. Each call records the profile it was written under and
+  -- the account it resolved to at its own timestamp.
+  config_dir      TEXT,
+  account_uuid    TEXT,
+  account_source  TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_events_ts      ON events(ts);
+-- Covering indexes: windows, burn rates and billing sums read only (account, ts,
+-- cost), and the totals cache groups by (account, session) - so neither ever has
+-- to visit the table rows themselves.
+DROP INDEX IF EXISTS idx_events_acct_ts;
+DROP INDEX IF EXISTS idx_events_acct_sess;
+CREATE INDEX IF NOT EXISTS idx_events_acct_ts_cost ON events(account_uuid, ts, cost_usd);
+CREATE INDEX IF NOT EXISTS idx_events_acct_sess_ts ON events(account_uuid, session_id, ts, cost_usd);
+CREATE INDEX IF NOT EXISTS idx_events_unattr  ON events(account_uuid) WHERE account_uuid IS NULL;
 CREATE INDEX IF NOT EXISTS idx_events_session ON events(session_id);
 CREATE INDEX IF NOT EXISTS idx_events_model   ON events(model);
 
@@ -115,6 +130,20 @@ CREATE TABLE IF NOT EXISTS account_observations (
 );
 CREATE INDEX IF NOT EXISTS idx_obs_dir ON account_observations(config_dir, ts);
 
+-- Dated statements, from inside a session's own transcript, of which account it
+-- was running as. Claude Code writes a session_context record with the signed-in
+-- email when a session starts and again whenever the account changes, so these
+-- mark the exact moment a running session switched. Bridge records carry an
+-- owner but no timestamp; they are dated by the last timestamped line before them.
+CREATE TABLE IF NOT EXISTS identity_points (
+  session_id   TEXT NOT NULL,
+  ts           INTEGER NOT NULL,
+  email        TEXT,
+  account_uuid TEXT,
+  source       TEXT NOT NULL,       -- 'context' | 'bridge'
+  PRIMARY KEY (session_id, ts, source)
+);
+
 -- Learned capacity per (account, limit_type), produced by calibrate.js.
 CREATE TABLE IF NOT EXISTS calibration (
   account_uuid TEXT NOT NULL,
@@ -136,12 +165,13 @@ CREATE TABLE IF NOT EXISTS meta (
  * Everything here is derived from transcripts on disk, so the index is a cache,
  * not a record. When the schema changes, rebuilding from source is both simpler
  * and more trustworthy than migrating - a full rescan takes about half a minute.
- * Only genuinely user-authored state is carried across (currently: labels).
+ * Only what cannot be re-derived is carried across: account rows (labels, plan
+ * details from long-gone config snapshots) and account observations.
  */
-const SCHEMA_VERSION = 5;
+const SCHEMA_VERSION = 6;
 
 const DERIVED_TABLES = [
-  'files', 'events', 'sessions', 'limit_events', 'calibration', 'accounts',
+  'files', 'events', 'sessions', 'limit_events', 'calibration', 'accounts', 'identity_points',
 ];
 
 // Account sightings are NOT derived: each comes from a config snapshot that
@@ -164,11 +194,11 @@ function ensureSchema(d) {
     return;
   }
 
-  // Preserve names the user set by hand; they cannot be re-derived.
-  let labels = [];
-  try {
-    labels = d.prepare('SELECT account_uuid, label FROM accounts WHERE label IS NOT NULL').all();
-  } catch { /* table predates labels */ }
+  // Account rows are not fully derivable: plan tier and subscription dates come
+  // from config snapshots that rotate away within hours, and labels are typed by
+  // hand. Carry every row across, keeping whichever columns the new schema has.
+  let accountRows = [];
+  try { accountRows = d.prepare('SELECT * FROM accounts').all(); } catch { /* no table yet */ }
 
   let observations = [];
   try {
@@ -182,10 +212,11 @@ function ensureSchema(d) {
                VALUES (?,?,?,?,?) ON CONFLICT(ts, config_dir) DO NOTHING`)
       .run(o.ts, o.config_dir ?? '', o.account_uuid, o.email, o.source);
   }
-  for (const l of labels) {
-    d.prepare(`INSERT INTO accounts (account_uuid, label) VALUES (?, ?)
-               ON CONFLICT(account_uuid) DO UPDATE SET label = excluded.label`)
-      .run(l.account_uuid, l.label);
+  const cols = new Set(d.prepare('PRAGMA table_info(accounts)').all().map((c) => c.name));
+  for (const row of accountRows) {
+    const keys = Object.keys(row).filter((k) => cols.has(k));
+    d.prepare(`INSERT INTO accounts (${keys.join(', ')}) VALUES (${keys.map(() => '?').join(', ')})
+               ON CONFLICT(account_uuid) DO NOTHING`).run(...keys.map((k) => row[k]));
   }
   d.prepare(`INSERT INTO meta (key, value) VALUES ('schema_version', ?)
              ON CONFLICT(key) DO UPDATE SET value = excluded.value`).run(String(SCHEMA_VERSION));

@@ -26,11 +26,9 @@ const GENERIC = { five_hour: 2000, seven_day: 15000 };
 /** Events that drew down this account's quota, in a time range. */
 function calibrationEvents(accountUuid, since, until) {
   return db().prepare(`
-    SELECT e.ts, e.cost_usd AS cost
-      FROM events e
-      JOIN sessions s ON s.session_id = e.session_id
-     WHERE e.ts >= ? AND e.ts <= ? AND s.account_uuid = ?
-     ORDER BY e.ts`).all(since, until, accountUuid);
+    SELECT ts, cost_usd AS cost FROM events
+     WHERE ts >= ? AND ts <= ? AND account_uuid = ?
+     ORDER BY ts`).all(since, until, accountUuid);
 }
 
 /**

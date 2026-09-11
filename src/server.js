@@ -97,9 +97,15 @@ function handleEvents(req, res) {
  * and the terminal always show the same numbers and the transcripts are only
  * scanned once no matter how many views are open.
  */
-export async function serve({ port = 4785, open = false, refresh, tui = true, web = true }) {
+export async function serve({ port = 4785, open = false, refresh, fastRefresh, tui = true, web = true }) {
+  // Refreshes share one database connection and ingest in chunked transactions
+  // that span awaits, so two must never interleave. Everything that writes goes
+  // through this queue, one at a time.
+  let chain = Promise.resolve();
+  const serial = (fn) => (chain = chain.then(fn, fn));
+
   // Bring the database current before accepting requests.
-  await refresh({ quiet: true });
+  await serial(() => refresh({ quiet: true, reattribute: 'all' }));
 
   const server = http.createServer((req, res) => {
     let url;
@@ -130,12 +136,27 @@ export async function serve({ port = 4785, open = false, refresh, tui = true, we
   }
 
   let ui = null;
+  const push = (info) => {
+    if (web) broadcast('update', { reason: info.reason, at: Date.now(), newEvents: info.newEvents ?? 0 });
+    ui?.update();
+  };
+
+  // Full rescan on a slow cadence: files the watches missed, keychain, calibration.
+  let fullBusy = false;
+  const fullTimer = setInterval(() => {
+    if (fullBusy) return;
+    fullBusy = true;
+    serial(() => refresh({ quiet: true }))
+      .then(() => push({ reason: 'rescan' }))
+      .catch((err) => (ui ? ui.reportError(err.message) : console.error('rescan failed:', err.message)))
+      .finally(() => { fullBusy = false; });
+  }, 60_000);
+
   const stopWatching = startWatcher({
     onChange: async (info) => {
       try {
-        await refresh({ quiet: true });
-        if (web) broadcast('update', { reason: info.reason, at: Date.now() });
-        ui?.update();
+        const r = await serial(() => fastRefresh(info.paths ?? []));
+        push({ ...info, newEvents: r?.newEvents ?? 0 });
       } catch (err) {
         // The TUI owns the screen, so a stray write would corrupt the frame -
         // hand it the message to show in its footer instead of dropping it.
@@ -149,6 +170,7 @@ export async function serve({ port = 4785, open = false, refresh, tui = true, we
   const shutdown = () => {
     if (closing) return;
     closing = true;
+    clearInterval(fullTimer);
     stopWatching();
     ui?.stop();
     for (const c of clients) { try { c.end(); } catch { /* already gone */ } }

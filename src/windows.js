@@ -61,25 +61,20 @@ export function buildWindows(events, type) {
  */
 export function eventsFor(accountUuid, since = 0, { includeUnattributed = false } = {}) {
   const d = db();
+  // Every call carries its own resolved account, so no join is needed - and a
+  // session that switched accounts mid-run is split correctly between them.
   if (accountUuid === '__all__') {
     return d.prepare('SELECT ts, cost_usd AS cost FROM events WHERE ts >= ? ORDER BY ts').all(since);
   }
   if (accountUuid == null) {
-    return d.prepare(`
-      SELECT e.ts, e.cost_usd AS cost FROM events e
-      LEFT JOIN sessions s ON s.session_id = e.session_id
-      WHERE e.ts >= ? AND s.account_uuid IS NULL ORDER BY e.ts`).all(since);
+    return d.prepare('SELECT ts, cost_usd AS cost FROM events WHERE account_uuid IS NULL AND ts >= ? ORDER BY ts').all(since);
   }
   if (includeUnattributed) {
-    return d.prepare(`
-      SELECT e.ts, e.cost_usd AS cost FROM events e
-      LEFT JOIN sessions s ON s.session_id = e.session_id
-      WHERE e.ts >= ? AND (s.account_uuid = ? OR s.account_uuid IS NULL) ORDER BY e.ts`).all(since, accountUuid);
+    return d.prepare(`SELECT ts, cost_usd AS cost FROM events
+      WHERE (account_uuid = ? OR account_uuid IS NULL) AND ts >= ? ORDER BY ts`).all(accountUuid, since);
   }
-  return d.prepare(`
-    SELECT e.ts, e.cost_usd AS cost FROM events e
-    JOIN sessions s ON s.session_id = e.session_id
-    WHERE s.account_uuid = ? AND e.ts >= ? ORDER BY e.ts`).all(accountUuid, since);
+  return d.prepare('SELECT ts, cost_usd AS cost FROM events WHERE account_uuid = ? AND ts >= ? ORDER BY ts')
+    .all(accountUuid, since);
 }
 
 /**
@@ -93,10 +88,28 @@ export function latestResetMs(accountUuid, type) {
   return row?.r ? row.r * 1000 : null;
 }
 
-/** Spend and call count strictly inside a time range. */
+/** Spend and call count strictly inside a time range - summed in SQL, not JS. */
 export function sumBetween(accountUuid, start, end) {
-  const rows = eventsFor(accountUuid, start).filter((e) => e.ts <= end);
-  return { cost: rows.reduce((a, e) => a + e.cost, 0), events: rows.length };
+  const r = db().prepare(`SELECT COUNT(*) n, COALESCE(SUM(cost_usd), 0) c FROM events
+    WHERE account_uuid = ? AND ts >= ? AND ts <= ?`).get(accountUuid, start, end);
+  return { cost: r.c, events: r.n };
+}
+
+/*
+ * Where each account's window chain currently starts. Rebuilding the chain from
+ * the account's first-ever call on every refresh re-reads its whole history;
+ * a window, once started, starts there forever, so later refreshes resume from
+ * the last known window start. Cleared on a full rescan, which can backfill
+ * older calls that would move the chain.
+ */
+const chainStart = new Map();
+export function resetWindowCache() { chainStart.clear(); }
+
+/** The oldest cached chain start - anything changing before it can move a chain. */
+export function earliestCachedChain() {
+  let m = Infinity;
+  for (const v of chainStart.values()) m = Math.min(m, v);
+  return m;
 }
 
 /**
@@ -126,10 +139,12 @@ export function currentWindow(accountUuid, type, now = Date.now()) {
     return { active: true, start, end: anchor, cost, events, authoritative: true };
   }
 
-  const events = eventsFor(accountUuid, anchor ?? 0);
+  const key = `${accountUuid}:${type}`;
+  const events = eventsFor(accountUuid, Math.max(anchor ?? 0, chainStart.get(key) ?? 0));
   const windows = buildWindows(events, type);
   const last = windows[windows.length - 1];
   if (!last) return { active: false, start: null, end: null, cost: 0, events: 0 };
+  chainStart.set(key, last.start);
   if (now >= last.end) {
     return { active: false, start: last.start, end: last.end, cost: last.cost, events: last.events, lapsed: true };
   }
@@ -141,10 +156,8 @@ export function currentWindow(accountUuid, type, now = Date.now()) {
  * Used to project when an open window will be exhausted.
  */
 export function burnRate(accountUuid, mins = 30, now = Date.now()) {
-  const since = now - mins * 60 * 1000;
-  const rows = eventsFor(accountUuid, since);
-  const cost = rows.reduce((a, r) => a + r.cost, 0);
-  return { perHour: cost / (mins / 60), cost, mins, events: rows.length };
+  const { cost, events } = sumBetween(accountUuid, now - mins * 60 * 1000, now);
+  return { perHour: cost / (mins / 60), cost, mins, events };
 }
 
 /**

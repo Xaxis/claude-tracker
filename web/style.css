@@ -294,3 +294,8 @@ td { font-variant-numeric: tabular-nums; }
 .billing-track { height: 4px; border-radius: 2px; background: var(--gridline); overflow: hidden; }
 .billing-track > span { display: block; height: 100%; border-radius: 2px; background: var(--text-muted); }
 .limit-note { font-size: 11px; color: var(--text-muted); margin-top: -4px; }
+
+/* --- running sessions ----------------------------------------------------- */
+.status-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--baseline); vertical-align: middle; }
+.status-dot.is-busy { background: var(--warning); }
+.ago { font-variant-numeric: tabular-nums; }
