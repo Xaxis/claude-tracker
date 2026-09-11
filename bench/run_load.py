@@ -134,7 +134,7 @@ for s in dom:
     for c in s['cards']:
         acct = (c['name'] or '').strip()
         if acct in writes and cost_of(c['meta']) is not None: web.append(staleness(t, acct, cost_of(c['meta'])))
-strip = re.compile(r'\x1b\[[0-9;?]*[a-zA-Z]')
+strip = re.compile(r'\x1b\[[0-9;?]*[a-zA-Z]|\x1b\]8;[^\x07\x1b]*(?:\x07|\x1b\\)')
 for t, raw in frames:
     if not (T0 + 2 < t < T_END): continue
     txt = strip.sub('', raw)

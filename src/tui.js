@@ -1,3 +1,4 @@
+import { spawn } from 'node:child_process';
 import { overview, liveSessions, modelBreakdown, windowHistory } from './api.js';
 
 /**
@@ -46,22 +47,36 @@ const C = {
   reset: A.reset,
 };
 
-const ANSI_RE = /\x1b\[[0-9;]*m/g;
+// Colour codes and OSC 8 hyperlinks - neither takes up room on screen.
+const ANSI_RE = /\x1b\[[0-9;]*m|\x1b\]8;[^\x07\x1b]*(?:\x07|\x1b\\)/g;
 const vlen = (s) => s.replace(ANSI_RE, '').length;
 const padEnd = (s, n) => s + ' '.repeat(Math.max(0, n - vlen(s)));
+const LINK_END = '\x1b]8;;\x1b\\';
+/** Text that opens `url` when clicked, in terminals that support hyperlinks. */
+const hyperlink = (text, url) => `\x1b]8;;${url}\x1b\\${text}${LINK_END}`;
 const truncate = (s, n) => {
   if (vlen(s) <= n) return s;
   // Walk the string keeping escape sequences intact while counting visible chars.
-  let out = '', seen = 0, i = 0;
+  let out = '', seen = 0, i = 0, inLink = false;
   while (i < s.length && seen < n) {
     if (s[i] === '\x1b') {
-      const m = /^\x1b\[[0-9;]*m/.exec(s.slice(i));
-      if (m) { out += m[0]; i += m[0].length; continue; }
+      const m = /^(?:\x1b\[[0-9;]*m|\x1b\]8;[^\x07\x1b]*(?:\x07|\x1b\\))/.exec(s.slice(i));
+      if (m) {
+        if (m[0].startsWith('\x1b]8;')) inLink = !/^\x1b\]8;[^;]*;(?:\x07|\x1b\\)$/.test(m[0]);
+        out += m[0]; i += m[0].length; continue;
+      }
     }
     out += s[i]; seen++; i++;
   }
-  return out + A.reset;
+  return out + (inLink ? LINK_END : '') + A.reset;
 };
+
+/** Open a URL in the default browser, without waiting on it. */
+function openUrl(url) {
+  const [cmd, args] = process.platform === 'darwin' ? ['open', [url]]
+    : process.platform === 'win32' ? ['cmd', ['/c', 'start', '', url]] : ['xdg-open', [url]];
+  try { spawn(cmd, args, { stdio: 'ignore', detached: true }).on('error', () => {}).unref(); } catch { /* nothing to open it with */ }
+}
 
 /* --- formatting ----------------------------------------------------------- */
 
@@ -120,6 +135,9 @@ function sparkline(values, max) {
 /* --- the dashboard -------------------------------------------------------- */
 
 export function startTui({ webUrl, onQuit }) {
+  // The web dashboard's address, clickable where the terminal supports links.
+  const url = /^https?:\/\/\S+/.exec(webUrl ?? '')?.[0] ?? null;
+  const linkedUrl = url ? webUrl.replace(url, hyperlink(url, url)) : webUrl;
   const out = process.stdout;
   const state = {
     scroll: 0,
@@ -170,7 +188,7 @@ export function startTui({ webUrl, onQuit }) {
     const liveMark = state.live ? `${C.good}●${C.reset} live` : `${C.critical}●${C.reset} paused`;
     // When the numbers below were read - proof at a glance that they are moving.
     const stamp = `${C.muted}updated ${new Date(state.lastRefresh).toTimeString().slice(0, 8)}${C.reset}`;
-    const right = `${liveMark} ${C.muted}·${C.reset} ${stamp} ${C.muted}·${C.reset} ${C.accent}${webUrl}${C.reset}`;
+    const right = `${liveMark} ${C.muted}·${C.reset} ${stamp} ${C.muted}·${C.reset} ${C.accent}${linkedUrl}${C.reset}`;
     const left = `${A.bold}Claude Tracker${A.reset}`;
     L.push(`  ${padEnd(left, Math.max(0, inner - vlen(right)))}${right}`);
     L.push('');
@@ -365,6 +383,7 @@ export function startTui({ webUrl, onQuit }) {
       ? `  ${C.critical}refresh failed:${C.reset} ${state.error} ${C.muted}· showing data from ${age}s ago · r to retry${C.reset}`
       : `  ${C.muted}q${C.reset} quit  ${C.muted}r${C.reset} refresh  ` +
         `${C.muted}a${C.reset} account  ${C.muted}w${C.reset} window  ${C.muted}↑↓${C.reset} scroll` +
+        (url ? `  ${C.muted}o${C.reset} open web` : '') +
         (state.live ? '' : `  ${C.warning}paused${C.reset}`);
 
     const viewH = height - 2;
@@ -406,6 +425,7 @@ export function startTui({ webUrl, onQuit }) {
     switch (key) {
       case 'q': case '': quit(); return;
       case 'r': refreshAndRender(true); return;
+      case 'o': if (url) openUrl(url); return;
       case 'a':
         state.accountIdx = (state.accountIdx + 1) % (accounts.length + 1);
         refreshAndRender(true); return;
