@@ -76,7 +76,7 @@ Run it from any directory once linked:
 | `claude-tracker accounts` | list accounts and their UUIDs |
 | `claude-tracker label a1b2c3d4 "work"` | name an account by UUID prefix |
 | `claude-tracker statusline install` | exact limit numbers, from each profile's status line |
-| `claude-tracker service install` | keep it running in the background from login (macOS) |
+| `claude-tracker service install` | keep it running in the background from login (macOS, Linux) |
 
 Or from inside the repo, without linking — `yarn` and `npm run` both work:
 
@@ -242,11 +242,21 @@ Turn them off with `--no-notify` or `CLAUDE_TRACKER_NOTIFY=0`.
 
 ### Running at login
 
-`claude-tracker service install` adds a per-user launchd agent that runs the web
-dashboard from login and restarts it if it stops; `service status` and `service
-uninstall` do what they say. It matters for accuracy as much as convenience: the
-tracker only sees the moment you switch accounts while it is running. The log is
+`claude-tracker service install` runs the web dashboard in the background from
+login and restarts it if it stops: a per-user launchd agent on macOS, a systemd
+user service on Linux. `service status` and `service uninstall` do what they
+say. It matters for accuracy as much as convenience: the tracker only sees the
+moment you switch accounts while it is running. The log is
 `~/.claude/tracker/service.log`.
+
+On Linux the service lives as long as your systemd user instance, which normally
+stops when you last log out - taking the tracker with it while sessions left in
+tmux carry on. On a machine you reach over SSH, turn on lingering so it starts
+at boot and survives logout:
+
+```sh
+loginctl enable-linger
+```
 
 ### Realtime
 
@@ -444,7 +454,7 @@ depend on your own usage history.
 | `src/statusline.js` | installs that command into each profile |
 | `src/live.js` | turns status-line snapshots into exact readings |
 | `src/notify.js` | deduplicated desktop notifications |
-| `src/service.js` | the launchd login service |
+| `src/service.js` | the login service: launchd or systemd |
 | `src/billing.js` | projects the subscription cycle from its start date |
 | `src/api.js` | aggregation for both dashboards |
 | `src/tui.js` | terminal dashboard |
