@@ -252,7 +252,7 @@ ${c.bold}claude-tracker${c.reset} — local usage and rate-limit tracking for Cl
   ${c.bold}verify${c.reset}                      check the window model against observed resets
   ${c.bold}where${c.reset}                       print data locations
   ${c.bold}statusline${c.reset} install|uninstall  exact limits via each profile's status line
-  ${c.bold}service${c.reset} install|uninstall     run in the background at login (macOS)
+  ${c.bold}service${c.reset} install|uninstall     run in the background at login (launchd or systemd)
 
 ${c.dim}In the terminal dashboard: q quit · r refresh · a cycle account · w switch
 window · space pause · ↑↓/jk scroll${c.reset}

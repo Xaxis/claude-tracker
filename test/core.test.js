@@ -744,3 +744,13 @@ test('an idle session is read as of its last call, not the render', async () => 
   assert.equal(db().prepare("SELECT ts FROM utilization WHERE session_id = 'sess-idle'").get().ts, lastCallAt);
   fs.rmSync(LIVE_DIR, { recursive: true, force: true });
 });
+
+test('the systemd unit hands every argument over unchanged', async () => {
+  const { unitFile } = await import('../src/service.js');
+  const unit = unitFile({ args: ['/usr/bin/node', '/a dir/cli.js', '50%d', 'q"uote', '$HOME'], env: { PATH: '/x%y' } });
+  // systemd reads %% as %, $$ as $, and unquotes C-style: all verified against a real user unit.
+  assert.match(unit, /^ExecStart="\/usr\/bin\/node" "\/a dir\/cli.js" "50%%d" "q\\"uote" "\$\$HOME"$/m);
+  assert.match(unit, /^Environment="PATH=\/x%%y"$/m);
+  assert.match(unit, /^Restart=always$/m);
+  assert.match(unit, /^WantedBy=default.target$/m);
+});
