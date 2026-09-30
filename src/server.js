@@ -3,11 +3,12 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { exec } from 'node:child_process';
-import { overview, history, sessions, modelBreakdown, liveSessions, windowHistory } from './api.js';
+import { overview, history, sessions, modelBreakdown, liveSessions, windowHistory, localState } from './api.js';
 import { verifyWindowModel } from './calibrate.js';
 import { startWatcher } from './watcher.js';
 import { listAccounts } from './accounts.js';
 import { notify } from './notify.js';
+import { PROTOCOL, advertise, startSync } from './sync.js';
 
 const WEB_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'web');
 
@@ -63,7 +64,7 @@ function handleApi(req, res, url) {
   const days = Math.min(365, Math.max(1, Number(q.get('days') ?? 30)));
 
   switch (url.pathname) {
-    case '/api/health': return sendJson(res, { app: 'claude-tracker', pid: process.pid });
+    case '/api/health': return sendJson(res, { app: 'claude-tracker', pid: process.pid, sync: PROTOCOL });
     case '/api/overview': return sendJson(res, overview());
     case '/api/history': return sendJson(res, history(days, account));
     case '/api/sessions': return sendJson(res, sessions(Math.min(200, Number(q.get('limit') ?? 40)), account));
@@ -109,7 +110,7 @@ async function probe(port) {
   }
 }
 
-export async function serve({ port = 4785, open = false, refresh, fastRefresh, tui = true, web = true, notifications = true }) {
+export async function serve({ port = 4785, open = false, refresh, fastRefresh, afterSync, tui = true, web = true, notifications = true }) {
   // Refreshes share one database connection and ingest in chunked transactions
   // that span awaits, so two must never interleave. Everything that writes goes
   // through this queue, one at a time.
@@ -185,11 +186,13 @@ export async function serve({ port = 4785, open = false, refresh, fastRefresh, t
   }
 
   let ui = null;
+  let sync = null;
   // Alerts are checked at most every 10s, whatever the push rate.
   let lastNotify = 0;
   const push = (info) => {
     if (web) broadcast('update', { reason: info.reason, at: Date.now(), newEvents: info.newEvents ?? 0 });
     ui?.update();
+    sync?.nudge();
     if (notifications && Date.now() - lastNotify > 10_000) {
       lastNotify = Date.now();
       try { notify(overview()); } catch { /* an alert must never take the dashboards down */ }
@@ -221,12 +224,34 @@ export async function serve({ port = 4785, open = false, refresh, fastRefresh, t
     },
   });
 
+  // Syncing with other machines belongs to whichever process serves the port -
+  // the one `sync serve` finds. Rows that arrive are settled a second at a time.
+  let advert = null;
+  if (web) {
+    advert = advertise(port);
+    let since = null, settling = null;
+    const onRows = (t) => {
+      since = Math.min(since ?? Infinity, t ?? Infinity);
+      settling ??= setTimeout(() => {
+        const from = since;
+        since = null; settling = null;
+        serial(() => afterSync(from))
+          .then(() => push({ reason: 'sync' }))
+          .catch((err) => (ui ? ui.reportError(err.message) : console.error('sync failed:', err.message)));
+      }, 1000);
+    };
+    sync = startSync({ serial, onRows, localState });
+    server.on('upgrade', (req, socket, head) => sync.accept(req, socket, head, advert.token));
+  }
+
   let closing = false;
   const shutdown = () => {
     if (closing) return;
     closing = true;
     clearInterval(fullTimer);
     stopWatching();
+    sync?.stop();
+    advert?.withdraw();
     ui?.stop();
     for (const c of clients) { try { c.end(); } catch { /* already gone */ } }
     if (web) server.close(() => process.exit(0));

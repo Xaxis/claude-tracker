@@ -182,6 +182,75 @@ CREATE TABLE IF NOT EXISTS meta (
   key   TEXT PRIMARY KEY,
   value TEXT
 );
+
+-- Syncing with trackers on other machines (see replica.js).
+--
+-- Most synced tables only ever gain rows, so a peer resumes from the last rowid
+-- it received. Sessions and accounts are updated in place, so every change to
+-- one is logged here instead, and a peer resumes from the last seq it received.
+-- The triggers delete and re-insert rather than INSERT OR REPLACE: a trigger
+-- takes the conflict policy of the statement that fired it, and an upsert's is
+-- to abort.
+CREATE TABLE IF NOT EXISTS sync_dirty (
+  seq INTEGER PRIMARY KEY AUTOINCREMENT,
+  tbl TEXT NOT NULL,
+  key TEXT NOT NULL,
+  UNIQUE (tbl, key)
+);
+CREATE TRIGGER IF NOT EXISTS sessions_sync_insert AFTER INSERT ON sessions
+BEGIN DELETE FROM sync_dirty WHERE tbl = 'sessions' AND key = NEW.session_id;
+      INSERT INTO sync_dirty (tbl, key) VALUES ('sessions', NEW.session_id); END;
+CREATE TRIGGER IF NOT EXISTS sessions_sync_update AFTER UPDATE ON sessions
+WHEN OLD.first_ts IS NOT NEW.first_ts OR OLD.last_ts IS NOT NEW.last_ts OR OLD.cwd IS NOT NEW.cwd
+  OR OLD.project IS NOT NEW.project OR OLD.git_branch IS NOT NEW.git_branch OR OLD.version IS NOT NEW.version
+  OR OLD.entrypoint IS NOT NEW.entrypoint OR OLD.config_dir IS NOT NEW.config_dir
+  OR OLD.user_email IS NOT NEW.user_email OR OLD.reported_cost IS NOT NEW.reported_cost
+  -- A bridge record is evidence; any other account on a session is a conclusion.
+  OR ((OLD.account_source = 'bridge' OR NEW.account_source = 'bridge')
+      AND (OLD.account_uuid IS NOT NEW.account_uuid OR OLD.account_source IS NOT NEW.account_source))
+BEGIN DELETE FROM sync_dirty WHERE tbl = 'sessions' AND key = NEW.session_id;
+      INSERT INTO sync_dirty (tbl, key) VALUES ('sessions', NEW.session_id); END;
+CREATE TRIGGER IF NOT EXISTS accounts_sync_insert AFTER INSERT ON accounts
+BEGIN DELETE FROM sync_dirty WHERE tbl = 'accounts' AND key = NEW.account_uuid;
+      INSERT INTO sync_dirty (tbl, key) VALUES ('accounts', NEW.account_uuid); END;
+CREATE TRIGGER IF NOT EXISTS accounts_sync_update AFTER UPDATE ON accounts
+WHEN OLD.email IS NOT NEW.email OR OLD.display_name IS NOT NEW.display_name OR OLD.label IS NOT NEW.label
+  OR OLD.org_uuid IS NOT NEW.org_uuid OR OLD.org_name IS NOT NEW.org_name
+  OR OLD.rate_limit_tier IS NOT NEW.rate_limit_tier OR OLD.subscription_type IS NOT NEW.subscription_type
+  OR OLD.billing_type IS NOT NEW.billing_type OR OLD.subscription_at IS NOT NEW.subscription_at
+  OR OLD.config_dir IS NOT NEW.config_dir OR OLD.first_seen IS NOT NEW.first_seen OR OLD.last_seen IS NOT NEW.last_seen
+BEGIN DELETE FROM sync_dirty WHERE tbl = 'accounts' AND key = NEW.account_uuid;
+      INSERT INTO sync_dirty (tbl, key) VALUES ('accounts', NEW.account_uuid); END;
+
+-- How far this tracker has read each table of each other machine's index.
+CREATE TABLE IF NOT EXISTS sync_cursors (
+  machine_id TEXT NOT NULL,
+  tbl        TEXT NOT NULL,
+  cursor     INTEGER NOT NULL,
+  PRIMARY KEY (machine_id, tbl)
+);
+
+-- Other machines this tracker has synced with, and what each last said was
+-- running there.
+CREATE TABLE IF NOT EXISTS sync_machines (
+  machine_id TEXT PRIMARY KEY,
+  name       TEXT,
+  epoch      TEXT,
+  last_seen  INTEGER,
+  state      TEXT,
+  state_at   INTEGER
+);
+
+-- Machines this tracker connects to over ssh, and how that is going.
+CREATE TABLE IF NOT EXISTS sync_peers (
+  target     TEXT PRIMARY KEY,
+  command    TEXT,
+  added_at   INTEGER,
+  machine_id TEXT,
+  status     TEXT,
+  error      TEXT,
+  status_at  INTEGER
+);
 `;
 
 /**
@@ -200,7 +269,14 @@ function ensureSchema(d) {
 
   const fresh = !d.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='events'").get();
   if (have === SCHEMA_VERSION || fresh) {
+    const logged = !!d.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='sync_dirty'").get();
     d.exec(SCHEMA);
+    // An index from before syncing existed has sessions and accounts no change
+    // was ever logged for; log them all once, so a peer's first sync gets them.
+    if (!logged) {
+      d.exec(`INSERT OR IGNORE INTO sync_dirty (tbl, key) SELECT 'accounts', account_uuid FROM accounts;
+              INSERT OR IGNORE INTO sync_dirty (tbl, key) SELECT 'sessions', session_id FROM sessions;`);
+    }
     d.prepare(`INSERT INTO meta (key, value) VALUES ('schema_version', ?)
                ON CONFLICT(key) DO UPDATE SET value = excluded.value`).run(String(SCHEMA_VERSION));
     return;
@@ -214,6 +290,11 @@ function ensureSchema(d) {
   const q = (id) => `"${id.replace(/"/g, '""')}"`;
   d.exec('BEGIN');
   try {
+    // Triggers would follow their tables aside too, and keep the new tables from
+    // getting their own.
+    for (const { name } of d.prepare("SELECT name FROM sqlite_master WHERE type = 'trigger'").all()) {
+      d.exec(`DROP TRIGGER ${q(name)}`);
+    }
     for (const t of tables) {
       for (const { name } of d.prepare(`SELECT name FROM sqlite_master
           WHERE type = 'index' AND tbl_name = ? AND sql IS NOT NULL`).all(t)) d.exec(`DROP INDEX ${q(name)}`);
@@ -229,6 +310,9 @@ function ensureSchema(d) {
       }
       d.exec(`DROP TABLE ${q(t + '__old')}`);
     }
+    // Rows were renumbered, so where other machines had read up to no longer
+    // means anything: a new epoch has them start over.
+    d.prepare("DELETE FROM meta WHERE key = 'sync_epoch'").run();
     d.prepare(`INSERT INTO meta (key, value) VALUES ('schema_version', ?)
                ON CONFLICT(key) DO UPDATE SET value = excluded.value`).run(String(SCHEMA_VERSION));
     d.exec('COMMIT');

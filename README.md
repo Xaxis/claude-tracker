@@ -9,8 +9,9 @@ directory you use, reconstructs the 5-hour and 7-day rate-limit windows per
 account, and shows how full each one is right now — in the terminal, in the
 browser, or both at once. New accounts are picked up on their own.
 
-Everything stays on your machine. There are no dependencies, no API calls, and
-no network access beyond a loopback HTTP server you start yourself.
+Everything stays on your machine unless you sync it with another of yours,
+over ssh. There are no dependencies, no API calls, and no network access beyond
+a loopback HTTP server you start yourself.
 
 ```
   Claude Tracker                     ● live · updated 09:32:16 · 127.0.0.1:4785
@@ -77,6 +78,8 @@ Run it from any directory once linked:
 | `claude-tracker label a1b2c3d4 "work"` | name an account by UUID prefix |
 | `claude-tracker statusline install` | exact limit numbers, from each profile's status line |
 | `claude-tracker service install` | keep it running in the background from login (macOS, Linux) |
+| `claude-tracker sync add me@devbox` | sync with the tracker on another machine, over ssh |
+| `claude-tracker sync` | which machines it syncs with, and how that is going |
 
 Or from inside the repo, without linking — `yarn` and `npm run` both work:
 
@@ -258,6 +261,51 @@ at boot and survives logout:
 loginctl enable-linger
 ```
 
+### Syncing machines
+
+Running Claude on a laptop and a dev box means two trackers, each seeing half
+the picture: an account's window fills from both machines, but each tracker
+only counts the calls made on its own. Syncing them makes both whole. Put the
+tracker on each machine, run `service install` on each, then from whichever
+machine can reach the other over ssh:
+
+```sh
+claude-tracker sync add me@devbox      # what you would type after `ssh`
+```
+
+That is all. Both dashboards then show every account's usage from both
+machines, the sessions running on each (marked with the machine's name), and
+the account to use next wherever it is signed in. A new call on one machine
+shows on the other within a couple of seconds.
+
+How it works:
+
+- **One ssh connection, both ways.** The tracker that added the peer keeps
+  `ssh me@devbox claude-tracker sync serve` open; that command hands the
+  connection to the tracker already running there. Only one machine needs to
+  reach the other - a laptop that can ssh into a dev box, where the dev box
+  cannot reach the laptop, still gets everything in both directions. Nothing
+  new listens on the network, and ssh does the authentication, so it needs to
+  work without a password prompt: a key, or an agent holding one.
+- **Evidence travels, conclusions do not.** What is copied is calls, sign-in
+  records, refusals, status-line readings, sessions and accounts. Each tracker
+  then attributes every call over the combined evidence itself, so both arrive
+  at the same totals. A profile from another machine is stored under that
+  machine's id, so `~/.claude` on the laptop and `~/.claude` on the dev box
+  never share a timeline.
+- **Incremental.** Each side remembers how far into each of the other's tables
+  it has read. The first sync copies everything - about half a minute for half
+  a million calls - and after that only what is new. A machine that was asleep
+  or offline catches up when it reconnects.
+- **The tracker must be running on both.** `sync serve` hands the connection to
+  it; if it is not running, `sync add` says so.
+
+`claude-tracker sync` shows each peer's state and the last error, if any;
+`sync remove me@devbox` stops connecting (the history already copied stays);
+`sync name laptop` changes what other machines call this one, which is its
+hostname until you do. If ssh needs something unusual to find the command on
+the other machine, pass it: `sync add me@devbox --command "node ~/claude-tracker/bin/cli.js sync serve"`.
+
 ### Realtime
 
 Both dashboards run off one watcher inside the tracker process:
@@ -410,9 +458,9 @@ to every account on the plan.
 - **Exact where a session is running**, with the status line installed.
   Otherwise percentages are estimates, marked `≈`. Reset times are exact
   whenever Claude Code or the API has reported one.
-- **Estimates only see this machine.** Usage from claude.ai or other devices
-  counts against the same limits but leaves no local trace; exact readings do
-  include it.
+- **Estimates only see this machine** and the machines it syncs with. Usage
+  from claude.ai or anywhere else counts against the same limits but leaves no
+  trace here; exact readings do include it.
 - **Renewal dates assume a monthly cycle**, projected from the subscription
   start, and aren't shown for prepaid or organisation seats.
 - **Attribution is per call**, exact from the moment the tracker runs; older
@@ -424,16 +472,20 @@ to every account on the plan.
 
 ## Privacy
 
-Everything stays on this machine. The tracker reads Claude Code's transcripts and
-config files, and never reads credentials. `statusline install` edits only the
+Everything stays on this machine, unless you sync it: then the index is copied
+to the machines you added, over ssh, and theirs to this one. The tracker reads
+Claude Code's transcripts and config files, and never reads credentials. `statusline install` edits only the
 `statusLine` key of each profile's `settings.json`, after writing a backup.
 Notifications go through macOS's own notification centre. The web server binds
-to `127.0.0.1` only, and the index lives in `~/.claude/tracker/`.
+to `127.0.0.1` only, and the index lives in `~/.claude/tracker/`. A sync
+connection reaches it only through `sync serve`, which has to show a token kept
+in a file only you can read.
 
 ## Development
 
 ```sh
-node --test                     # unit tests: windows, pricing, attribution
+node --test                     # unit tests, and two trackers syncing end to end
+CT_TEST_SSH=ssh CT_TEST_HOST=me@localhost node --test test/sync.test.js   # the same, over real ssh
 python3 bench/run_load.py   # end-to-end realtime test (needs Chrome)
 ```
 
@@ -455,6 +507,8 @@ depend on your own usage history.
 | `src/live.js` | turns status-line snapshots into exact readings |
 | `src/notify.js` | deduplicated desktop notifications |
 | `src/service.js` | the login service: launchd or systemd |
+| `src/replica.js` | what syncing copies between machines, and how it merges |
+| `src/sync.js` | the sync connection: ssh, the relay, the protocol |
 | `src/billing.js` | projects the subscription cycle from its start date |
 | `src/api.js` | aggregation for both dashboards |
 | `src/tui.js` | terminal dashboard |

@@ -134,6 +134,19 @@ function sparkline(values, max) {
 
 /* --- the dashboard -------------------------------------------------------- */
 
+/** The machines this one syncs with, for the header: bright while they report, dim once they stop. */
+function syncMark(sync, now) {
+  if (!sync) return '';
+  const parts = sync.machines.map((m) => (m.online
+    ? `${C.good}⇄${C.reset} ${m.name}`
+    : `${C.muted}⇄ ${m.name} ${m.lastSeen ? duration(now - m.lastSeen) : 'never'}${C.reset}`));
+  // A peer that has never answered has no machine to show yet - show why.
+  for (const p of sync.peers) {
+    if (p.status !== 'connected' && !sync.machines.length) parts.push(`${C.critical}⇄${C.reset} ${C.muted}${p.target}${C.reset}`);
+  }
+  return parts.join(' ');
+}
+
 export function startTui({ webUrl, onQuit }) {
   // The web dashboard's address, clickable where the terminal supports links.
   const url = /^https?:\/\/\S+/.exec(webUrl ?? '')?.[0] ?? null;
@@ -188,10 +201,14 @@ export function startTui({ webUrl, onQuit }) {
     const liveMark = state.live ? `${C.good}●${C.reset} live` : `${C.critical}●${C.reset} paused`;
     // When the numbers below were read - proof at a glance that they are moving.
     const stamp = `${C.muted}updated ${new Date(state.lastRefresh).toTimeString().slice(0, 8)}${C.reset}`;
-    const right = `${liveMark} ${C.muted}·${C.reset} ${stamp} ${C.muted}·${C.reset} ${C.accent}${linkedUrl}${C.reset}`;
     const left = `${A.bold}Claude Tracker${A.reset}`;
+    const synced = syncMark(ov?.sync, now);
+    let right = `${liveMark} ${C.muted}·${C.reset} ${stamp}${synced ? ` ${C.muted}·${C.reset} ${synced}` : ''} ${C.muted}·${C.reset} ${C.accent}${linkedUrl}${C.reset}`;
+    // Too narrow for everything on one line: the machines go on the next.
+    const wraps = synced && vlen(left) + 2 + vlen(right) > inner;
+    if (wraps) right = `${liveMark} ${C.muted}·${C.reset} ${stamp} ${C.muted}·${C.reset} ${C.accent}${linkedUrl}${C.reset}`;
     L.push(`  ${padEnd(left, Math.max(0, inner - vlen(right)))}${right}`);
-    L.push('');
+    L.push(wraps ? `  ${synced}` : '');
 
     if (!ov || !ov.accounts.length) {
       // Usage with no identifiable account is a real state, not an empty one -
@@ -239,7 +256,9 @@ export function startTui({ webUrl, onQuit }) {
     // ---- which account to use right now
     const rec = ov.recommendation;
     if (rec) {
-      const how = rec.command ? `  ${C.accent}${rec.command}${C.reset}` : `  ${C.muted}${rec.note}${C.reset}`;
+      const how = rec.command
+        ? `  ${C.accent}${rec.command}${C.reset}${rec.machine ? `${C.muted} on ${rec.machine}${C.reset}` : ''}`
+        : `  ${C.muted}${rec.note}${C.reset}`;
       L.push(`  ${C.good}USE NOW${C.reset}  ${A.bold}${rec.label}${A.reset}  ` +
         `${C.muted}${Math.round(rec.headroom)}% headroom${rec.exact ? '' : ' (est)'}${C.reset}${how}`);
     } else {
@@ -257,8 +276,9 @@ export function startTui({ webUrl, onQuit }) {
       const burn = s.recent.calls ? `${money(s.recent.cost)}/5m` : '';
       const who = s.account ? `${s.account}${s.background ? ' (bg)' : ''}` : 'unknown account';
       const name = s.name || s.sessionId.slice(0, 8);
-      const tail = `${C.muted}${padEnd(ago, 6)}${C.reset} ${padEnd(burn, 10)}`;
-      const whoW = Math.max(12, Math.min(30, inner - 22 - 18));
+      const tail = `${C.muted}${padEnd(ago, 6)}${C.reset} ${padEnd(burn, 10)}${s.machine ? `${C.muted}on ${s.machine}${C.reset}` : ''}`;
+      // The account column gives way to the machine name, not the other way round.
+      const whoW = Math.max(12, Math.min(30, inner - 22 - 18 - (s.machine ? s.machine.length + 3 : 0)));
       L.push(`  ${dot} ${padEnd(truncate(name, 20), 21)}${C.accent}${padEnd(truncate(who, whoW), whoW + 1)}${C.reset}${tail}`);
     }
     if (data.live.length > shown.length) L.push(`    ${C.muted}+${data.live.length - shown.length} more${C.reset}`);

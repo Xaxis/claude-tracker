@@ -8,6 +8,7 @@ import { LIMIT_TYPES, currentWindow, burnRate, recentWindows, sumBetween } from 
 import { modelLabel } from './pricing.js';
 import { billingPeriod, periodSpend } from './billing.js';
 import { accountAggregates } from './aggregates.js';
+import { machine, remoteMachines, listPeers, machineNameOf } from './replica.js';
 
 const UNATTRIBUTED = '__unattributed__';
 
@@ -78,16 +79,23 @@ function windowStatus(accountUuid, type, tier, now) {
 
 /**
  * The account to use right now: never one that is refused on any limit,
- * preferring one already signed into a profile (usable immediately), then the
- * most headroom in its tightest window. An idle window counts as empty - the
- * next request opens a fresh one.
+ * preferring one already signed into a profile here (usable immediately), then
+ * one signed in on another synced machine, then the most headroom in its
+ * tightest window. An idle window counts as empty - the next request opens a
+ * fresh one.
  */
-function recommend(rows) {
+function recommend(rows, now) {
   const signedIn = new Map();
-  for (const p of discoverProfiles()) {
-    const acct = profileAccount(p);
-    if (acct && !signedIn.has(acct.accountUuid)) signedIn.set(acct.accountUuid, p);
+  const run = (p) => (p.isDefault ? 'claude' : `CLAUDE_CONFIG_DIR=${p.dir} claude`);
+  for (const p of profileStates()) {
+    if (p.accountUuid && !signedIn.has(p.accountUuid)) signedIn.set(p.accountUuid, { name: p.name, command: run(p), machine: null });
   }
+  for (const m of remoteMachines(now)) {
+    for (const p of m.profiles) {
+      if (p.accountUuid && !signedIn.has(p.accountUuid)) signedIn.set(p.accountUuid, { name: p.name, command: run(p), machine: m.name });
+    }
+  }
+  const rank = (x) => (x.profile ? (x.profile.machine ? 1 : 2) : 0);
   const scored = rows.filter((a) => !a.limits.some((l) => l.blocked)).map((a) => {
     const core = a.limits.filter((l) => LIMIT_TYPES[l.type]);
     const headroom = core.length ? Math.min(...core.map((l) => 100 - (l.active ? l.percent : 0))) : 100;
@@ -95,14 +103,15 @@ function recommend(rows) {
       a, headroom, profile: signedIn.get(a.accountUuid) ?? null,
       exact: core.every((l) => !l.active || l.confidence === 'exact'),
     };
-  }).sort((x, y) => (Number(!!y.profile) - Number(!!x.profile)) || y.headroom - x.headroom);
+  }).sort((x, y) => rank(y) - rank(x) || y.headroom - x.headroom);
   const best = scored[0];
   if (!best) return null;
   const p = best.profile;
   return {
     accountUuid: best.a.accountUuid, label: best.a.label, headroom: best.headroom, exact: best.exact,
     profile: p?.name ?? null,
-    command: p ? (p.isDefault ? 'claude' : `CLAUDE_CONFIG_DIR=${tildify(p.dir)} claude`) : null,
+    machine: p?.machine ?? null,
+    command: p?.command ?? null,
     note: p ? null : 'not signed into any profile - /login with it first',
   };
 }
@@ -192,7 +201,8 @@ export function overview(now = Date.now()) {
     accounts: rows,
     unattributed: { events: unattributed.events, cost: unattributed.cost },
     current: cur ? { accountUuid: cur.accountUuid, email: cur.email } : null,
-    recommendation: recommend(rows),
+    recommendation: recommend(rows, now),
+    sync: syncSummary(now),
   };
 }
 
@@ -240,7 +250,7 @@ export function sessions(limit = 40, accountUuid = null) {
   const { clause: where, params } = accountFilter(accountUuid, 'WHERE');
   const rows = db().prepare(`
     SELECT s.session_id, s.project, s.cwd, s.git_branch, s.first_ts, s.last_ts,
-           s.account_uuid, s.account_source, s.version,
+           s.account_uuid, s.account_source, s.version, s.config_dir,
            COALESCE(SUM(e.cost_usd), 0) AS cost,
            COUNT(e.call_id) AS events,
            COALESCE(SUM(e.input_tokens + e.output_tokens + e.cache_write_5m + e.cache_write_1h + e.cache_read), 0) AS tokens
@@ -252,19 +262,38 @@ export function sessions(limit = 40, accountUuid = null) {
   // A session that switched accounts billed each for part of it - list both.
   const split = db().prepare(`SELECT account_uuid a, SUM(cost_usd) c FROM events
      WHERE session_id = ? GROUP BY account_uuid ORDER BY MIN(ts)`);
-  for (const r of rows) r.accounts = split.all(r.session_id).map((x) => ({ accountUuid: x.a, cost: x.c }));
+  for (const r of rows) {
+    r.accounts = split.all(r.session_id).map((x) => ({ accountUuid: x.a, cost: x.c }));
+    r.machine = machineNameOf(r.config_dir);
+  }
   return rows;
 }
 
 /**
- * Claude Code processes running right now, across every profile, each with the
- * account it is running as *at this moment*.
+ * Claude Code processes running right now, on this machine and on every synced
+ * machine still reporting, each with the account it is running as *at this
+ * moment*. Another machine's sessions carry its name in `machine`.
+ */
+export function liveSessions(now = Date.now()) {
+  const out = localSessions(now);
+  const byUuid = new Map(db().prepare('SELECT * FROM accounts').all().map((a) => [a.account_uuid, a]));
+  for (const m of remoteMachines(now)) {
+    for (const s of m.running) {
+      const acct = s.accountUuid ? byUuid.get(s.accountUuid) : null;
+      out.push({ ...s, account: acct ? accountLabel(acct) : s.account, machine: m.name });
+    }
+  }
+  return out.sort((a, b) => (b.lastActivityAt ?? 0) - (a.lastActivityAt ?? 0));
+}
+
+/**
+ * Claude Code processes running on this machine, across every profile.
  *
  * A session's current account is decided by the same rules its calls are
  * billed by - the newest of its own records and its profile's latest login - so
  * a /login typed into one session shows on every session it moved.
  */
-export function liveSessions(now = Date.now()) {
+export function localSessions(now = Date.now()) {
   const d = db();
   const acctRows = d.prepare('SELECT * FROM accounts').all();
   const byUuid = new Map(acctRows.map((a) => [a.account_uuid, a]));
@@ -327,10 +356,31 @@ export function liveSessions(now = Date.now()) {
         account: acct ? accountLabel(acct) : null,
         accountSource: source,
         recent: { calls, cost, perHour: cost * 12 },
+        machine: null,
       });
     }
   }
   return out.sort((a, b) => (b.lastActivityAt ?? 0) - (a.lastActivityAt ?? 0));
+}
+
+/** Each profile on this machine and who is signed into it, as other machines are told. */
+export function profileStates() {
+  return discoverProfiles().map((p) => {
+    const a = profileAccount(p);
+    return { name: p.name, dir: tildify(p.dir), isDefault: p.isDefault, accountUuid: a?.accountUuid ?? null, email: a?.email ?? null };
+  });
+}
+
+/** What this machine tells the machines it syncs with. */
+export function localState() {
+  return { running: localSessions(), profiles: profileStates() };
+}
+
+/** This machine's name, the machines it syncs with, and how reaching them is going. */
+function syncSummary(now) {
+  const peers = listPeers().map((p) => ({ target: p.target, status: p.status, error: p.error, at: p.status_at }));
+  const machines = remoteMachines(now).map(({ id, name, online, lastSeen }) => ({ id, name, online, lastSeen }));
+  return { name: machine().name, machines, peers };
 }
 
 /** Per-model totals over the trailing `days`. */
