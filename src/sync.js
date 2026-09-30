@@ -222,8 +222,12 @@ export const REMOTE_COMMANDS = [
   `sh -lc 'exec claude-tracker sync serve'`,
 ];
 
+// BatchMode means ssh can never stop to ask anything - so it also cannot ask
+// to trust a host it has not met under this name, and would refuse it. Trust
+// on first contact is what answering yes would do; a key that has changed
+// since is still refused.
 const SSH_OPTIONS = [
-  '-T', '-C', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10',
+  '-T', '-C', '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=accept-new', '-o', 'ConnectTimeout=10',
   '-o', 'ServerAliveInterval=15', '-o', 'ServerAliveCountMax=3',
 ];
 

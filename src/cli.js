@@ -338,8 +338,14 @@ async function cmdSync(action, args, flags) {
     const r = await S.probePeer(target, typeof flags.command === 'string' ? flags.command : null);
     if (!r.ok) {
       console.error(`${c.red}✗${c.reset} could not sync with ${target}: ${r.error}`);
-      console.error(`${c.dim}  It needs \`ssh ${target}\` to work without a password prompt, and claude-tracker`);
-      console.error(`  running there: claude-tracker service install${c.reset}`);
+      if (/Host key verification failed/i.test(r.error)) {
+        const host = target.replace(/^.*@/, '');
+        console.error(`${c.dim}  ${host} presents a different host key from the one this machine recorded for it.`);
+        console.error(`  If it was reinstalled, forget the old key and try again: ssh-keygen -R ${host}${c.reset}`);
+      } else {
+        console.error(`${c.dim}  It needs \`ssh ${target}\` to work without a password prompt, and claude-tracker`);
+        console.error(`  running there: claude-tracker service install${c.reset}`);
+      }
       process.exitCode = 1;
       return;
     }
