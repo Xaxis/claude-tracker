@@ -42,6 +42,14 @@ cd claude-tracker
 npm link          # puts `claude-tracker` on your PATH
 ```
 
+With a system Node, as on most Linux installs, npm's global directory belongs to
+root and `npm link` fails without sudo. Link into `~/.local` instead, whose `bin`
+most distributions already put on your PATH:
+
+```sh
+NPM_CONFIG_PREFIX=~/.local npm link
+```
+
 Then, from anywhere:
 
 ```sh
@@ -49,7 +57,8 @@ claude-tracker
 ```
 
 That is the whole thing: terminal dashboard and web dashboard, together.
-(`npm unlink -g claude-tracker` undoes it.)
+(`npm unlink -g claude-tracker` undoes it, with the same `NPM_CONFIG_PREFIX` if
+you used one.)
 
 ## Use
 
