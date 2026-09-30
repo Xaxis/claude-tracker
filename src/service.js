@@ -37,7 +37,7 @@ const SERVICES = {
     file: path.join(HOME, 'Library', 'LaunchAgents', `${LABEL}.plist`),
     target: () => `gui/${process.getuid()}`,
 
-    install(port) {
+    async install(port) {
       const { args, env } = command(port);
       const esc = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
       const plist = `<?xml version="1.0" encoding="UTF-8"?>
@@ -61,7 +61,14 @@ const SERVICES = {
 </plist>
 `;
       fs.mkdirSync(path.dirname(this.file), { recursive: true });
-      run('launchctl', 'bootout', `${this.target()}/${LABEL}`);   // replace any earlier version
+      // Replace any earlier version. bootout returns before the old job has
+      // gone, and loading over it fails with "5: Input/output error" - so wait
+      // for it to leave. launchd gives a job 20s to exit before killing it.
+      run('launchctl', 'bootout', `${this.target()}/${LABEL}`);
+      for (const until = Date.now() + 25_000; this.status().loaded;) {
+        if (Date.now() > until) throw new Error('the running service did not stop within 25s');
+        await new Promise((r) => setTimeout(r, 250));
+      }
       fs.writeFileSync(this.file, plist);
       const r = run('launchctl', 'bootstrap', this.target(), this.file);
       if (!r.ok) throw new Error(`launchctl bootstrap failed: ${r.out.trim()}`);
@@ -142,10 +149,10 @@ function service() {
   return s;
 }
 
-export function installService({ port = 4785 } = {}) {
+export async function installService({ port = 4785 } = {}) {
   const s = service();
   ensureDataDir();
-  s.install(port);
+  await s.install(port);
   return { file: s.file, log: LOG, url: `http://127.0.0.1:${port}` };
 }
 
