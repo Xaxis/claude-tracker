@@ -789,3 +789,61 @@ if (cmd === 'bootstrap') {
   assert.equal(r.status, 0, r.stderr);
   assert.equal(r.stdout.trim(), 'running');
 });
+
+/* ------------------------------------------------------------------ syncing */
+
+test('a sync connection that errors mid-write closes, and takes nothing down with it', async () => {
+  // A relay killed mid-transfer errors the socket; readline re-emits that as its
+  // own error, and an unhandled one used to crash the whole tracker.
+  const { Duplex } = await import('node:stream');
+  const { openLink } = await import('../src/sync.js');
+  const socket = new Duplex({ read() {}, write(_chunk, _enc, done) { done(); } });
+  const link = openLink({ input: socket, output: socket, serial: (fn) => Promise.resolve().then(fn) });
+  socket.destroy(Object.assign(new Error('write EPIPE'), { code: 'EPIPE' }));
+  assert.equal(await link.done, 'write EPIPE');
+  assert.equal(link.closed, true);
+});
+
+test('rows from another machine keep their profiles apart, and merge without flapping', async () => {
+  reset();
+  const R = await import('../src/replica.js');
+  const me = R.machine().id, other = 'abcdef123456';
+  // A profile path crosses as <machine>:<path>, and one naming this machine comes home.
+  assert.equal(R.exportDir('/home/me/.claude'), `${me}:/home/me/.claude`);
+  assert.equal(R.importDir('/Users/them/.claude', other), `${other}:/Users/them/.claude`);
+  assert.equal(R.importDir(`${me}:/home/me/.claude`, other), '/home/me/.claude');
+  assert.equal(R.importDir(`${other}:/x`, 'ffffff000000'), `${other}:/x`);
+
+  const cols = Object.keys(R.TABLES.sessions.cols);
+  const row = (o) => cols.map((c) => o[c] ?? null);
+  db().prepare(`INSERT INTO sessions (session_id, first_ts, last_ts, cwd, config_dir, account_uuid, account_source)
+    VALUES ('s1', 100, 500, '/here', '/home/me/.claude', 'guess', 'inferred')`).run();
+  // Older news does not overwrite; a bridge record is evidence and is taken.
+  R.importBatch(other, 'sessions', cols, [row({ session_id: 's1', first_ts: 50, last_ts: 400, cwd: '/there', config_dir: '/Users/them/.claude', bridge_account: 'owner' })], 1);
+  let s = db().prepare('SELECT * FROM sessions WHERE session_id = ?').get('s1');
+  assert.deepEqual([s.first_ts, s.last_ts, s.cwd, s.config_dir, s.account_uuid, s.account_source],
+    [50, 500, '/here', '/home/me/.claude', 'owner', 'bridge']);
+  // Newer news does.
+  R.importBatch(other, 'sessions', cols, [row({ session_id: 's1', first_ts: 50, last_ts: 900, cwd: '/there' })], 2);
+  s = db().prepare('SELECT cwd, last_ts FROM sessions WHERE session_id = ?').get('s1');
+  assert.deepEqual([s.cwd, s.last_ts], ['/there', 900]);
+  // The same row again changes nothing, so it is not logged to be sent back.
+  const logged = db().prepare('SELECT MAX(seq) m FROM sync_dirty').get().m;
+  R.importBatch(other, 'sessions', cols, [row({ session_id: 's1', first_ts: 50, last_ts: 900, cwd: '/there' })], 3);
+  assert.equal(db().prepare('SELECT MAX(seq) m FROM sync_dirty').get().m, logged);
+  assert.deepEqual(db().prepare('SELECT tbl, cursor FROM sync_cursors WHERE machine_id = ?').all(other).map((r) => ({ ...r })),
+    [{ tbl: 'sessions', cursor: 3 }]);
+
+  // A label set here stays; one set there fills a gap.
+  const acols = Object.keys(R.TABLES.accounts.cols);
+  const arow = (o) => acols.map((c) => o[c] ?? null);
+  db().prepare("INSERT INTO accounts (account_uuid, label, last_seen) VALUES ('A', 'mine', 10), ('B', NULL, 10)").run();
+  R.importBatch(other, 'accounts', acols, [arow({ account_uuid: 'A', label: 'theirs', last_seen: 20 }), arow({ account_uuid: 'B', label: 'named', last_seen: 20 })], 4);
+  assert.deepEqual(db().prepare("SELECT account_uuid a, label FROM accounts WHERE account_uuid IN ('A','B') ORDER BY 1").all().map((r) => [r.a, r.label]),
+    [['A', 'mine'], ['B', 'named']]);
+
+  // Malformed rows are refused whole, and the cursor does not move past them.
+  assert.throws(() => R.importBatch(other, 'events', ['call_id', 'ts'], [['c1', 'yesterday']], 9), /events\.ts is not a valid number/);
+  assert.throws(() => R.importBatch(other, 'nope', [], [], 1), /unknown table/);
+  assert.equal(db().prepare("SELECT COUNT(*) n FROM sync_cursors WHERE tbl = 'events'").get().n, 0);
+});

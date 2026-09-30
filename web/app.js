@@ -224,7 +224,7 @@ function renderRecommendation(ov) {
   }
   $('#rec-name').textContent = r.label;
   $('#rec-why').textContent = `${Math.round(r.headroom)}% headroom in its tightest window` +
-    `${r.exact ? '' : ' (estimated)'}${r.note ? ` · ${r.note}` : ''}`;
+    `${r.exact ? '' : ' (estimated)'}${r.machine ? ` · signed in on ${r.machine}` : ''}${r.note ? ` · ${r.note}` : ''}`;
   btn.hidden = !r.command;
   btn.textContent = r.command ?? '';
 }
@@ -519,6 +519,19 @@ function renderModels(rows) {
   });
 }
 
+/** Where the numbers come from: this machine alone, or every machine it syncs with. */
+function syncNote(sync) {
+  if (!sync || (!sync.machines.length && !sync.peers.length)) {
+    return 'reading local transcripts only, nothing leaves this machine.';
+  }
+  const parts = sync.machines.map((m) => (m.online
+    ? `${m.name} (live)`
+    : `${m.name} (last heard ${m.lastSeen ? duration(Date.now() - m.lastSeen) + ' ago' : 'never'})`));
+  const failing = sync.peers.filter((p) => p.status === 'error' && p.error).map((p) => `${p.target}: ${p.error}`);
+  return `${sync.name} synced over ssh with ${parts.join(', ') || 'no machine yet'}.` +
+    (failing.length && !sync.machines.some((m) => m.online) ? ` ${failing.join('; ')}` : '');
+}
+
 /* --- sessions ------------------------------------------------------------- */
 
 function renderLive(rows) {
@@ -537,7 +550,8 @@ function renderLive(rows) {
     // The account this session is billing right now - per session, since a
     // background job can keep an account the rest of its profile has left.
     const who = s.account ? `${s.account}${s.background ? ' · background' : ''}` : 'unknown account';
-    main.append(el('div', 'row-sub', `${who} · ${(s.cwd ?? '').replace(/^\/Users\/[^/]+/, '~')}`));
+    const where = s.machine ? `${s.machine} · ` : '';
+    main.append(el('div', 'row-sub', `${who} · ${where}${(s.cwd ?? '').replace(/^\/(Users|home)\/[^/]+/, '~')}`));
     row.append(main);
     const val = el('div', 'row-value');
     const ago = el('span', 'ago');
@@ -563,7 +577,7 @@ function renderSessions(rows, accounts) {
     const name = (u) => (u ? nameOf.get(u) ?? `${u.slice(0, 8)}…` : 'unattributed');
     const who = s.accounts?.length ? s.accounts.map((x) => name(x.accountUuid)).join(' → ') : name(s.account_uuid);
     main.append(el('div', 'row-sub',
-      `${dayOf(s.last_ts)} ${timeOf(s.last_ts)} · ${who}${s.git_branch ? ' · ' + s.git_branch : ''}`));
+      `${dayOf(s.last_ts)} ${timeOf(s.last_ts)} · ${who}${s.machine ? ' · ' + s.machine : ''}${s.git_branch ? ' · ' + s.git_branch : ''}`));
     row.append(main);
     row.append(el('div', 'row-value', `${money(s.cost)}`));
     host.append(row);
@@ -606,8 +620,7 @@ async function loadFast() {
     renderAccounts(ov);
     renderLive(live);
     syncAccountFilter(ov);
-    $('#foot-note').textContent =
-      `Updated ${new Date().toLocaleTimeString()} · reading local transcripts only, nothing leaves this machine.`;
+    $('#foot-note').textContent = `Updated ${new Date().toLocaleTimeString()} · ${syncNote(ov.sync)}`;
   } finally {
     fastBusy = false;
     if (fastAgain) { fastAgain = false; loadFast().catch(() => {}); }

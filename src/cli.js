@@ -9,6 +9,7 @@ import { overview, modelBreakdown, liveSessions } from './api.js';
 import { LIMIT_TYPES, resetWindowCache, earliestCachedChain } from './windows.js';
 import { invalidateAggregates, aggregatesCutoff } from './aggregates.js';
 import { closeDb } from './db.js';
+import { importMark } from './replica.js';
 import { DATA_DIR, DB_PATH } from './paths.js';
 
 const C = {
@@ -60,7 +61,7 @@ async function refresh({ quiet = false, force = false, reattribute = 'recent' } 
   // re-check the last six hours so late-arriving identity records still land.
   const a = attributeEvents(reattribute === 'all' ? { all: true } : { since: Date.now() - 6 * 3600_000 });
   const live = ingestLive();
-  invalidateCaches(reattribute === 'all', res.minNewTs, a.minChangedTs, live.oldest);
+  invalidateCaches(reattribute === 'all', res.minNewTs, a.minChangedTs, live.oldest, importedSince());
   calibrateAll();
   return { ...res, ms: Date.now() - t0 };
 }
@@ -77,8 +78,35 @@ async function fastRefresh(paths = []) {
   const r = paths.length ? await ingestPaths(paths) : { scanned: 0, newEvents: 0 };
   const a = attributeEvents({ since: Date.now() - 10 * 60_000, includeNull: false });
   const live = ingestLive();
-  invalidateCaches(false, r.minNewTs, a.minChangedTs, live.oldest);
+  invalidateCaches(false, r.minNewTs, a.minChangedTs, live.oldest, importedSince());
   return { ...r, attributed: a.changed, exact: live.samples, ms: Date.now() - t0 };
+}
+
+/**
+ * Rows from another machine have arrived: re-derive what they bear on. `since`
+ * is the earliest time they could change attribution from - null when they
+ * only touched what attribution never reads.
+ */
+function afterSync(since) {
+  if (since == null || !Number.isFinite(since)) return;
+  attributeSessions();
+  attributeLimitEvents();
+  resolveAccountEmails();
+  const a = attributeEvents({ since: Math.min(since, Date.now() - 6 * 3600_000) });
+  invalidateCaches(false, since, a.minChangedTs);
+}
+
+/**
+ * How far back rows imported by another process on this machine reached, if
+ * any arrived since this one last looked. A terminal dashboard attached to the
+ * service caches history of its own, and would otherwise never see them.
+ */
+let seenImport = null;
+function importedSince() {
+  const m = importMark();
+  const fresh = seenImport !== null && m.n !== seenImport;
+  seenImport = m.n;
+  return fresh ? m.since : null;
 }
 
 /**
@@ -236,6 +264,128 @@ async function cmdService(action, flags) {
   }
 }
 
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const ago = (t) => (t ? `${duration(Date.now() - t)} ago` : 'never');
+
+/** The tracker serving this machine's port, if there is one - and whether it can sync. */
+async function localTracker(port) {
+  try {
+    const r = await fetch(`http://127.0.0.1:${port}/api/health`, { signal: AbortSignal.timeout(1500) });
+    const h = await r.json();
+    return h?.app === 'claude-tracker' ? h : null;
+  } catch { return null; }
+}
+
+/**
+ * Syncing is done by the tracker running here, not by this command. Make sure
+ * one is running that can, then watch it reach `target`.
+ */
+async function handOver(port, target) {
+  const R = await import('./replica.js');
+  const started = Date.now();
+  let h = await localTracker(port);
+  if (h && !h.sync) {
+    const { serviceStatus, installService } = await import('./service.js');
+    let installed = false;
+    try { installed = serviceStatus().installed; } catch { /* no service manager here */ }
+    if (!installed) {
+      console.log(`The tracker running here predates sync. Restart it and it will start syncing with ${target}.`);
+      return;
+    }
+    console.log(`${c.dim}restarting the login service, which predates sync…${c.reset}`);
+    await installService({ port });
+    h = null;
+    // It reads any new transcripts before it serves again.
+    for (let i = 0; i < 120 && !h?.sync; i++) { await sleep(1000); h = await localTracker(port); }
+  }
+  if (!h) {
+    console.log(`Nothing is running here to do the syncing. Start it with ${c.bold}claude-tracker service install${c.reset},`);
+    console.log('or leave claude-tracker open.');
+    return;
+  }
+  for (let i = 0; i < 40; i++) {
+    await sleep(1000);
+    const p = R.listPeers().find((x) => x.target === target);
+    if (p?.status === 'connected' && p.status_at >= started - 1000) {
+      console.log(`${c.green}✓${c.reset} syncing - both machines' dashboards now show both machines`);
+      return;
+    }
+    if (p?.status === 'error' && p.status_at >= started) {
+      console.log(`${c.yellow}!${c.reset} the tracker running here could not connect: ${p.error}`);
+      console.log(`${c.dim}  It keeps retrying. See how it is going with: claude-tracker sync${c.reset}`);
+      return;
+    }
+  }
+  console.log(`still connecting - see how it is going with: ${c.bold}claude-tracker sync${c.reset}`);
+}
+
+async function cmdSync(action, args, flags) {
+  const S = await import('./sync.js');
+  const R = await import('./replica.js');
+  const port = Number(flags.port ?? 4785);
+
+  if (action === 'serve') {
+    await S.syncServe();
+    // The relay's stdin would hold the process open after the connection ends.
+    process.exit(process.exitCode ?? 0);
+  }
+
+  const me = R.machine();
+  if (action === 'add') {
+    const target = args[0];
+    try { S.checkTarget(target); } catch (err) { console.error(err.message); process.exitCode = 1; return; }
+    console.log(`${c.dim}connecting to ${target} over ssh…${c.reset}`);
+    const r = await S.probePeer(target, typeof flags.command === 'string' ? flags.command : null);
+    if (!r.ok) {
+      console.error(`${c.red}✗${c.reset} could not sync with ${target}: ${r.error}`);
+      console.error(`${c.dim}  It needs \`ssh ${target}\` to work without a password prompt, and claude-tracker`);
+      console.error(`  running there: claude-tracker service install${c.reset}`);
+      process.exitCode = 1;
+      return;
+    }
+    R.addPeer(target, r.command);
+    console.log(`${c.green}✓${c.reset} ${target} is ${c.bold}${r.peer.name}${c.reset}; this machine is ${c.bold}${me.name}${c.reset}`);
+    await handOver(port, target);
+    return;
+  }
+  if (action === 'remove') {
+    console.log(R.removePeer(args[0]) ? `${c.green}✓${c.reset} no longer connecting to ${args[0]}` : `not connecting to ${args[0]}`);
+    return;
+  }
+  if (action === 'name') {
+    if (!args.length) { console.error('usage: claude-tracker sync name <name>'); process.exitCode = 1; return; }
+    const m = R.setMachineName(args.join(' '));
+    console.log(`${c.green}✓${c.reset} this machine is now ${c.bold}${m.name}${c.reset} ${c.dim}- other machines see it when they next connect${c.reset}`);
+    return;
+  }
+
+  console.log(`\n${c.bold}This machine${c.reset}  ${me.name} ${c.dim}(${me.id})${c.reset}`);
+  const peers = R.listPeers();
+  const machines = R.remoteMachines();
+  if (!peers.length && !machines.length) {
+    console.log(`\n  ${c.dim}Not syncing with any machine. Add one with: claude-tracker sync add me@devbox${c.reset}\n`);
+    return;
+  }
+  if (peers.length) {
+    console.log(`\n${c.bold}Connects to${c.reset}`);
+    for (const p of peers) {
+      const mark = p.status === 'connected' ? `${c.green}●${c.reset}` : p.status === 'error' ? `${c.red}●${c.reset}` : `${c.gray}○${c.reset}`;
+      console.log(`  ${mark} ${pad(p.target, 28)} ${p.status ?? 'waiting for the tracker here'} ${c.dim}${p.status_at ? ago(p.status_at) : ''}${c.reset}`);
+      if (p.status === 'error' && p.error) console.log(`    ${c.dim}${p.error}${c.reset}`);
+    }
+  }
+  if (machines.length) {
+    console.log(`\n${c.bold}Synced with${c.reset}`);
+    for (const m of machines) {
+      const mark = m.online ? `${c.green}●${c.reset}` : `${c.gray}○${c.reset}`;
+      const seen = m.online ? 'online' : `last heard ${ago(m.lastSeen)}`;
+      const running = m.running.length ? ` · ${m.running.length} session${m.running.length === 1 ? '' : 's'} running` : '';
+      console.log(`  ${mark} ${pad(m.name, 28)} ${seen}${running}`);
+    }
+  }
+  console.log();
+}
+
 function help() {
   console.log(`
 ${c.bold}claude-tracker${c.reset} — local usage and rate-limit tracking for Claude accounts
@@ -253,11 +403,13 @@ ${c.bold}claude-tracker${c.reset} — local usage and rate-limit tracking for Cl
   ${c.bold}where${c.reset}                       print data locations
   ${c.bold}statusline${c.reset} install|uninstall  exact limits via each profile's status line
   ${c.bold}service${c.reset} install|uninstall     run in the background at login (launchd or systemd)
+  ${c.bold}sync${c.reset} add <ssh-host>           sync with the tracker on another machine, over ssh
+  ${c.bold}sync${c.reset} [status]|remove <host>|name <name>
 
 ${c.dim}In the terminal dashboard: q quit · r refresh · a cycle account · w switch
 window · space pause · ↑↓/jk scroll${c.reset}
 
-${c.dim}Data is read from your local Claude transcripts. Nothing is uploaded.${c.reset}
+${c.dim}Data is read from your local Claude transcripts. Nothing leaves this machine except\nto machines you sync with, over ssh.${c.reset}
 `);
 }
 
@@ -299,6 +451,7 @@ export async function runCli(argv) {
       case 'label': cmdLabel(rest.slice(1)); break;
       case 'statusline': await cmdStatusline(rest[1] ?? 'status', flags); break;
       case 'service': await cmdService(rest[1] ?? 'status', flags); break;
+      case 'sync': await cmdSync(rest[1] ?? 'status', rest.slice(2), flags); break;
       case 'models': await refresh({ quiet: true }); cmdModels(Number(flags.days ?? 30)); break;
       case 'verify': await refresh({ quiet: true }); cmdVerify(); break;
       case 'where':
@@ -317,6 +470,7 @@ export async function runCli(argv) {
           notifications: !flags['no-notify'] && process.env.CLAUDE_TRACKER_NOTIFY !== '0',
           refresh,
           fastRefresh,
+          afterSync,
         });
         return; // the dashboards own the process from here
       }
