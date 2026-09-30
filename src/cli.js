@@ -226,7 +226,7 @@ async function cmdStatusline(action, flags) {
 async function cmdService(action, flags) {
   const { installService, uninstallService, serviceStatus } = await import('./service.js');
   if (action === 'install') {
-    const r = installService({ port: Number(flags.port ?? 4785) });
+    const r = await installService({ port: Number(flags.port ?? 4785) });
     console.log(`${c.green}✓${c.reset} running at login - ${r.url}\n  ${c.dim}log: ${r.log}${c.reset}`);
   } else if (action === 'uninstall') {
     console.log(uninstallService().removed ? `${c.green}✓${c.reset} removed` : 'not installed');

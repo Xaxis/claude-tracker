@@ -754,3 +754,38 @@ test('the systemd unit hands every argument over unchanged', async () => {
   assert.match(unit, /^Restart=always$/m);
   assert.match(unit, /^WantedBy=default.target$/m);
 });
+
+test('reinstalling on macOS waits for the old agent to leave before loading the new one', async () => {
+  // launchctl bootout returns while the old job is still being torn down, and
+  // bootstrapping a label launchd still holds fails with "5: Input/output error".
+  // This launchctl behaves that way, so a reinstall over a running agent races.
+  const { spawnSync } = await import('node:child_process');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ct-launchd-'));
+  const bin = path.join(dir, 'bin');
+  fs.mkdirSync(bin);
+  fs.writeFileSync(path.join(bin, 'launchctl'), `#!${process.execPath}
+const fs = require('fs'), f = ${JSON.stringify(path.join(dir, 'launchd.json'))};
+const s = fs.existsSync(f) ? JSON.parse(fs.readFileSync(f, 'utf8')) : {};
+const held = s.loaded || s.leavingUntil > Date.now();
+const [cmd] = process.argv.slice(2);
+if (cmd === 'print') { if (held) console.log('state = running'); process.exit(held ? 0 : 113); }
+if (cmd === 'bootout') { if (!s.loaded) process.exit(3); fs.writeFileSync(f, JSON.stringify({ leavingUntil: Date.now() + 1500 })); }
+if (cmd === 'bootstrap') {
+  if (held) { console.error('Bootstrap failed: 5: Input/output error'); process.exit(5); }
+  fs.writeFileSync(f, JSON.stringify({ loaded: true }));
+}`, { mode: 0o755 });
+
+  const serviceUrl = new URL('../src/service.js', import.meta.url).href;
+  const r = spawnSync(process.execPath, ['--no-warnings', '--input-type=module', '-e', `
+    Object.defineProperty(process, 'platform', { value: 'darwin' });
+    const { installService, serviceStatus } = await import('${serviceUrl}');
+    await installService();
+    await installService();
+    console.log(serviceStatus().state);`], {
+    env: { ...process.env, HOME: dir, CLAUDE_TRACKER_DIR: path.join(dir, 'data'), PATH: `${bin}${path.delimiter}${process.env.PATH}` },
+    encoding: 'utf8',
+  });
+  fs.rmSync(dir, { recursive: true, force: true });
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal(r.stdout.trim(), 'running');
+});
