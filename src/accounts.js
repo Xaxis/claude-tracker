@@ -371,14 +371,14 @@ let resolverCache = { sig: null, fn: null };
 
 /** Cheap fingerprint of everything the resolver is built from. */
 function resolverSignature(d) {
-  const a = d.prepare('SELECT COUNT(*) n, MAX(ts) m FROM identity_points').get();
+  const a = d.prepare('SELECT COUNT(*) n, MAX(ts) m, COUNT(config_dir) p FROM identity_points').get();
   const b = d.prepare('SELECT COUNT(*) n, MAX(ts) m FROM account_observations').get();
   const c = d.prepare('SELECT COUNT(*) n, COUNT(email) e FROM accounts').get();
   const s = d.prepare('SELECT COUNT(*) n, COUNT(account_uuid) k FROM sessions').get();
-  const l = d.prepare('SELECT COUNT(*) n, MAX(ts) m FROM limit_events').get();
+  const l = d.prepare('SELECT COUNT(*) n, MAX(ts) m, COUNT(config_dir) p FROM limit_events').get();
   // Readings matter per session and window, not per reading.
   const u = d.prepare('SELECT COUNT(*) n FROM (SELECT DISTINCT session_id, limit_type, resets_at FROM utilization)').get();
-  return `${a.n}:${a.m}|${b.n}:${b.m}|${c.n}:${c.e}|${s.n}:${s.k}|${l.n}:${l.m}|${u.n}`;
+  return `${a.n}:${a.m}:${a.p}|${b.n}:${b.m}|${c.n}:${c.e}|${s.n}:${s.k}|${l.n}:${l.m}:${l.p}|${u.n}`;
 }
 
 function buildResolver() {
@@ -453,14 +453,16 @@ function createResolver(d) {
 
   const S = new Map(), W = new Map(), O = new Map(), C = new Map(), F = new Map();
   const prev = new Map();
-  for (const r of d.prepare('SELECT session_id, ts, email, account_uuid, source FROM identity_points ORDER BY ts').all()) {
+  for (const r of d.prepare('SELECT session_id, ts, email, account_uuid, source, config_dir FROM identity_points ORDER BY ts').all()) {
     const acct = r.account_uuid ?? (r.email ? byEmail.get(r.email.toLowerCase()) : null);
     if (!acct) continue;
     push(r.source === 'context' ? S : W, r.session_id, r.ts, acct);
     const k = `${r.source}|${r.session_id}`;
     if (prev.get(k) === acct) continue;
     prev.set(k, acct);
-    const dir = sessionDir.get(r.session_id);
+    // The profile the record was written in - a session resumed on another
+    // machine writes its records there, and they say nothing about this one.
+    const dir = r.config_dir ?? sessionDir.get(r.session_id);
     if (dir) push(F, dir, r.ts, acct);
   }
   for (const r of d.prepare("SELECT ts, config_dir, account_uuid FROM account_observations WHERE config_dir != '' ORDER BY ts").all()) {
@@ -519,7 +521,7 @@ function createResolver(d) {
     g.members.push(m);
     return g;
   };
-  for (const r of d.prepare(`SELECT l.limit_type, l.resets_at, l.ts, l.session_id, l.overage, s.config_dir
+  for (const r of d.prepare(`SELECT l.limit_type, l.resets_at, l.ts, l.session_id, l.overage, COALESCE(l.config_dir, s.config_dir) config_dir
       FROM limit_events l LEFT JOIN sessions s ON s.session_id = l.session_id
       WHERE l.status = 'rejected'`).all()) {
     const m = { sid: r.session_id, dir: r.config_dir, ts: r.ts };
@@ -690,7 +692,7 @@ export function attributeEvents({ since = 0, all = false, includeNull = true } =
       if (acct !== r.account_uuid) { upd.run(acct, src, r.call_id); changed++; minChangedTs = Math.min(minChangedTs, r.ts); }
     }
     // A refusal belongs to the account its whole group was settled on.
-    for (const l of d.prepare(`SELECT l.id, l.session_id, l.ts, l.limit_type, l.resets_at, s.config_dir FROM limit_events l
+    for (const l of d.prepare(`SELECT l.id, l.session_id, l.ts, l.limit_type, l.resets_at, COALESCE(l.config_dir, s.config_dir) config_dir FROM limit_events l
         LEFT JOIN sessions s ON s.session_id = l.session_id
         WHERE ${includeNull || all ? 'l.account_uuid IS NULL OR ' : ''}l.ts >= ?`).all(all ? 0 : since)) {
       const acct = resolve.groupAccount(l.limit_type, l.resets_at) ?? resolve(l.session_id, l.config_dir, l.ts)[0];

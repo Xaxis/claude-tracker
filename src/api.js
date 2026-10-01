@@ -286,6 +286,46 @@ export function liveSessions(now = Date.now()) {
   return out.sort((a, b) => (b.lastActivityAt ?? 0) - (a.lastActivityAt ?? 0));
 }
 
+/** When a session's transcript in `profile` was last written, if it is there. */
+function transcriptWritten(profile, sessionId) {
+  let slugs = [];
+  try { slugs = fs.readdirSync(profile.projectsDir); } catch { return 0; }
+  for (const slug of slugs) {
+    try { return fs.statSync(path.join(profile.projectsDir, slug, `${sessionId}.jsonl`)).mtimeMs; } catch { /* not here */ }
+  }
+  return 0;
+}
+
+/**
+ * Every live process in the profiles' running-session registries, once each.
+ *
+ * A copied profile carries a copy of the registry, naming processes that run
+ * under the original. A process belongs to the profile whose entry it updated
+ * last - or, if that cannot tell them apart, whose transcript it is writing.
+ */
+function runningEntries() {
+  const byPid = new Map();
+  for (const profile of discoverProfiles()) {
+    let names = [];
+    try { names = fs.readdirSync(profile.sessionsDir); } catch { continue; }
+    for (const n of names) {
+      if (!n.endsWith('.json')) continue;
+      let s;
+      try { s = JSON.parse(fs.readFileSync(path.join(profile.sessionsDir, n), 'utf8')); } catch { continue; }
+      if (!s.sessionId) continue;
+      // The registry keeps entries for exited processes; drop anything whose pid is gone.
+      try { process.kill(s.pid, 0); } catch { continue; }
+      const prev = byPid.get(s.pid);
+      const e = { profile, s };
+      if (!prev) { byPid.set(s.pid, e); continue; }
+      const d = (s.updatedAt ?? 0) - (prev.s.updatedAt ?? 0)
+        || transcriptWritten(profile, s.sessionId) - transcriptWritten(prev.profile, prev.s.sessionId);
+      if (d > 0) byPid.set(s.pid, e);
+    }
+  }
+  return byPid.values();
+}
+
 /**
  * Claude Code processes running on this machine, across every profile.
  *
@@ -308,57 +348,48 @@ export function localSessions(now = Date.now()) {
   const who = accountResolver();
 
   const out = [];
-  for (const profile of discoverProfiles()) {
-    let names = [];
-    try { names = fs.readdirSync(profile.sessionsDir); } catch { continue; }
-    const signedIn = profileAccount(profile);
-    for (const n of names) {
-      if (!n.endsWith('.json')) continue;
-      let s;
-      try { s = JSON.parse(fs.readFileSync(path.join(profile.sessionsDir, n), 'utf8')); } catch { continue; }
-      if (!s.sessionId) continue;
-      // The registry keeps entries for exited processes; drop anything whose pid is gone.
-      try { process.kill(s.pid, 0); } catch { continue; }
-
-      // A parked job writes its transcript under its job id, not the host session's.
-      const keys = [s.sessionId, s.parkedJobId].filter(Boolean);
-      // The transcript's own id: whichever key has the newest record or call.
-      let sid = null, seen = -Infinity;
-      for (const k of keys) {
-        for (const r of [lastIdentity.get(k, k), lastCall.get(k, k)]) {
-          const ts = r?.ts ?? r?.last;
-          if (r?.sid && ts > seen) { sid = r.sid; seen = ts; }
-        }
+  const signedInTo = new Map();
+  for (const { profile, s } of runningEntries()) {
+    if (!signedInTo.has(profile.dir)) signedInTo.set(profile.dir, profileAccount(profile));
+    const signedIn = signedInTo.get(profile.dir);
+    // A parked job writes its transcript under its job id, not the host session's.
+    const keys = [s.sessionId, s.parkedJobId].filter(Boolean);
+    // The transcript's own id: whichever key has the newest record or call.
+    let sid = null, seen = -Infinity;
+    for (const k of keys) {
+      for (const r of [lastIdentity.get(k, k), lastCall.get(k, k)]) {
+        const ts = r?.ts ?? r?.last;
+        if (r?.sid && ts > seen) { sid = r.sid; seen = ts; }
       }
-      let acct = null, source = null;
-      if (sid) {
-        const [uuid, src] = who(sid, profile.dir, now);
-        if (uuid) { acct = byUuid.get(uuid) ?? { account_uuid: uuid }; source = src; }
-      }
-      if (!acct && signedIn) { acct = byUuid.get(signedIn.accountUuid); source = 'profile'; }
-
-      let calls = 0, cost = 0, last = null;
-      for (const k of keys) {
-        const r = recent.get(k, k, now - 5 * 60_000);
-        calls += r.calls; cost += r.cost;
-        const lc = lastCall.get(k, k).last;
-        if (lc && (!last || lc > last)) last = lc;
-      }
-
-      out.push({
-        sessionId: s.sessionId, pid: s.pid, cwd: s.cwd, name: s.name,
-        status: s.status, kind: s.kind, background: !!s.parkedJobId,
-        startedAt: s.startedAt, updatedAt: s.updatedAt,
-        lastCallAt: last,
-        lastActivityAt: Math.max(s.updatedAt ?? 0, last ?? 0) || null,
-        profile: profile.name,
-        accountUuid: acct?.account_uuid ?? null,
-        account: acct ? accountLabel(acct) : null,
-        accountSource: source,
-        recent: { calls, cost, perHour: cost * 12 },
-        machine: null,
-      });
     }
+    let acct = null, source = null;
+    if (sid) {
+      const [uuid, src] = who(sid, profile.dir, now);
+      if (uuid) { acct = byUuid.get(uuid) ?? { account_uuid: uuid }; source = src; }
+    }
+    if (!acct && signedIn) { acct = byUuid.get(signedIn.accountUuid); source = 'profile'; }
+
+    let calls = 0, cost = 0, last = null;
+    for (const k of keys) {
+      const r = recent.get(k, k, now - 5 * 60_000);
+      calls += r.calls; cost += r.cost;
+      const lc = lastCall.get(k, k).last;
+      if (lc && (!last || lc > last)) last = lc;
+    }
+
+    out.push({
+      sessionId: s.sessionId, pid: s.pid, cwd: s.cwd, name: s.name,
+      status: s.status, kind: s.kind, background: !!s.parkedJobId,
+      startedAt: s.startedAt, updatedAt: s.updatedAt,
+      lastCallAt: last,
+      lastActivityAt: Math.max(s.updatedAt ?? 0, last ?? 0) || null,
+      profile: profile.name,
+      accountUuid: acct?.account_uuid ?? null,
+      account: acct ? accountLabel(acct) : null,
+      accountSource: source,
+      recent: { calls, cost, perHour: cost * 12 },
+      machine: null,
+    });
   }
   return out.sort((a, b) => (b.lastActivityAt ?? 0) - (a.lastActivityAt ?? 0));
 }

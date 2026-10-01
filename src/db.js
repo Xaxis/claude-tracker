@@ -65,7 +65,8 @@ DROP INDEX IF EXISTS idx_events_acct_sess;
 CREATE INDEX IF NOT EXISTS idx_events_acct_ts_cost ON events(account_uuid, ts, cost_usd);
 CREATE INDEX IF NOT EXISTS idx_events_acct_sess_ts ON events(account_uuid, session_id, ts, cost_usd);
 CREATE INDEX IF NOT EXISTS idx_events_unattr  ON events(account_uuid) WHERE account_uuid IS NULL;
-CREATE INDEX IF NOT EXISTS idx_events_session ON events(session_id);
+DROP INDEX IF EXISTS idx_events_session;
+CREATE INDEX IF NOT EXISTS idx_events_session_ts ON events(session_id, ts);
 CREATE INDEX IF NOT EXISTS idx_events_model   ON events(model);
 
 -- Per-session rollup, including which account owns it.
@@ -115,6 +116,7 @@ CREATE TABLE IF NOT EXISTS limit_events (
   resets_at     INTEGER NOT NULL,    -- epoch seconds
   status        TEXT,
   overage       TEXT,
+  config_dir    TEXT,                -- the profile it was recorded under
   UNIQUE(limit_type, resets_at, session_id)
 );
 CREATE INDEX IF NOT EXISTS idx_limit_ts ON limit_events(ts);
@@ -137,13 +139,19 @@ CREATE INDEX IF NOT EXISTS idx_obs_dir ON account_observations(config_dir, ts);
 -- was running as. Claude Code writes a session_context record with the signed-in
 -- email when a session starts and again whenever the account changes, so these
 -- mark the exact moment a running session switched. Bridge records carry an
--- owner but no timestamp; they are dated by the last timestamped line before them.
+-- owner but no timestamp; they are dated by the line after them.
+--
+-- Each record keeps the profile it was written under, as calls do. A session
+-- is not tied to one: carried to another machine and resumed there, it goes on
+-- writing records under that machine's profile, which say nothing about the
+-- profile it started in.
 CREATE TABLE IF NOT EXISTS identity_points (
   session_id   TEXT NOT NULL,
   ts           INTEGER NOT NULL,
   email        TEXT,
   account_uuid TEXT,
   source       TEXT NOT NULL,       -- 'context' | 'bridge'
+  config_dir   TEXT,
   PRIMARY KEY (session_id, ts, source)
 );
 
@@ -258,7 +266,7 @@ CREATE TABLE IF NOT EXISTS sync_peers (
  * Code deletes old transcripts, so history this index holds may exist nowhere
  * else, and account details come from config snapshots that rotate away.
  */
-const SCHEMA_VERSION = 6;
+const SCHEMA_VERSION = 7;
 
 function ensureSchema(d) {
   // The version has to be read before the schema is applied: an old table plus

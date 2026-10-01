@@ -1,4 +1,4 @@
-import { ingestAll, ingestPaths } from './ingest.js';
+import { ingestAll, ingestPaths, placeRecords } from './ingest.js';
 import { ingestLive } from './live.js';
 import {
   discoverAccounts, attributeSessions, attributeLimitEvents,
@@ -89,6 +89,7 @@ async function fastRefresh(paths = []) {
  */
 function afterSync(since) {
   if (since == null || !Number.isFinite(since)) return;
+  placeRecords();
   attributeSessions();
   attributeLimitEvents();
   resolveAccountEmails();
