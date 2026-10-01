@@ -90,8 +90,12 @@ const quoted = (h) => h.replace(/\./g, '\\.');
 const laptop = machine('laptop', 47911, { uuid: 'aaaaaaaa-0000-0000-0000-000000000001', email: 'laptop@example.com' });
 const devbox = machine('devbox', 47912, { uuid: 'bbbbbbbb-0000-0000-0000-000000000002', email: 'devbox@example.com' });
 
-test.after(() => {
-  for (const m of [laptop, devbox]) { try { m.proc?.kill(); } catch { /* gone */ } }
+test.after(async () => {
+  // Wait for each tracker to exit before removing its files from under it.
+  await Promise.all([laptop, devbox].map((m) => m.proc && m.proc.exitCode === null && new Promise((resolve) => {
+    m.proc.once('exit', resolve);
+    m.proc.kill();
+  })));
   fs.rmSync(root, { recursive: true, force: true });
 });
 
