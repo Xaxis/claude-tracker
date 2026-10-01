@@ -296,7 +296,7 @@ function ensureSchema(d) {
   const tables = d.prepare(`SELECT name FROM sqlite_master WHERE type = 'table'
     AND name NOT LIKE 'sqlite_%' AND name != 'meta'`).all().map((r) => r.name);
   const q = (id) => `"${id.replace(/"/g, '""')}"`;
-  d.exec('BEGIN');
+  d.exec('BEGIN IMMEDIATE');
   try {
     // Triggers would follow their tables aside too, and keep the new tables from
     // getting their own.
@@ -352,10 +352,18 @@ export function setMeta(key, value) {
     .run(key, String(value));
 }
 
-/** Run fn inside a transaction, rolling back on throw. */
+/**
+ * Run fn inside a transaction, rolling back on throw.
+ *
+ * IMMEDIATE takes the write lock up front. A plain BEGIN reads first and asks
+ * for the lock at its first write - and if another process has written since
+ * that read, SQLite refuses at once ("database is locked", busy snapshot) with
+ * no busy timeout to wait it out. With a tracker service committing every few
+ * seconds, a long re-attribution in a second process hit that every time.
+ */
 export function tx(fn) {
   const d = db();
-  d.exec('BEGIN');
+  d.exec('BEGIN IMMEDIATE');
   try {
     const out = fn(d);
     d.exec('COMMIT');

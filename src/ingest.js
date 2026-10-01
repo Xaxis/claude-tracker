@@ -259,7 +259,7 @@ async function ingestFile(file, from) {
   let pendingBytes = 0;
   let inTx = 0;
 
-  const begin = () => { if (!inTx) d.exec('BEGIN'); };
+  const begin = () => { if (!inTx) d.exec('BEGIN IMMEDIATE'); };
   const commit = () => { if (inTx) { d.exec('COMMIT'); inTx = 0; } };
 
   try {
