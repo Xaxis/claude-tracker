@@ -134,6 +134,13 @@ test('two trackers sync both ways over one connection, live, without echoes pili
   const rec = (await devbox.get('/api/overview')).accounts.map((a) => a.accountUuid).sort();
   assert.deepEqual(rec, [laptop.account.uuid, devbox.account.uuid].sort());
 
+  // Each machine marks both accounts in use, and says where.
+  for (const m of [laptop, devbox]) {
+    const out = m.cli('status').stdout;
+    assert.match(out, /● laptop@example\.com on laptop /, `${m.name}: ${out}`);
+    assert.match(out, /● devbox@example\.com on devbox /, `${m.name}: ${out}`);
+  }
+
   // A new call on the devbox reaches the laptop live.
   devbox.append(5);
   await until('a new devbox call to reach the laptop', async () =>

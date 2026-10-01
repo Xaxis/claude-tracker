@@ -119,7 +119,26 @@ async function getJson(url) {
 
 /* --- accounts ------------------------------------------------------------- */
 
-function renderAccounts(data) {
+/**
+ * Where each account is in use: signed into a machine's main profile, or
+ * billing a session running there. Account -> machine names, null for this
+ * machine and first. The same rule as the terminal dashboard's.
+ */
+function inUse(ov, live) {
+  const out = new Map();
+  const add = (acct, m) => {
+    if (!acct) return;
+    const list = out.get(acct) ?? [];
+    if (!list.includes(m)) list.push(m);
+    out.set(acct, list);
+  };
+  for (const p of ov.sync?.signedIn ?? []) add(p.accountUuid, p.machine);
+  for (const x of live) add(x.accountUuid, x.machine ?? null);
+  for (const list of out.values()) list.sort((a, b) => (a === null ? -1 : b === null ? 1 : a.localeCompare(b)));
+  return out;
+}
+
+function renderAccounts(data, live = []) {
   const host = $('#accounts');
   host.textContent = '';
 
@@ -128,8 +147,11 @@ function renderAccounts(data) {
     return;
   }
 
+  const using = inUse(data, live);
+  const named = data.sync?.machines.length > 0;
   for (const a of data.accounts) {
-    const card = el('div', `account${a.isCurrent ? ' is-current' : ''}`);
+    const where = using.get(a.accountUuid) ?? [];
+    const card = el('div', `account${where.includes(null) ? ' is-current' : ''}`);
 
     const head = el('div', 'account-head');
     const idBox = el('div', 'row-main');
@@ -141,8 +163,15 @@ function renderAccounts(data) {
     idBox.append(el('div', 'account-meta', meta.join(' · ')));
     head.append(idBox);
 
-    if (a.isCurrent) head.append(el('span', 'pill now', 'signed in'));
-    else if (a.limits.some((l) => l.blocked)) head.append(el('span', 'pill blocked', 'limited'));
+    // A pill for each machine it is in use on: green dot here, blue elsewhere.
+    const pills = el('div', 'pills');
+    for (const m of where) {
+      const pill = el('span', `pill now ${m === null ? 'here' : 'elsewhere'}`);
+      pill.append(el('span', 'dot', '●'), document.createTextNode(` ${named ? m ?? data.sync.name : 'in use'}`));
+      pills.append(pill);
+    }
+    if (!where.length && a.limits.some((l) => l.blocked)) pills.append(el('span', 'pill blocked', 'limited'));
+    if (pills.childNodes.length) head.append(pills);
     card.append(head);
 
     for (const l of a.limits) {
@@ -617,7 +646,7 @@ async function loadFast() {
     state.overview = ov;
     renderHero(ov);
     renderRecommendation(ov);
-    renderAccounts(ov);
+    renderAccounts(ov, live);
     renderLive(live);
     syncAccountFilter(ov);
     $('#foot-note').textContent = `Updated ${new Date().toLocaleTimeString()} · ${syncNote(ov.sync)}`;

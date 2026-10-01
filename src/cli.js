@@ -5,7 +5,7 @@ import {
   listAccounts, accountLabel, resolveAccountEmails, setLabel, attributeEvents,
 } from './accounts.js';
 import { calibrateAll, verifyWindowModel } from './calibrate.js';
-import { overview, modelBreakdown, liveSessions } from './api.js';
+import { overview, modelBreakdown, liveSessions, inUse } from './api.js';
 import { LIMIT_TYPES, resetWindowCache, earliestCachedChain } from './windows.js';
 import { invalidateAggregates, aggregatesCutoff } from './aggregates.js';
 import { closeDb } from './db.js';
@@ -133,10 +133,16 @@ function cmdStatus() {
     return;
   }
 
+  const live = liveSessions();
+  const using = inUse(o, live);
+  const synced = o.sync.machines.length > 0;
   for (const a of o.accounts) {
-    const marker = a.isCurrent ? `${c.green}●${c.reset}` : `${c.gray}○${c.reset}`;
+    // In use here: green. In use only on another synced machine: blue.
+    const where = using.get(a.accountUuid) ?? [];
+    const marker = where.includes(null) ? `${c.green}●${c.reset}` : where.length ? `${c.blue}●${c.reset}` : `${c.gray}○${c.reset}`;
+    const on = synced && where.length ? ` ${c.dim}on ${where.map((m) => m ?? o.sync.name).join(', ')}${c.reset}` : '';
     const tier = a.tier ? ` ${c.dim}${a.tier.replace('default_claude_', '')}${c.reset}` : '';
-    console.log(`${marker} ${c.bold}${a.label}${c.reset}${tier}  ${c.dim}${money(a.totalCost)} tracked · ${a.sessions} session${a.sessions === 1 ? '' : 's'}${c.reset}`);
+    console.log(`${marker} ${c.bold}${a.label}${c.reset}${on}${tier}  ${c.dim}${money(a.totalCost)} tracked · ${a.sessions} session${a.sessions === 1 ? '' : 's'}${c.reset}`);
     for (const l of a.limits) {
       const blocked = l.blocked ? ` ${c.red}LIMIT HIT${c.reset}` : '';
       const conf = l.confidence === 'default' ? `${c.dim}(est)${c.reset}` : l.confidence === 'partial' ? `${c.dim}(~)${c.reset}` : '';
@@ -161,7 +167,6 @@ function cmdStatus() {
   } else {
     console.log(`  ${c.red}Every account is refused right now.${c.reset}`);
   }
-  const live = liveSessions();
   if (live.length) {
     console.log(`  ${c.cyan}${live.length}${c.reset} ${c.dim}Claude Code session${live.length === 1 ? '' : 's'} running now${c.reset}`);
   }

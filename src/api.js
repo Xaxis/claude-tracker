@@ -407,11 +407,42 @@ export function localState() {
   return { running: localSessions(), profiles: profileStates() };
 }
 
-/** This machine's name, the machines it syncs with, and how reaching them is going. */
+/**
+ * This machine's name, the machines it syncs with, how reaching them is going,
+ * and who is signed into each one's main profile (machine null: this one).
+ */
 function syncSummary(now) {
   const peers = listPeers().map((p) => ({ target: p.target, status: p.status, error: p.error, at: p.status_at }));
-  const machines = remoteMachines(now).map(({ id, name, online, lastSeen }) => ({ id, name, online, lastSeen }));
-  return { name: machine().name, machines, peers };
+  const remote = remoteMachines(now);
+  const machines = remote.map(({ id, name, online, lastSeen }) => ({ id, name, online, lastSeen }));
+  const signedIn = [];
+  const main = profileStates().find((p) => p.isDefault);
+  if (main?.accountUuid) signedIn.push({ machine: null, accountUuid: main.accountUuid });
+  for (const m of remote) {
+    const p = m.profiles.find((x) => x.isDefault);
+    if (p?.accountUuid) signedIn.push({ machine: m.name, accountUuid: p.accountUuid });
+  }
+  return { name: machine().name, machines, peers, signedIn };
+}
+
+/**
+ * Where each account is in use: signed into a machine's main profile, or
+ * billing a session running there. Account -> machine names, null for this
+ * machine and listed first. Takes the running sessions the caller already
+ * has, rather than reading them all again.
+ */
+export function inUse(ov, live) {
+  const out = new Map();
+  const add = (acct, m) => {
+    if (!acct) return;
+    const list = out.get(acct) ?? [];
+    if (!list.includes(m)) list.push(m);
+    out.set(acct, list);
+  };
+  for (const p of ov.sync?.signedIn ?? []) add(p.accountUuid, p.machine);
+  for (const s of live) add(s.accountUuid, s.machine ?? null);
+  for (const list of out.values()) list.sort((a, b) => (a === null ? -1 : b === null ? 1 : a.localeCompare(b)));
+  return out;
 }
 
 /** Per-model totals over the trailing `days`. */
