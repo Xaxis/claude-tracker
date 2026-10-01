@@ -275,7 +275,10 @@ claude-tracker sync add me@devbox      # what you would type after `ssh`
 
 That is all. Both dashboards then show every account's usage from both
 machines, the sessions running on each (marked with the machine's name), and
-the account to use next wherever it is signed in. A new call on one machine
+the account to use next wherever it is signed in. An account in use - signed
+into a machine's main profile, or billing a session running there - is marked
+on both: a green dot for this machine, blue for another, with the machine's
+name beside it. A new call on one machine
 shows on the other within a couple of seconds.
 
 How it works:

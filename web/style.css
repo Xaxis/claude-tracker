@@ -225,6 +225,10 @@ main {
 }
 .pill.now { border-color: transparent; background: var(--track-accent); color: var(--text-primary); }
 .pill.blocked { border-color: transparent; background: var(--critical); color: #fff; }
+.pills { display: flex; gap: 6px; flex-wrap: wrap; justify-content: flex-end; }
+.pill .dot { font-size: 9px; vertical-align: 1px; }
+.pill.here .dot { color: var(--good); }
+.pill.elsewhere .dot { color: var(--series-1); }
 
 /* --- charts ---------------------------------------------------------------- */
 .chart-wrap { overflow-x: auto; }

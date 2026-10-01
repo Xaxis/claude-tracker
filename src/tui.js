@@ -1,5 +1,5 @@
 import { spawn } from 'node:child_process';
-import { overview, liveSessions, modelBreakdown, windowHistory } from './api.js';
+import { overview, liveSessions, modelBreakdown, windowHistory, inUse } from './api.js';
 
 /**
  * Live terminal dashboard.
@@ -288,12 +288,18 @@ export function startTui({ webUrl, onQuit }) {
     // ---- accounts
     rule('ACCOUNTS');
     L.push('');
+    // In use here: green. In use only on another synced machine: blue. With
+    // machines to tell apart, each account says which it is in use on.
+    const using = inUse(ov, data.live);
+    const machines = ov.sync?.machines.length > 0;
     for (const a of ov.accounts) {
-      const mark = a.isCurrent ? `${C.good}●${C.reset}` : `${C.muted}○${C.reset}`;
+      const where = using.get(a.accountUuid) ?? [];
+      const mark = where.includes(null) ? `${C.good}●${C.reset}` : where.length ? `${C.accent}●${C.reset}` : `${C.muted}○${C.reset}`;
+      const on = machines && where.length ? `${C.muted}on ${where.map((m) => m ?? ov.sync.name).join(', ')}${C.reset} ` : '';
       const tier = a.tier ? `${C.muted}${a.tier.replace('default_claude_', '').replace(/_/g, ' ')}${C.reset}` : '';
       const exact = a.limits.some((l) => l.confidence === 'exact') ? `${C.good}exact${C.reset} ${C.muted}·${C.reset} ` : '';
       const stats = `${exact}${C.muted}${money(a.totalCost)} · ${a.sessions} session${a.sessions === 1 ? '' : 's'}${C.reset}`;
-      const name = `${mark} ${A.bold}${a.label}${A.reset} ${tier}`;
+      const name = `${mark} ${A.bold}${a.label}${A.reset} ${on}${tier}`;
       L.push(`  ${padEnd(truncate(name, inner - vlen(stats) - 2), inner - vlen(stats))}${stats}`);
 
       // Budget the row explicitly, then give the bar whatever is left. Widths
