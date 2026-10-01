@@ -128,14 +128,16 @@ export const TABLES = {
     },
   },
   identity_points: {
-    cols: { session_id: 'T!', ts: 'I!', email: 'T', account_uuid: 'T', source: 'T!' },
+    own: 'config_dir',
+    cols: { session_id: 'T!', ts: 'I!', email: 'T', account_uuid: 'T', source: 'T!', config_dir: 'T' },
   },
   account_observations: {
     own: 'config_dir',
     cols: { ts: 'I!', config_dir: 'T!', account_uuid: 'T!', email: 'T', source: 'T' },
   },
   limit_events: {
-    cols: { ts: 'I!', session_id: 'T', limit_type: 'T!', resets_at: 'I!', status: 'T', overage: 'T' },
+    own: 'config_dir',
+    cols: { ts: 'I!', session_id: 'T', limit_type: 'T!', resets_at: 'I!', status: 'T', overage: 'T', config_dir: 'T' },
   },
   utilization: {
     own: 'config_dir',
@@ -228,8 +230,8 @@ const IMPORT = {
   },
 
   identity_points(r) {
-    return stmt(`INSERT INTO identity_points (session_id, ts, email, account_uuid, source) VALUES (?,?,?,?,?)
-      ON CONFLICT(session_id, ts, source) DO NOTHING`).run(r.session_id, r.ts, r.email, r.account_uuid, r.source)
+    return stmt(`INSERT INTO identity_points (session_id, ts, email, account_uuid, source, config_dir) VALUES (?,?,?,?,?,?)
+      ON CONFLICT(session_id, ts, source) DO NOTHING`).run(r.session_id, r.ts, r.email, r.account_uuid, r.source, r.config_dir)
       .changes ? r.ts : undefined;
   },
 
@@ -243,13 +245,13 @@ const IMPORT = {
     // A unique key never matches on NULL, so a refusal with no session would be
     // stored again every time it came back round.
     const res = r.session_id == null
-      ? stmt(`INSERT INTO limit_events (ts, session_id, limit_type, resets_at, status, overage)
-          SELECT ?, NULL, ?, ?, ?, ? WHERE NOT EXISTS (SELECT 1 FROM limit_events
+      ? stmt(`INSERT INTO limit_events (ts, session_id, limit_type, resets_at, status, overage, config_dir)
+          SELECT ?, NULL, ?, ?, ?, ?, ? WHERE NOT EXISTS (SELECT 1 FROM limit_events
             WHERE session_id IS NULL AND limit_type = ? AND resets_at = ?)`)
-        .run(r.ts, r.limit_type, r.resets_at, r.status, r.overage, r.limit_type, r.resets_at)
-      : stmt(`INSERT INTO limit_events (ts, session_id, limit_type, resets_at, status, overage) VALUES (?,?,?,?,?,?)
+        .run(r.ts, r.limit_type, r.resets_at, r.status, r.overage, r.config_dir, r.limit_type, r.resets_at)
+      : stmt(`INSERT INTO limit_events (ts, session_id, limit_type, resets_at, status, overage, config_dir) VALUES (?,?,?,?,?,?,?)
           ON CONFLICT(limit_type, resets_at, session_id) DO NOTHING`)
-        .run(r.ts, r.session_id, r.limit_type, r.resets_at, r.status, r.overage);
+        .run(r.ts, r.session_id, r.limit_type, r.resets_at, r.status, r.overage, r.config_dir);
     return res.changes ? r.ts : undefined;
   },
 

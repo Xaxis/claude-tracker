@@ -95,8 +95,8 @@ function prepare(d) {
     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
     ON CONFLICT(call_id) DO NOTHING`);
   STMT.limit ||= d.prepare(`
-    INSERT INTO limit_events (ts, session_id, account_uuid, limit_type, resets_at, status, overage)
-    VALUES (?,?,?,?,?,?,?)
+    INSERT INTO limit_events (ts, session_id, account_uuid, limit_type, resets_at, status, overage, config_dir)
+    VALUES (?,?,?,?,?,?,?,?)
     ON CONFLICT(limit_type, resets_at, session_id) DO NOTHING`);
   STMT.bridge ||= d.prepare(`
     INSERT INTO sessions (session_id, account_uuid, account_source)
@@ -128,7 +128,7 @@ function prepare(d) {
       first_seen = MIN(COALESCE(accounts.first_seen, excluded.first_seen), excluded.first_seen),
       last_seen  = MAX(COALESCE(accounts.last_seen, excluded.last_seen), excluded.last_seen)`);
   STMT.identity ||= d.prepare(`
-    INSERT INTO identity_points (session_id, ts, email, account_uuid, source) VALUES (?,?,?,?,?)
+    INSERT INTO identity_points (session_id, ts, email, account_uuid, source, config_dir) VALUES (?,?,?,?,?,?)
     ON CONFLICT(session_id, ts, source) DO NOTHING`);
   STMT.fileMark ||= d.prepare(`
     INSERT INTO files (path, size, offset, mtime, scanned_at) VALUES (?,?,?,?,?)
@@ -138,7 +138,7 @@ function prepare(d) {
 }
 
 function flushBridge(ctx, ts) {
-  STMT.identity.run(ctx.pendingBridge.sid, ts, null, ctx.pendingBridge.acct, 'bridge');
+  STMT.identity.run(ctx.pendingBridge.sid, ts, null, ctx.pendingBridge.acct, 'bridge', ctx.configDir);
   ctx.pendingBridge = null;
 }
 
@@ -175,7 +175,7 @@ function handleLine(line, ctx) {
       if (m) {
         STMT.sessEmail.run(d.sessionId, m[1]);
         const at = tsMs(d.timestamp) ?? ctx.lastTs;
-        if (at) STMT.identity.run(d.sessionId, at, m[1].toLowerCase(), null, 'context');
+        if (at) STMT.identity.run(d.sessionId, at, m[1].toLowerCase(), null, 'context', ctx.configDir);
       }
     }
     return 0;
@@ -196,7 +196,7 @@ function handleLine(line, ctx) {
   const q = d.quotaLimits;
   if (q && q.resetsAt && q.rateLimitType && ts) {
     STMT.limit.run(ts, d.sessionId ?? null, null, q.rateLimitType, q.resetsAt,
-      q.status ?? null, q.overageStatus ?? null);
+      q.status ?? null, q.overageStatus ?? null, ctx.configDir);
   }
 
   if (type !== 'assistant' || !ts) return 0;
@@ -321,8 +321,25 @@ export function redateBridgePoints() {
   });
 }
 
+/**
+ * Records stored before they kept their own profile - or received from a
+ * machine that did not send it - are placed by the session's own calls: the
+ * first one after the record, which is the run the record opened, else the
+ * last one before it. Calls always say which profile they were made under.
+ */
+export function placeRecords() {
+  const near = `COALESCE(
+    (SELECT e.config_dir FROM events e WHERE e.session_id = r.session_id AND e.ts >= r.ts ORDER BY e.ts LIMIT 1),
+    (SELECT e.config_dir FROM events e WHERE e.session_id = r.session_id AND e.ts < r.ts ORDER BY e.ts DESC LIMIT 1))`;
+  const d = db();
+  const a = d.prepare(`UPDATE identity_points AS r SET config_dir = ${near} WHERE r.config_dir IS NULL`).run().changes;
+  const b = d.prepare(`UPDATE limit_events AS r SET config_dir = ${near} WHERE r.config_dir IS NULL AND r.session_id IS NOT NULL`).run().changes;
+  return { placed: a + b };
+}
+
 export async function ingestAll(opts = {}) {
   redateBridgePoints();
+  placeRecords();
   const d = db();
   prepare(d);
   const profiles = opts.profiles ?? discoverProfiles();

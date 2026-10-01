@@ -148,6 +148,53 @@ test('two trackers sync both ways over one connection, live, without echoes pili
   assert.match(status.stdout, /devbox\s+online · 1 session running/);
 });
 
+test('a session resumed on the other machine moves only itself, and a copied profile lists nothing twice', { timeout: 120_000 }, async () => {
+  // Started on the laptop, signed into the laptop's account...
+  const sid = 'roamer-session-0000-0000-000000000000';
+  const ctx = (email, t) => JSON.stringify({ type: 'attachment', timestamp: iso(t), sessionId: sid,
+    attachment: { type: 'session_context', context: { userEmail: `The user's email address is ${email}.` } } });
+  const call = (i, t) => JSON.stringify({ type: 'assistant', timestamp: iso(t), sessionId: sid, cwd: '/work/roamer',
+    message: { id: `msg_roamer_${i}`, model: 'claude-sonnet-4-5', usage: { input_tokens: 1000, output_tokens: 500 } } });
+  const start = Date.now() - 2 * 3600e3;
+  const history = [ctx(laptop.account.email, start), call(0, start + MIN), call(1, start + 2 * MIN)].join('\n') + '\n';
+  fs.writeFileSync(path.join(laptop.home, '.claude', 'projects', '-work-laptop', `${sid}.jsonl`), history);
+  await until('the laptop to read the roaming session', () => laptop.count(`SELECT COUNT(*) n FROM events WHERE session_id = '${sid}'`) === 2);
+
+  // ...then its transcript carried to the devbox and resumed there, on the devbox's account.
+  const sleeper = spawn('sleep', ['300'], { stdio: 'ignore' });
+  try {
+    const now = Date.now();
+    fs.writeFileSync(path.join(devbox.home, '.claude', 'projects', '-work-devbox', `${sid}.jsonl`),
+      history + [ctx(devbox.account.email, now), call(2, now + 1000)].join('\n') + '\n');
+    fs.writeFileSync(path.join(devbox.home, '.claude', 'sessions', `${sleeper.pid}.json`), JSON.stringify({
+      pid: sleeper.pid, sessionId: sid, cwd: '/work/roamer', name: 'roamer-task', status: 'busy', startedAt: now, updatedAt: now }));
+    // A copy of the laptop's profile, running-session registry and all - as a backup taken earlier.
+    const copy = path.join(laptop.home, '.claude-copy');
+    fs.mkdirSync(path.join(copy, 'projects'), { recursive: true });
+    fs.mkdirSync(path.join(copy, 'sessions'));
+    fs.writeFileSync(path.join(copy, 'settings.json'), '{}');
+    const reg = JSON.parse(fs.readFileSync(path.join(laptop.home, '.claude', 'sessions', `${process.pid}.json`), 'utf8'));
+    fs.writeFileSync(path.join(copy, 'sessions', `${process.pid}.json`), JSON.stringify({ ...reg, updatedAt: reg.updatedAt - 3600e3 }));
+
+    for (const [here, there] of [[laptop, devbox], [devbox, laptop]]) {
+      const live = await until(`${here.name} to list the roaming session on the devbox`, async () => {
+        const l = await here.get('/api/live');
+        return l.some((s) => s.name === 'roamer-task') && l.some((s) => s.name === 'laptop-task') ? l : null;
+      });
+      const mine = (m) => (m === here ? null : m.name);
+      // Each session on the account it is actually running as - the laptop's own
+      // sessions are not moved by a /login record written on the devbox.
+      assert.deepEqual(live.map((s) => [s.name, s.machine, s.account]).sort(), [
+        ['devbox-task', mine(devbox), devbox.account.email],
+        ['laptop-task', mine(laptop), laptop.account.email],
+        ['roamer-task', mine(devbox), devbox.account.email],
+      ], `${here.name}'s running sessions`);
+    }
+  } finally {
+    sleeper.kill();
+  }
+});
+
 test('a machine with no tracker running says so, in its own words', { timeout: 60_000 }, async () => {
   const idle = machine('idle', 47913, { uuid: 'cccccccc-0000-0000-0000-000000000003', email: 'idle@example.com' });
   const r = laptop.cli('sync', 'add', IDLE_HOST, '--command', idle.relay);

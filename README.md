@@ -292,7 +292,9 @@ How it works:
   then attributes every call over the combined evidence itself, so both arrive
   at the same totals. A profile from another machine is stored under that
   machine's id, so `~/.claude` on the laptop and `~/.claude` on the dev box
-  never share a timeline.
+  never share a timeline. A session carried to the other machine and resumed
+  there is followed there: each record keeps the profile it was written in,
+  so its `/login` on one machine never moves the other machine's sessions.
 - **Incremental.** Each side remembers how far into each of the other's tables
   it has read. The first sync copies everything - about half a minute for half
   a million calls - and after that only what is new. A machine that was asleep
