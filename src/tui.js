@@ -158,7 +158,10 @@ function failoverLines(f, here, now) {
         ? `${C.accent}${e.target.label}${C.reset} ${C.muted}${e.target.shown} · ${Math.round(e.target.room)}% free${C.reset}`
         : `${C.critical}nowhere${C.reset} ${C.muted}- no other account with room signed in there${C.reset}`;
       const state = p.mode !== 'auto' ? `${C.muted}(off)${C.reset}`
-        : e.due && e.target ? `${C.warning}moving idle sessions${C.reset}` : `${C.muted}at ${p.at}%${C.reset}`;
+        : !e.target ? ''
+          : e.out ? `${C.warning}moving sessions${C.reset}`
+            : e.due ? `${C.warning}moving background sessions${C.reset} ${C.muted}· open ones when it runs out${C.reset}`
+              : `${C.muted}at ${p.at}%${C.reset}`;
       rows.push(`  ${C.muted}↪${C.reset} ${who} → ${to}  ${state}`);
     }
     if (p.local && p.best) rows.push(`    ${C.muted}${p.best.label} has ${Math.round(p.best.room)}% free: claude-tracker pool add ${p.best.email}${C.reset}`);
