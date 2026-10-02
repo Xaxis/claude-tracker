@@ -4,6 +4,7 @@ import { spawn } from 'node:child_process';
 import { db, getMeta, setMeta } from './db.js';
 import { discoverProfiles, tildify } from './paths.js';
 import { profileAccount } from './accounts.js';
+import { linkMemory } from './pool.js';
 
 /**
  * Failing over: when the account sessions here are running on is nearly out,
@@ -178,6 +179,8 @@ export async function move(session, target, { fromAccount = null } = {}) {
     if (path.resolve(dest) !== path.resolve(src.file)) fs.copyFileSync(src.file, dest);
   } catch (err) { row.error = `could not copy its transcript: ${err.message}`; return record(); }
 
+  // Its project's memories come with it: the target reads and writes the main profile's.
+  try { linkMemory(target.dir, src.slug, { create: true }); } catch { /* resumes without them */ }
   row.continued = cutOff(id) ? 1 : 0;
   const args = ['--resume', id, '--fork-session', '--bg', '-n', row.name];
   if (row.continued) args.push(CONTINUE);

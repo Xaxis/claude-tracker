@@ -351,13 +351,17 @@ async function cmdPool(action, args, flags) {
   if (action === 'add') {
     const email = args[0];
     if (!email || !/^[^\s@]+@[^\s@]+$/.test(email)) { console.error('usage: claude-tracker pool add <email> [--as <name>]'); process.exitCode = 1; return; }
-    const { HOME, configFileOf, discoverProfiles } = await import('./paths.js');
+    const { HOME, configFileOf } = await import('./paths.js');
     const { profileAccount } = await import('./accounts.js');
     const fs = await import('node:fs');
     const path = await import('node:path');
     const { spawn } = await import('node:child_process');
     const already = F.pool().find((p) => p.email?.toLowerCase() === email.toLowerCase());
-    if (already) { console.log(`${email} is already signed in on this machine, in ${already.shown}.`); return; }
+    if (already) {
+      console.log(`${email} is already signed in on this machine, in ${already.shown}.`);
+      if (!already.isDefault) console.log(`${c.dim}To have it share this machine's settings, skills and memories: claude-tracker pool link${c.reset}`);
+      return;
+    }
     const name = String(flags.as ?? email.split('@')[0]).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
     const dir = path.join(HOME, `.claude-${name}`);
     // Never sign over a profile that is another account's: two emails can share a name.
@@ -368,17 +372,9 @@ async function cmdPool(action, args, flags) {
       return;
     }
     fs.mkdirSync(path.join(dir, 'projects'), { recursive: true });
-    // Carry over how Claude Code is set up here, so a session moved into this
-    // profile behaves as it did: settings copied, instructions and agents linked.
-    const main = discoverProfiles().find((p) => p.isDefault);
-    if (main) {
-      const from = (f) => path.join(main.dir, f);
-      if (fs.existsSync(from('settings.json')) && !fs.existsSync(path.join(dir, 'settings.json'))) fs.copyFileSync(from('settings.json'), path.join(dir, 'settings.json'));
-      for (const f of ['CLAUDE.md', 'agents', 'commands', 'skills', 'output-styles']) {
-        if (!fs.existsSync(from(f)) || fs.existsSync(path.join(dir, f))) continue;
-        try { fs.symlinkSync(fs.realpathSync(from(f)), path.join(dir, f)); } catch { /* not linkable here */ }
-      }
-    }
+    // The same setup as the main profile, so a session moved here behaves as it did.
+    const { shareSetup } = await import('./pool.js');
+    shareSetup(dir);
     console.log(`Signing ${email} into ${dir.replace(HOME, '~')} - finish the login in your browser.\n`);
     const code = await new Promise((resolve) => {
       const child = spawn(process.env.CLAUDE_TRACKER_CLAUDE || 'claude', ['auth', 'login', '--email', email],
@@ -403,7 +399,22 @@ async function cmdPool(action, args, flags) {
       process.exitCode = 1;
       return;
     }
+    // Now there is a config file to carry MCP servers and folder trust into.
+    const shared = shareSetup(dir);
     console.log(`\n${c.green}✓${c.reset} ${dir.replace(HOME, '~')} is signed in as ${c.bold}${who.email}${c.reset}; sessions can now be moved to it.`);
+    if (shared.copied.length) console.log(`  ${c.dim}also given: ${shared.copied.join(', ')}${c.reset}`);
+    return;
+  }
+
+  if (action === 'link') {
+    const { shareSetup, mainProfile } = await import('./pool.js');
+    const main = mainProfile();
+    for (const p of F.pool().filter((x) => !x.isDefault)) {
+      const r = shareSetup(p.dir, { force: !!flags.force });
+      const did = [...r.linked, ...r.copied, ...(r.memories ? [`${r.memories} project memories`] : [])];
+      console.log(`  ${pad(p.shown, 24)} ${did.length ? `${c.green}shared${c.reset} ${did.join(', ')}` : `${c.dim}already shares ${main ? main.name : 'the main profile'}'s setup${c.reset}`}`);
+      if (r.kept.length) console.log(`  ${' '.repeat(24)} ${c.yellow}kept its own${c.reset} ${r.kept.join(', ')} ${c.dim}- --force replaces them, keeping the old as .pre-pool${c.reset}`);
+    }
     return;
   }
 
@@ -575,6 +586,7 @@ ${c.bold}claude-tracker${c.reset} — local usage and rate-limit tracking for Cl
         ${c.dim}on [--at 90] [--wait 15]${c.reset}  at what fill, and not if it frees up that soon
         ${c.dim}move <session> [--to <email>]${c.reset}  move one now
   ${c.bold}pool${c.reset} [list]|add <email>        accounts signed in here, that sessions can move to
+        ${c.dim}link [--force]${c.reset}           share this machine's setup with every pool profile
 
 ${c.dim}In the terminal dashboard: q quit · r refresh · a cycle account · w switch
 window · space pause · ↑↓/jk scroll${c.reset}

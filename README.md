@@ -343,9 +343,17 @@ claude-tracker failover on                # move at 90% (--at to change)
 ```
 
 Signing in takes a browser, so the tracker never does it - `pool add` creates a
-profile (`~/.claude-me`), copies your settings into it and links your
-instructions and agents, then opens Claude Code's own login once. From then on
+profile (`~/.claude-me`) and opens Claude Code's own login once. From then on
 that profile stays signed in, and a session can be started on it at any time.
+
+A pool profile is your setup with another sign-in. It links your main profile's
+settings (hooks, permissions, status line), instructions, skills, agents,
+commands, plugins and keybindings, so a change to any of them shows in every
+profile; copies in your user-level MCP servers and the folders you have trusted,
+which live in the config file beside the sign-in; and links each project's
+memory to the main profile's, so a session moved there remembers what it did and
+what it learns is kept in one place. `claude-tracker pool link` does the same for
+profiles made by hand, keeping anything they have of their own unless `--force`.
 
 When an account in use crosses the threshold, each of its sessions is moved as
 soon as it is idle - one mid-turn finishes the turn, or is refused, first - so the

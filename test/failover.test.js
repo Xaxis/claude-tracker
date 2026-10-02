@@ -84,14 +84,17 @@ test('an idle session on an account running low moves to the profile with the mo
     const p = F.plan(ov, live);
     const first = await F.runFailover(ov, live);
     const again = await F.runFailover(api.overview(), api.liveSessions());
+    const memory = path.join(roomy, 'projects', '-work-app', 'memory');
     return { plan: p.entries.map((e) => ({ label: e.label, due: e.due, target: e.target?.label, dir: e.target?.dir })), first, again: again.length,
-      copied: fs.existsSync(path.join(roomy, 'projects', '-work-app', 'aaaaaaaa-idle.jsonl')), roomy };
+      copied: fs.existsSync(path.join(roomy, 'projects', '-work-app', 'aaaaaaaa-idle.jsonl')), roomy,
+      memory: fs.lstatSync(memory).isSymbolicLink() && fs.realpathSync(memory) === fs.realpathSync(path.join(main, 'projects', '-work-app', 'memory')) };
   `);
   assert.deepEqual(out.plan, [{ label: 'a@x.com', due: true, target: 'b@x.com', dir: out.roomy }]);
   assert.equal(out.first.length, 1, 'only the idle session moves; the busy one finishes its turn first');
   assert.deepEqual([out.first[0].session_id, out.first[0].status, out.first[0].bg_id, out.first[0].continued], ['aaaaaaaa-idle', 'started', 'aaaaaaaa', 0], out.first[0].error);
   assert.equal(out.again, 0, 'a session moves once');
   assert.equal(out.copied, true, 'its transcript is where the new profile can resume it');
+  assert.equal(out.memory, true, "its project's memories come with it");
   const [c] = calls();
   assert.deepEqual(c, { args: ['--resume', 'aaaaaaaa-idle', '--fork-session', '--bg', '-n', 'idle-one'], cwd: path.join(root, 'work', 'app'), configDir: out.roomy });
 });
