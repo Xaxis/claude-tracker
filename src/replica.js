@@ -400,6 +400,10 @@ export function saveState(id, state) {
     entries: (Array.isArray(f.entries) ? f.entries : []).slice(0, 20).map((e) => ({
       profile: clean(e?.profile), label: clean(e?.label), level: num(e?.level), due: !!e?.due, out: !!e?.out, sessions: num(e?.sessions) ?? 0,
       target: e?.target ? { label: clean(e.target.label), room: num(e.target.room), shown: clean(e.target.shown) } : null,
+      then: (Array.isArray(e?.then) ? e.then : []).slice(0, 5).map((t) => ({ label: clean(t?.label), room: num(t?.room) })),
+    })),
+    notices: (Array.isArray(f.notices) ? f.notices : []).slice(0, 10).map((n) => ({
+      level: n?.level === 'bad' ? 'bad' : 'warn', text: clean(n?.text, 300), fix: clean(n?.fix, 300),
     })),
     switches: (Array.isArray(f.switches) ? f.switches : []).slice(0, 20).map((m) => ({
       ts: num(m?.ts), profile: clean(m?.profile), from: clean(m?.from), to: clean(m?.to), status: clean(m?.status, 10),

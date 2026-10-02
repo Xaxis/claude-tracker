@@ -242,3 +242,85 @@ test('a preferred account is switched to while it has room, and the best by room
   assert.deepEqual(out.full, [out.byRoom[0], false]);
   assert.equal(out.cleared, null);
 });
+
+// Today's outage, as it happened: ~/.claude is switched to an account whose
+// weekly window resets at the same hour as another's, fills it in minutes, and
+// is refused. Its readings must count as its own, and failover must move on.
+const SAME_RESET = `${SETUP}
+  const week = now + 4 * 86400e3;
+  // C has a week of history on this weekly window, from before; B's resets at the same hour.
+  db().prepare("INSERT INTO utilization (ts, session_id, config_dir, account_uuid, limit_type, pct, resets_at) VALUES (?, 'old-c', '/elsewhere', 'C', 'seven_day', 60, ?)").run(now - 2 * 86400e3, week);
+  db().prepare("INSERT INTO account_observations (ts, config_dir, account_uuid, email, source) VALUES (?, ?, 'A', 'a@x.com', 'watch'), (?, ?, 'B', 'b@x.com', 'watch')")
+    .run(now - 3 * HOUR, main, now - 20 * MIN, main);
+  db().prepare("INSERT INTO switches (ts, profile, from_account, to_account, spare, status) VALUES (?, ?, 'A', 'B', 'x', 'switched')").run(now - 20 * MIN, main);
+  // ~/.claude is on B now.
+  const b = S.readSignin({ dir: path.join(HOME, '.claude-pool-b'), isDefault: false });
+  fs.writeFileSync(path.join(HOME, '.claude.json'), JSON.stringify({ oauthAccount: account('B', 'b@x.com'), userID: 'me' }));
+  const own = (ts, type, pct, resetsAt, sid = 'sess-1') => db().prepare("INSERT INTO utilization (ts, session_id, config_dir, account_uuid, limit_type, pct, resets_at) VALUES (?, ?, ?, 'C', ?, ?, ?)").run(ts, sid, main, type, pct, resetsAt);
+`;
+
+test('a profile’s own readings say how full its account is, whatever account they were matched to', () => {
+  const root = scratch();
+  const out = inChild(root, `${SAME_RESET}
+    own(now - 10 * MIN, 'seven_day', 19, week); own(now - 10 * MIN, 'five_hour', 95, now + 4 * HOUR);
+    const A = await import('${SRC}accounts.js');
+    A.attributeEvents({ all: true });
+    const owner = db().prepare("SELECT account_uuid a FROM utilization WHERE session_id = 'sess-1' AND limit_type = 'five_hour'").get().a;
+    F.setFailover({ mode: 'auto', at: 90 });
+    const e = F.plan(api.overview(), api.liveSessions()).entries[0];
+    return { owner, label: e.label, level: e.level, measured: e.measured, due: e.due };
+  `);
+  assert.equal(out.owner, 'B', 'read in a profile watched on B for 10 minutes: B’s, not C’s');
+  assert.deepEqual([out.label, Math.round(out.level), out.measured, out.due], ['b@x.com', 95, true, true]);
+});
+
+test('refused right after a switch, it switches again at once, never back to the spent account, and past a spare that fails', () => {
+  const root = scratch();
+  const out = inChild(root, `${SAME_RESET}
+    // A third spare, D, to fall back on.
+    db().prepare("INSERT INTO accounts (account_uuid, email, last_seen) VALUES ('D', 'd@x.com', ?)").run(now);
+    const d = F.makeSpare('d@x.com');
+    S.writeSignin(d, { oauth: token('D'), account: account('D', 'd@x.com') });
+    db().prepare("INSERT INTO limit_events (ts, session_id, account_uuid, limit_type, resets_at, status, config_dir) VALUES (?, 'sess-1', 'C', 'five_hour', ?, 'rejected', ?)")
+      .run(now - 5 * MIN, Math.round((now + 4 * HOUR) / 1000), main);
+    (await import('${SRC}accounts.js')).attributeEvents({ all: true });
+    F.setFailover({ mode: 'auto', at: 90 });
+    const p = F.plan(api.overview(), api.liveSessions()).entries[0];
+    // The first choice's spare has lost its token, though it still names its account: the next one is used.
+    fs.rmSync(path.join(p.target.dir, '.credentials.json'));
+    const made = F.runFailover(api.overview(), api.liveSessions());
+    const now2 = F.plan(api.overview(), api.liveSessions());
+    return {
+      first: [p.label, p.out, p.due, p.target.label, p.then.map((t) => t.label)],
+      made: made.map((m) => m.status),
+      on: read(path.join(HOME, '.claude.json')).oauthAccount.emailAddress,
+      spentB: !now2.entries[0].then.concat(now2.entries[0].target ?? []).some((t) => t.label === 'b@x.com'),
+    };
+  `);
+  assert.equal(out.first[0], 'b@x.com');
+  assert.equal(out.first[1], true, 'refused in the profile: out');
+  assert.equal(out.first[2], true);
+  assert.deepEqual(out.made, ['failed', 'switched'], 'the next spare is tried when one fails');
+  assert.notEqual(out.on, 'b@x.com');
+  assert.equal(out.spentB, true, 'B is not offered again before it resets');
+});
+
+test('room on a bigger plan counts for more, and it says when another account is needed', () => {
+  const root = scratch();
+  const out = inChild(root, `${SETUP}
+    reading('A', 'five_hour', 95, now + 3 * HOUR);
+    // B: 80% free on a Max 20x. C: untouched, but a small plan.
+    db().prepare("UPDATE accounts SET rate_limit_tier = 'default_claude_max_20x' WHERE account_uuid = 'B'").run();
+    db().prepare("DELETE FROM utilization WHERE account_uuid = 'C'").run();
+    const big = F.plan(api.overview(), api.liveSessions()).entries[0].target.label;
+    // Both spares full: nothing to switch to, and a notice saying what to do.
+    db().prepare("UPDATE utilization SET pct = 99 WHERE account_uuid = 'B' AND limit_type = 'five_hour'").run();
+    reading('C', 'five_hour', 99, now + 3 * HOUR);
+    const p = F.plan(api.overview(), api.liveSessions());
+    return { big, target: p.entries[0].target, notices: p.notices };
+  `);
+  assert.equal(out.big, 'b@x.com');
+  assert.equal(out.target, null);
+  assert.equal(out.notices[0].level, 'bad');
+  assert.match(out.notices[0].fix, /claude-tracker pool add/);
+});

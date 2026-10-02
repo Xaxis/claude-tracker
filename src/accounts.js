@@ -538,7 +538,23 @@ function createResolver(d) {
     marks.push({ type: r.limit_type, resetsAt: Math.round(r.resets_at / 1000), sid: r.session_id, dir: r.config_dir, ts: r.ts });
   }
 
-  const weekKey = (m) => `seven_day|${m.resetsAt}`;
+  // A profile watched signed into one account since well before a reading was
+  // taken holds that account's reading: its sessions can only call as what the
+  // profile is signed into. Reset times alone cannot tell apart two accounts
+  // whose windows happen to reset together. (Sessions go on with the sign-in
+  // they hold for a little while after a switch, hence the minute.)
+  const SURE_AFTER = 60e3;
+  const sure = (m) => {
+    const o = observedAt(m.dir, m.ts);
+    if (!o?.account) return null;
+    const began = latest(OC.get(m.dir), m.ts)?.ts ?? o.ts;
+    return m.ts - began >= SURE_AFTER ? o.account : null;
+  };
+  const weekKey = (m) => {
+    const a = sure(m);
+    return a ? `seven_day|${m.resetsAt}|${a}` : `seven_day|${m.resetsAt}`;
+  };
+  const keyedAccount = (g) => g.key.split('|')[2] || null;
 
   // Each session's weekly readings, to pair its five-hour readings with.
   const weekly = new Map();
@@ -598,7 +614,8 @@ function createResolver(d) {
   const groupTier = new Map();      // group key -> the timeline its members' evidence went to
   const markAccount = new Map();    // `${type}|${sid}|${ts}` -> account, for each refusal and reading
   const fits = (acct, g) => {
-    if ((owned.get(`${acct}|${g.type}`) ?? []).some(([s0, e0]) => s0 < g.resetsAt && g.start < e0)) return false;
+    // Overlapping another window of its own, unless it is the same window.
+    if ((owned.get(`${acct}|${g.type}`) ?? []).some(([s0, e0]) => s0 < g.resetsAt && g.start < e0 && e0 !== g.resetsAt)) return false;
     if (g.type === 'five_hour' && (blocked.get(acct) ?? []).some(([f, u]) => f <= g.start && u >= g.start + SLOT)) return false;
     if (g.block && (opens.get(acct) ?? []).some((s) => g.block[0] <= s && g.block[1] >= s + SLOT)) return false;
     return true;
@@ -654,7 +671,10 @@ function createResolver(d) {
     }
   };
 
-  settle(build(marks.filter((m) => m.type === 'seven_day'), weekKey));
+  settle(build(marks.filter((m) => m.type === 'seven_day'), weekKey), (g) => {
+    const a = keyedAccount(g);
+    return a ? { account: a, tier: S } : null;
+  });
   // Five-hour readings go with the account of the weekly window read alongside.
   const weekGroup = (m) => {
     const w = m.sid ? weekOf(m.sid, m.ts) : null;
@@ -663,10 +683,11 @@ function createResolver(d) {
   const rest = build(marks.filter((m) => m.type !== 'seven_day'), (m) => {
     if (m.type !== 'five_hour') return `${m.type}|${m.resetsAt}`;
     const w = weekGroup(m);
-    return `five_hour|${m.resetsAt}|${w ? groupAccount.get(w) : ''}`;
+    return `five_hour|${m.resetsAt}|${sure(m) ?? (w ? groupAccount.get(w) : '')}`;
   });
   settle(rest, (g) => {
     if (g.type !== 'five_hour') return null;
+    if (g.members.some(sure)) return { account: keyedAccount(g), tier: S };
     const w = g.members.map(weekGroup).find(Boolean);
     return w ? { account: groupAccount.get(w), tier: groupTier.get(w) } : null;
   });

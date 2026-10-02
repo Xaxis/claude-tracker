@@ -285,6 +285,11 @@ function printPlan(p, machine, settings) {
     console.log(e.target
       ? `    ${e.due ? `${c.yellow}switching${c.reset}` : 'switches'} to ${c.bold}${e.target.label}${c.reset} ${c.dim}(${pct(e.target.room)} free${e.target.pinned ? ', your pick' : ''})${e.due ? '' : ` at ${settings.at}%`}${c.reset}`
       : `    ${c.red}nothing to switch to${c.reset} ${c.dim}- no spare on ${machine} holds an account with room${c.reset}`);
+    if (e.then?.length) console.log(`    ${c.dim}if that fails: ${e.then.map((t) => `${t.label} (${pct(t.room)} free)`).join(', then ')}${c.reset}`);
+  }
+  for (const n of p.notices ?? []) {
+    console.log(`  ${n.level === 'bad' ? c.red : c.yellow}! ${n.text}${c.reset}`);
+    if (n.fix) console.log(`    ${c.dim}→ ${n.fix}${c.reset}`);
   }
   if (p.best) console.log(`  ${c.dim}${p.best.label} has ${pct(p.best.room)} free and no spare on ${machine}${p.best.email ? `: claude-tracker pool add ${p.best.email}` : ''}${c.reset}`);
 }

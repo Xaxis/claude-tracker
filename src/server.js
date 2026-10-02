@@ -253,12 +253,19 @@ export async function serve({ port = 4785, open = false, refresh, fastRefresh, a
   let failTimer = null;
   if (web) {
     let failing = false;
+    const told = new Map();
     const failover = async () => {
       if (failing) return;
       failing = true;
       try {
         const ov = overview(), live = liveSessions();
-        setMeta('failover_plan', JSON.stringify({ ...plan(ov, live), computedAt: Date.now() }));
+        const p = plan(ov, live);
+        setMeta('failover_plan', JSON.stringify({ ...p, computedAt: Date.now() }));
+        for (const n of p.notices) {
+          if (n.level !== 'bad' || Date.now() - (told.get(n.text) ?? 0) < 6 * 3600e3) continue;
+          told.set(n.text, Date.now());
+          send('Claude failover needs another account', `${n.text} To fix: ${n.fix}.`);
+        }
         const names = new Map(ov.accounts.map((a) => [a.accountUuid, a.label]));
         const made = runFailover(ov, live);
         for (const m of made) {

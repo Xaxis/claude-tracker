@@ -161,6 +161,11 @@ function failoverLines(f, here, now) {
       const state = p.mode !== 'auto' ? `${C.muted}(off)${C.reset}`
         : !e.target ? '' : e.due ? `${C.warning}switching${C.reset}` : `${C.muted}at ${p.at}%${C.reset}`;
       rows.push(`  ${C.muted}↪${C.reset} ${who} → ${to}  ${state}`);
+      if (e.then?.length) rows.push(`    ${C.muted}if that fails: ${e.then.map((t) => t.label).join(' → ')}${C.reset}`);
+    }
+    for (const n of p.notices ?? []) {
+      rows.push(`  ${n.level === 'bad' ? C.critical : C.warning}!${C.reset} ${plans.length > 1 ? `${C.muted}${p.machine}:${C.reset} ` : ''}${n.text}`);
+      if (n.fix) rows.push(`    ${C.muted}→ ${n.fix}${C.reset}`);
     }
     if (p.local && p.best) rows.push(`    ${C.muted}${p.best.label} has ${Math.round(p.best.room)}% free: claude-tracker pool add ${p.best.email}${C.reset}`);
   }

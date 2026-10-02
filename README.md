@@ -367,6 +367,20 @@ profile with sessions running, the account it is on, how full, and what it would
 switch to, on every synced machine. `claude-tracker failover switch` switches now;
 `claude-tracker pool` lists what is signed in where.
 
+How full a profile's account is comes from the profile's own sessions - their
+status-line readings and refusals since it was signed in - so it cannot be
+mistaken for another account whose windows reset at the same time. If the new
+account turns out to be out, or fills before the next check, it switches again
+within a minute; an account it ran out on is not switched back to until it
+resets. If a spare fails to switch to, the next in line is tried at once.
+
+Room counts for more on a bigger plan: 50% left on a Max 20x outlasts 100% on a
+Pro or Team seat, so small plans are a last resort. When a profile is down to
+its last spare with room, or has none, the dashboards say so and the service
+sends a notification: sign another account up, then `claude-tracker pool add
+<email>`. A spare whose sign-in was lost (a `/login` over a switched profile
+does that) is listed with the command that puts it back.
+
 It picks the spare with the most room, unless you pick: `claude-tracker failover
 prefer <email>` sends it to that account while it has room (`prefer auto` hands
 the choice back). In the terminal dashboard the same settings are keys: `f`
