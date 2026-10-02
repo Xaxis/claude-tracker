@@ -21,9 +21,12 @@ export const limitLabel = (type) => LIMIT_TYPES[type]?.label ?? EXTRA_LABELS[typ
 
 /** The newest exact reading for an account's window that has not reset yet. */
 function exactReading(accountUuid, type, now) {
+  // Never one dated before its own window began: an idle session's fresh numbers, misdated.
+  const span = LIMIT_TYPES[type]?.span ?? 0;
   return db().prepare(`SELECT ts, pct, resets_at FROM utilization
      WHERE account_uuid = ? AND limit_type = ? AND (resets_at > ? OR (resets_at IS NULL AND ts > ?))
-     ORDER BY ts DESC LIMIT 1`).get(accountUuid, type, now, now - 30 * 60_000) ?? null;
+       AND (resets_at IS NULL OR ts >= resets_at - ?)
+     ORDER BY ts DESC LIMIT 1`).get(accountUuid, type, now, now - 30 * 60_000, span) ?? null;
 }
 
 /**
@@ -50,14 +53,20 @@ function windowStatus(accountUuid, type, tier, now) {
     const before = sumBetween(accountUuid, start ?? ex.ts, ex.ts).cost;
     const after = sumBetween(accountUuid, ex.ts, now).cost;
     const perPoint = ex.pct >= 3 && before > 0 ? before / ex.pct : capacity ? capacity / 100 : null;
-    percent = ex.pct + (perPoint ? after / perPoint : 0);
+    const since = perPoint ? after / perPoint : 0;
+    percent = ex.pct + since;
     used = before + after;
     if (perPoint) capacity = perPoint * 100;
-    confidence = 'exact';
+    // Exact as Claude Code read it; whatever the calls since have added is estimated.
+    confidence = since >= 1 ? 'carried' : 'exact';
     active = true;
   } else {
     percent = capacity ? (used / capacity) * 100 : 0;
   }
+  // A window whose time is up is empty again - the next request opens a new one -
+  // however full it got.
+  const lastPercent = active ? null : percent;
+  if (!active) percent = 0;
   const percentRaw = percent;
   percent = Math.max(0, Math.min(100, percent));
 
@@ -72,7 +81,7 @@ function windowStatus(accountUuid, type, tier, now) {
     type, label: limitLabel(type), active, start, end,
     resetsInMs: end ? Math.max(0, end - now) : null,
     used, capacity, confidence, samples: cap.samples,
-    percent, percentRaw, events: w.events ?? 0,
+    percent, percentRaw, lastPercent, events: w.events ?? 0,
     burnPerHour: rate.perHour, exhaustsAt, exactAt: ex?.ts ?? null,
   };
 }
@@ -96,7 +105,7 @@ function recommend(rows, now) {
     }
   }
   const rank = (x) => (x.profile ? (x.profile.machine ? 1 : 2) : 0);
-  const scored = rows.filter((a) => !a.limits.some((l) => l.blocked)).map((a) => {
+  const scored = rows.filter((a) => a.available.now).map((a) => {
     const core = a.limits.filter((l) => LIMIT_TYPES[l.type]);
     const headroom = core.length ? Math.min(...core.map((l) => 100 - (l.active ? l.percent : 0))) : 100;
     return {
@@ -113,6 +122,22 @@ function recommend(rows, now) {
     machine: p?.machine ?? null,
     command: p?.command ?? null,
     note: p ? null : 'not signed into any profile - /login with it first',
+  };
+}
+
+/**
+ * When an account can take a request again: now, unless a window is full -
+ * refused by the API, or read or carried to 100% - and then when the last such
+ * window resets. `sure` when that rests on a refusal or an exact reading
+ * rather than an estimate.
+ */
+export function availability(limits) {
+  const out = limits.filter((l) => l.blocked || (l.active && l.percent >= 100));
+  if (!out.length) return { now: true, at: null, limit: null, sure: true };
+  const last = out.reduce((a, b) => ((b.end ?? 0) > (a.end ?? 0) ? b : a));
+  return {
+    now: false, at: last.end ?? null, limit: last.type,
+    sure: out.every((l) => l.blocked || l.confidence === 'exact'),
   };
 }
 
@@ -170,6 +195,7 @@ export function overview(now = Date.now()) {
       });
     }
     const totals = agg.get(a.account_uuid) ?? { events: 0, cost: 0 };
+    const available = availability(limits);
 
     // Only a monthly subscription has a cycle to project. A prepaid or org seat
     // records a start date too, but projecting monthly renewals from it is fiction.
@@ -186,6 +212,7 @@ export function overview(now = Date.now()) {
       totalCost: totals.cost,
       totalEvents: totals.events,
       limits,
+      available,
       billing: period ? { ...period, spend: periodSpend(d, a.account_uuid, period) } : null,
     };
   });

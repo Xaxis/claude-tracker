@@ -82,10 +82,15 @@ export function eventsFor(accountUuid, since = 0, { includeUnattributed = false 
  * This is ground truth and outranks anything we reconstruct.
  */
 export function latestResetMs(accountUuid, type) {
-  const row = db().prepare(`
+  const refused = db().prepare(`
     SELECT MAX(resets_at) AS r FROM limit_events
-     WHERE limit_type = ? AND account_uuid = ?`).get(type, accountUuid);
-  return row?.r ? row.r * 1000 : null;
+     WHERE limit_type = ? AND account_uuid = ?`).get(type, accountUuid)?.r;
+  // Status-line readings name it too - and once it passes, the next window
+  // opens at the first call after it, not where reconstruction would put it.
+  const read = db().prepare(`
+    SELECT MAX(resets_at) AS r FROM utilization
+     WHERE limit_type = ? AND account_uuid = ? AND ts >= resets_at - ?`).get(type, accountUuid, LIMIT_TYPES[type].span)?.r;
+  return Math.max(refused ? refused * 1000 : 0, read ?? 0) || null;
 }
 
 /** Spend and call count strictly inside a time range - summed in SQL, not JS. */

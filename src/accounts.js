@@ -413,9 +413,12 @@ function createResolver(d) {
    *      bridge registered with and can be days out of date.
    *
    * The newest evidence at or before a call decides, so a session follows its
-   * profile's latest login unless its own records are more recent. S, C and O
-   * keep every point; F and W only the moments the account changed, since their
-   * repeats confirm nothing.
+   * profile's latest login unless its own records are more recent. C and O keep
+   * every point; S, F and W only the moments the account changed, since their
+   * repeats confirm nothing. A session's context record in particular repeats
+   * the email it started with on later turns, even after a /login elsewhere in
+   * its profile has moved it - counting each repeat as news let a stale email
+   * outvote the login that was actually watched.
    */
   const push = (map, key, ts, account) => {
     if (!account || key == null || ts == null) return;
@@ -468,7 +471,7 @@ function createResolver(d) {
   for (const r of d.prepare("SELECT ts, config_dir, account_uuid FROM account_observations WHERE config_dir != '' ORDER BY ts").all()) {
     push(O, r.config_dir, r.ts, r.account_uuid);
   }
-  sortAll(S); sortAll(O); collapse(W); collapse(F);
+  collapse(S); sortAll(O); collapse(W); collapse(F);
   // The session's own records, before refusals and readings add to S.
   const own = new Map([...S].map(([k, tl]) => [k, tl.slice()]));
 
@@ -504,62 +507,96 @@ function createResolver(d) {
 
   /*
    * Refusals and status-line readings. Every session on an account is refused -
-   * and reads - with that account's reset time, so a (limit, reset) pair names
-   * exactly one account, whatever each session's own stale records claim. Each
-   * group is settled by vote, most certain first, within what is possible: an
-   * account never holds two overlapping windows of one kind, and an account
+   * and reads - with that account's reset time, so a reset time nearly always
+   * names one account, whatever each session's own stale records claim. Nearly:
+   * windows open on round boundaries - five-hour ones on ten-minute marks, weekly
+   * ones on the hour - so two accounts in use at once can share one. But a status
+   * line reads both of its account's windows at once, and two accounts sharing
+   * both is far rarer. So weekly windows, which pool a week of evidence, are
+   * settled first; a five-hour reading then belongs to whichever account holds
+   * the weekly window it was read alongside, and one five-hour reset read
+   * alongside two weekly windows is two accounts, not one.
+   *
+   * Each group is settled by vote, most certain first, within what is possible:
+   * an account never holds two overlapping windows of one kind, and an account
    * that is blocked cannot take the call that opens a five-hour window.
    */
   const spanOf = (type) => (type === 'five_hour' ? 5 * 3600e3 : 7 * 86400e3);
   const SLOT = 10 * 60e3;     // a five-hour window starts on the 10-minute boundary before its first call
   const GRACE = 60e3;         // requests already in flight when a refusal lands still complete
-  const groups = new Map();
-  const member = (type, resetsAtSec, m) => {
-    const key = `${type}|${resetsAtSec}`;
-    if (!groups.has(key)) groups.set(key, { key, type, resetsAt: resetsAtSec * 1000, members: [], refusals: [], overage: null });
-    const g = groups.get(key);
-    g.members.push(m);
-    return g;
-  };
+  const marks = [];           // every refusal and reading: { type, resetsAt (s), sid, dir, ts, refusal, overage }
   for (const r of d.prepare(`SELECT l.limit_type, l.resets_at, l.ts, l.session_id, l.overage, COALESCE(l.config_dir, s.config_dir) config_dir
       FROM limit_events l LEFT JOIN sessions s ON s.session_id = l.session_id
       WHERE l.status = 'rejected'`).all()) {
-    const m = { sid: r.session_id, dir: r.config_dir, ts: r.ts };
-    const g = member(r.limit_type, r.resets_at, m);
-    g.refusals.push(m);
-    g.overage ??= r.overage;
+    marks.push({ type: r.limit_type, resetsAt: r.resets_at, sid: r.session_id, dir: r.config_dir, ts: r.ts, refusal: true, overage: r.overage });
   }
   for (const r of d.prepare(`SELECT u.limit_type, u.resets_at, u.ts, u.session_id, COALESCE(u.config_dir, s.config_dir) config_dir
       FROM utilization u LEFT JOIN sessions s ON s.session_id = u.session_id
       WHERE u.resets_at IS NOT NULL AND u.limit_type IN ('five_hour', 'seven_day')`).all()) {
-    member(r.limit_type, Math.round(r.resets_at / 1000), { sid: r.session_id, dir: r.config_dir, ts: r.ts });
+    // A reading dated before its own window began cannot be right.
+    if (r.ts < r.resets_at - spanOf(r.limit_type)) continue;
+    marks.push({ type: r.limit_type, resetsAt: Math.round(r.resets_at / 1000), sid: r.session_id, dir: r.config_dir, ts: r.ts });
   }
-  for (const g of groups.values()) {
-    g.members.sort((a, b) => a.ts - b.ts);
-    g.refusals.sort((a, b) => a.ts - b.ts);
-    const votes = new Map();
-    // One vote per session, from the newest evidence at its latest record here.
-    for (const m of new Map(g.members.map((x) => [x.sid, x])).values()) {
-      const top = evidence(m.sid, m.dir, m.ts, false)[0];
-      if (!top) continue;
-      const v = votes.get(top[0].account) ?? { total: 0, max: 0 };
-      v.total += top[2]; v.max = Math.max(v.max, top[2]);
-      votes.set(top[0].account, v);
+
+  const weekKey = (m) => `seven_day|${m.resetsAt}`;
+
+  // Each session's weekly readings, to pair its five-hour readings with.
+  const weekly = new Map();
+  for (const m of marks) {
+    if (m.type !== 'seven_day' || m.refusal || !m.sid) continue;
+    if (!weekly.has(m.sid)) weekly.set(m.sid, []);
+    weekly.get(m.sid).push(m);
+  }
+  for (const list of weekly.values()) list.sort((a, b) => a.ts - b.ts);
+  // The weekly window a session read at `ts`: its latest weekly reading by then, if still open.
+  const weekOf = (sid, ts) => {
+    const list = weekly.get(sid);
+    if (!list) return null;
+    let lo = 0, hi = list.length;
+    while (lo < hi) { const mid = (lo + hi) >> 1; if (list[mid].ts <= ts) lo = mid + 1; else hi = mid; }
+    const w = lo ? list[lo - 1] : null;
+    return w && ts < w.resetsAt * 1000 ? w : null;
+  };
+
+  const build = (list, keyOf) => {
+    const groups = new Map();
+    for (const m of list) {
+      const key = keyOf(m);
+      if (!groups.has(key)) groups.set(key, { key, type: m.type, resetsAt: m.resetsAt * 1000, members: [], refusals: [], overage: null });
+      const g = groups.get(key);
+      g.members.push(m);
+      if (m.refusal) { g.refusals.push(m); g.overage ??= m.overage; }
     }
-    g.ranked = [...votes.entries()].sort((a, b) => b[1].max - a[1].max || b[1].total - a[1].total);
-    g.strength = g.ranked[0]?.[1].max ?? 0;
-    g.start = g.resetsAt - spanOf(g.type);
-    g.first = g.members[0].ts;
-    // From the refusal to the reset the account served nothing - unless overage
-    // was letting calls through.
-    g.block = g.refusals.length && !String(g.overage ?? '').startsWith('allowed')
-      ? [g.refusals[0].ts, g.resetsAt] : null;
-  }
+    for (const g of groups.values()) {
+      g.members.sort((a, b) => a.ts - b.ts);
+      g.refusals.sort((a, b) => a.ts - b.ts);
+      const votes = new Map();
+      // One vote per session, from the newest evidence at its latest record here.
+      for (const m of new Map(g.members.map((x) => [x.sid, x])).values()) {
+        const top = evidence(m.sid, m.dir, m.ts, false)[0];
+        if (!top) continue;
+        const v = votes.get(top[0].account) ?? { total: 0, max: 0 };
+        v.total += top[2]; v.max = Math.max(v.max, top[2]);
+        votes.set(top[0].account, v);
+      }
+      g.ranked = [...votes.entries()].sort((a, b) => b[1].max - a[1].max || b[1].total - a[1].total);
+      g.strength = g.ranked[0]?.[1].max ?? 0;
+      g.start = g.resetsAt - spanOf(g.type);
+      g.first = g.members[0].ts;
+      // From the refusal to the reset the account served nothing - unless overage
+      // was letting calls through.
+      g.block = g.refusals.length && !String(g.overage ?? '').startsWith('allowed')
+        ? [g.refusals[0].ts, g.resetsAt] : null;
+    }
+    return [...groups.values()];
+  };
 
   const owned = new Map();      // `${acct}|${type}` -> its windows
   const opens = new Map();      // acct -> when its five-hour windows opened
   const blocked = new Map();    // acct -> spans it could serve nothing
-  const groupAccount = new Map();
+  const groupAccount = new Map();   // group key -> account
+  const groupTier = new Map();      // group key -> the timeline its members' evidence went to
+  const markAccount = new Map();    // `${type}|${sid}|${ts}` -> account, for each refusal and reading
   const fits = (acct, g) => {
     if ((owned.get(`${acct}|${g.type}`) ?? []).some(([s0, e0]) => s0 < g.resetsAt && g.start < e0)) return false;
     if (g.type === 'five_hour' && (blocked.get(acct) ?? []).some(([f, u]) => f <= g.start && u >= g.start + SLOT)) return false;
@@ -574,7 +611,11 @@ function createResolver(d) {
     if (g.type === 'five_hour') { if (!opens.has(acct)) opens.set(acct, []); opens.get(acct).push(g.start); }
     if (g.block) { if (!blocked.has(acct)) blocked.set(acct, []); blocked.get(acct).push(g.block); }
     groupAccount.set(g.key, acct);
-    for (const m of g.members) push(tier, m.sid, m.ts, acct);
+    groupTier.set(g.key, tier);
+    for (const m of g.members) {
+      push(tier, m.sid, m.ts, acct);
+      markAccount.set(`${g.type}|${m.sid}|${m.ts}`, acct);
+    }
     // A five-hour window opens with a call, so a refused session's calls since
     // it opened were the refused account's too - unless its own records or its
     // watched profile show it arriving there part-way.
@@ -585,26 +626,55 @@ function createResolver(d) {
       push(tier, m.sid, c, acct);
     }
   };
-  for (const g of [...groups.values()].sort((a, b) => b.strength - a.strength || a.first - b.first)) {
-    const pick = g.ranked.find(([acct]) => fits(acct, g));
-    // A refusal corroborated by strong evidence is itself strong evidence.
-    if (pick) assign(g, pick[0], pick[1].max >= WEIGHT.O ? S : C);
-  }
-  // A group nothing could settle goes to the most recent account seen in its
-  // profile that could have held the window. Never a later one: history must
-  // not drift onto an account signed in afterwards.
-  for (const g of [...groups.values()].filter((x) => !groupAccount.has(x.key)).sort((a, b) => a.first - b.first)) {
-    const tried = new Set();
-    for (const dir of new Set(g.members.map((m) => m.dir).filter(Boolean))) {
-      const tl = F.get(dir) ?? [];
-      const j = firstAfter(tl, g.first);
-      for (let i = (j === -1 ? tl.length : j) - 1; i >= 0 && !groupAccount.has(g.key); i--) {
-        const a = tl[i].account;
-        if (tried.has(a)) continue;
-        tried.add(a);
-        if (fits(a, g)) assign(g, a, C);
+  // `known(g)` names the account a group must be, when something stronger than
+  // its vote already says - the weekly window its five-hour readings went with.
+  const settle = (list, known = () => null) => {
+    for (const g of [...list].sort((a, b) => b.strength - a.strength || a.first - b.first)) {
+      const k = known(g);
+      if (k && fits(k.account, g)) { assign(g, k.account, k.tier); continue; }
+      const pick = g.ranked.find(([acct]) => fits(acct, g));
+      // A refusal corroborated by strong evidence is itself strong evidence.
+      if (pick) assign(g, pick[0], pick[1].max >= WEIGHT.O ? S : C);
+    }
+    // A group nothing could settle goes to the most recent account seen in its
+    // profile that could have held the window. Never a later one: history must
+    // not drift onto an account signed in afterwards.
+    for (const g of list.filter((x) => !groupAccount.has(x.key)).sort((a, b) => a.first - b.first)) {
+      const tried = new Set();
+      for (const dir of new Set(g.members.map((m) => m.dir).filter(Boolean))) {
+        const tl = F.get(dir) ?? [];
+        const j = firstAfter(tl, g.first);
+        for (let i = (j === -1 ? tl.length : j) - 1; i >= 0 && !groupAccount.has(g.key); i--) {
+          const a = tl[i].account;
+          if (tried.has(a)) continue;
+          tried.add(a);
+          if (fits(a, g)) assign(g, a, C);
+        }
       }
     }
+  };
+
+  settle(build(marks.filter((m) => m.type === 'seven_day'), weekKey));
+  // Five-hour readings go with the account of the weekly window read alongside.
+  const weekGroup = (m) => {
+    const w = m.sid ? weekOf(m.sid, m.ts) : null;
+    return w && groupAccount.has(weekKey(w)) ? weekKey(w) : null;
+  };
+  const rest = build(marks.filter((m) => m.type !== 'seven_day'), (m) => {
+    if (m.type !== 'five_hour') return `${m.type}|${m.resetsAt}`;
+    const w = weekGroup(m);
+    return `five_hour|${m.resetsAt}|${w ? groupAccount.get(w) : ''}`;
+  });
+  settle(rest, (g) => {
+    if (g.type !== 'five_hour') return null;
+    const w = g.members.map(weekGroup).find(Boolean);
+    return w ? { account: groupAccount.get(w), tier: groupTier.get(w) } : null;
+  });
+  // By reset alone, for anything not settled as one of the marks above.
+  const byReset = new Map();
+  for (const [key, acct] of groupAccount) {
+    const [type, reset] = key.split('|');
+    if (!byReset.has(`${type}|${reset}`)) byReset.set(`${type}|${reset}`, acct);
   }
   sortAll(S); sortAll(C);
 
@@ -666,7 +736,9 @@ function createResolver(d) {
     }
     return [null, null];
   };
-  resolve.groupAccount = (type, resetsAtSec) => groupAccount.get(`${type}|${resetsAtSec}`) ?? null;
+  // The account a refusal or reading was settled on: by the mark itself, else by its reset.
+  resolve.groupAccount = (type, resetsAtSec, sid, ts) =>
+    markAccount.get(`${type}|${sid}|${ts}`) ?? byReset.get(`${type}|${resetsAtSec}`) ?? null;
   return resolve;
 }
 
@@ -695,14 +767,14 @@ export function attributeEvents({ since = 0, all = false, includeNull = true } =
     for (const l of d.prepare(`SELECT l.id, l.session_id, l.ts, l.limit_type, l.resets_at, COALESCE(l.config_dir, s.config_dir) config_dir FROM limit_events l
         LEFT JOIN sessions s ON s.session_id = l.session_id
         WHERE ${includeNull || all ? 'l.account_uuid IS NULL OR ' : ''}l.ts >= ?`).all(all ? 0 : since)) {
-      const acct = resolve.groupAccount(l.limit_type, l.resets_at) ?? resolve(l.session_id, l.config_dir, l.ts)[0];
+      const acct = resolve.groupAccount(l.limit_type, l.resets_at, l.session_id, l.ts) ?? resolve(l.session_id, l.config_dir, l.ts)[0];
       if (acct) d.prepare('UPDATE limit_events SET account_uuid = ? WHERE id = ?').run(acct, l.id);
     }
     // So does a status-line reading: its reset time says whose window it read.
     const updU = d.prepare('UPDATE utilization SET account_uuid = ? WHERE rowid = ?');
     const from = all ? 0 : Math.min(since, Date.now() - 8 * 86400e3);
-    for (const u of d.prepare('SELECT rowid id, limit_type, resets_at, account_uuid FROM utilization WHERE resets_at IS NOT NULL AND ts >= ?').all(from)) {
-      const acct = resolve.groupAccount(u.limit_type, Math.round(u.resets_at / 1000));
+    for (const u of d.prepare('SELECT rowid id, limit_type, resets_at, account_uuid, session_id, ts FROM utilization WHERE resets_at IS NOT NULL AND ts >= ?').all(from)) {
+      const acct = resolve.groupAccount(u.limit_type, Math.round(u.resets_at / 1000), u.session_id, u.ts);
       if (acct && acct !== u.account_uuid) updU.run(acct, u.id);
     }
   });
