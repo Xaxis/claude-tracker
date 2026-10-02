@@ -5,6 +5,7 @@ import { db, getMeta, setMeta } from './db.js';
 import { discoverProfiles, tildify, HOME, configFileOf } from './paths.js';
 import { profileAccount } from './accounts.js';
 import { readSignin, writeSignin, switchSignin, withStorageLock } from './signin.js';
+import { machine } from './replica.js';
 
 /**
  * Failing over: when the account a profile is signed into runs low, sign the
@@ -62,6 +63,19 @@ export function level(a) {
 
 const readJson = (f) => { try { return JSON.parse(fs.readFileSync(f, 'utf8')); } catch { return null; } };
 
+/**
+ * Among spares equally good, which this machine takes: each machine synced
+ * with takes its own turn, so two running low together on one account do not
+ * pile onto one spare.
+ */
+function turnOf(group) {
+  if (group.length < 2) return group[0] ?? null;
+  const me = machine().id;
+  const ids = [me, ...db().prepare('SELECT machine_id FROM sync_machines').all().map((r) => r.machine_id)].sort();
+  const sorted = [...group].sort((x, y) => String(x.accountUuid).localeCompare(String(y.accountUuid)));
+  return sorted[ids.indexOf(me) % sorted.length];
+}
+
 /** This machine's spares: what each is for, and the account whose sign-in it holds now, if any. */
 export function spares() {
   let names = [];
@@ -114,12 +128,15 @@ export function plan(ov, live, settings = failoverSettings(), now = Date.now(), 
     if (!signed) continue;
     const a = accounts.get(signed.accountUuid);
     const lvl = level(a);
-    const target = held
+    // Most room - within 5 points counts as equal - and, between equals, one no
+    // other machine is using; then this machine's turn among what is left.
+    const rank = (x) => [Math.round(x.room / 5), elsewhere.has(x.accountUuid) ? 0 : 1];
+    const options = held
       .filter((s) => s.accountUuid && s.accountUuid !== signed.accountUuid)
       .map((s) => ({ ...s, label: accounts.get(s.accountUuid)?.label ?? s.email, room: headroom(accounts.get(s.accountUuid)) }))
       .filter((s) => s.room >= MIN_ROOM)
-      // Most room first; between equals, one no other machine is using.
-      .sort((x, y) => y.room - x.room || Number(elsewhere.has(x.accountUuid)) - Number(elsewhere.has(y.accountUuid)))[0] ?? null;
+      .sort((x, y) => rank(y)[0] - rank(x)[0] || rank(y)[1] - rank(x)[1]);
+    const target = turnOf(options.filter((x) => options.length && String(rank(x)) === String(rank(options[0]))));
     // Out, but back within the wait: not worth a switch.
     const freesAt = a && !a.available.now ? a.available.at : null;
     const soon = freesAt != null && freesAt - now < settings.waitMin * 60e3;
