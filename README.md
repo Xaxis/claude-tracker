@@ -80,6 +80,9 @@ Run it from any directory once linked:
 | `claude-tracker service install` | keep it running in the background from login (macOS, Linux) |
 | `claude-tracker sync add me@devbox` | sync with the tracker on another machine, over ssh |
 | `claude-tracker sync` | which machines it syncs with, and how that is going |
+| `claude-tracker failover` | where sessions go when their account runs low |
+| `claude-tracker failover on` | move them automatically |
+| `claude-tracker pool add me@example.com` | sign another account into its own profile, as a place to move to |
 
 Or from inside the repo, without linking — `yarn` and `npm run` both work:
 
@@ -311,6 +314,57 @@ How it works:
 hostname until you do. If ssh needs something unusual to find the command on
 the other machine, pass it: `sync add me@devbox --command "node ~/claude-tracker/bin/cli.js sync serve"`.
 
+### When an account is free again
+
+Every account says whether it can take a request now, and if not, when it can:
+`out until 21:40` in the terminal, a pill on the card in the browser. An account
+is out while any window is full - refused by the API, or read or carried to 100% -
+and free again when the last of those resets. A window whose time is up reads
+empty: the next request opens a fresh one. A reading Claude Code reported is
+`exact`; once calls made since are added to it, it is `≈ carried`. Out until a
+time marked `≈` rests on such an estimate.
+
+The account a reading belongs to is worked out, since a status line does not say
+whose numbers it shows. Two things matter most. A session repeats the email it
+started with on later turns, even after a `/login` elsewhere has moved it, so only
+a change in a session's own records counts as news. And a status line reads both
+of its account's windows at once, so weekly windows are settled first and each
+five-hour reading goes with the weekly window read alongside it - two accounts
+whose five-hour windows reset at the same moment stay two accounts.
+
+### Failing over
+
+When the account your sessions are on runs low, the tracker can carry them to the
+account with the most room:
+
+```sh
+claude-tracker pool add me@example.com    # once per account, per machine: a browser login
+claude-tracker failover on                # move at 90% (--at to change)
+```
+
+Signing in takes a browser, so the tracker never does it - `pool add` creates a
+profile (`~/.claude-me`), copies your settings into it and links your
+instructions and agents, then opens Claude Code's own login once. From then on
+that profile stays signed in, and a session can be started on it at any time.
+
+When an account in use crosses the threshold, each of its sessions is moved as
+soon as it is idle - one mid-turn finishes the turn, or is refused, first - so the
+old and the new never work at once. A move copies the session's transcript into
+the profile with the most room and resumes it there, forked, as a background
+session: `claude attach <id>` opens it, and the dashboards and a notification
+give the exact command. A session cut off by a refusal is told to carry on where
+it stopped; one that was waiting for you waits for you. A background original is
+stopped; an interactive one is yours to close. Nothing moves when the account
+frees up within 15 minutes (`--wait`).
+
+The plan is always on show, switched on or not: in the terminal under `USE NOW`,
+in the browser as a Failover panel, and with `claude-tracker failover` - each
+account in use, how full it is, and where its sessions would go. Each machine
+moves its own sessions through its own profiles; synced machines show each
+other's plans. When no profile on a machine is signed into an account with room,
+it says so and names the account with the most, with the `pool add` that would
+make it a target. `claude-tracker failover move <session>` moves one now.
+
 ### Realtime
 
 Both dashboards run off one watcher inside the tracker process:
@@ -514,6 +568,7 @@ depend on your own usage history.
 | `src/service.js` | the login service: launchd or systemd |
 | `src/replica.js` | what syncing copies between machines, and how it merges |
 | `src/sync.js` | the sync connection: ssh, the relay, the protocol |
+| `src/failover.js` | where sessions go when their account runs low, and moving them |
 | `src/billing.js` | projects the subscription cycle from its start date |
 | `src/api.js` | aggregation for both dashboards |
 | `src/tui.js` | terminal dashboard |

@@ -22,7 +22,7 @@ function claim(key) {
   catch { return false; }
 }
 
-function send(title, message) {
+export function send(title, message) {
   if (process.platform !== 'darwin' || process.env.CLAUDE_TRACKER_NOTIFY === '0') return;
   const q = (s) => String(s).replace(/\\/g, '\\\\').replace(/"/g, '\\"');
   execFile('osascript', ['-e', `display notification "${q(message)}" with title "${q(title)}"`], () => {});

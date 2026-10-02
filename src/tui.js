@@ -143,6 +143,36 @@ function clockAt(ts, now) {
   return `${day}${hm} (in ${duration(ts - now)})`;
 }
 
+/**
+ * Where sessions go when their account runs low, machine by machine, and what
+ * was moved in the last few hours. Nothing when nothing is running anywhere.
+ */
+function failoverLines(f, here, now) {
+  if (!f) return [];
+  const plans = [{ machine: here ?? 'here', mode: f.mode, at: f.at, ...(f.plan ?? { entries: [] }), local: true }, ...f.remote];
+  const rows = [];
+  for (const p of plans) {
+    for (const e of p.entries ?? []) {
+      const who = `${A.bold}${e.label}${A.reset} ${C.muted}${Math.round(e.level)}%${plans.length > 1 ? ` on ${p.machine}` : ''}${C.reset}`;
+      const to = e.target
+        ? `${C.accent}${e.target.label}${C.reset} ${C.muted}${e.target.shown} · ${Math.round(e.target.room)}% free${C.reset}`
+        : `${C.critical}nowhere${C.reset} ${C.muted}- no other account with room signed in there${C.reset}`;
+      const state = p.mode !== 'auto' ? `${C.muted}(off)${C.reset}`
+        : e.due && e.target ? `${C.warning}moving idle sessions${C.reset}` : `${C.muted}at ${p.at}%${C.reset}`;
+      rows.push(`  ${C.muted}↪${C.reset} ${who} → ${to}  ${state}`);
+    }
+    if (p.local && p.best) rows.push(`    ${C.muted}${p.best.label} has ${Math.round(p.best.room)}% free: claude-tracker pool add ${p.best.email}${C.reset}`);
+  }
+  for (const m of (f.moves ?? []).filter((x) => now - x.ts < 6 * 3600e3).slice(0, 3)) {
+    rows.push(m.status === 'started'
+      ? `    ${C.good}moved${C.reset} ${m.name} → ${m.to}  ${C.muted}${m.attach}${C.reset}`
+      : `    ${C.critical}not moved${C.reset} ${m.name}: ${C.muted}${m.error}${C.reset}`);
+  }
+  if (!rows.length) return [];
+  const head = f.mode === 'auto' ? `${C.good}FAILOVER${C.reset} ${C.muted}on at ${f.at}%${C.reset}` : `${C.muted}FAILOVER off · claude-tracker failover on${C.reset}`;
+  return [`  ${head}`, ...rows];
+}
+
 /** The machines this one syncs with, for the header: bright while they report, dim once they stop. */
 function syncMark(sync, now) {
   if (!sync) return '';
@@ -273,6 +303,7 @@ export function startTui({ webUrl, onQuit }) {
     } else {
       L.push(`  ${C.critical}Every account is refused right now${C.reset} ${C.muted}- see resets below${C.reset}`);
     }
+    for (const line of failoverLines(ov.failover, ov.sync?.name, now)) L.push(line);
     L.push('');
 
     // ---- running now, each with the account it is billing *right now*

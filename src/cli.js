@@ -272,6 +272,137 @@ async function cmdService(action, flags) {
   }
 }
 
+/* --- failing over ---------------------------------------------------------- */
+
+const pct = (n) => `${Math.round(n)}%`;
+const when = (ts) => new Date(ts).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+
+/** One line per account in use somewhere: how full, and where its sessions go. */
+function printPlan(p, machine, settings) {
+  if (!p.entries.length) { console.log(`  ${c.dim}${machine}: no sessions running${c.reset}`); return; }
+  for (const e of p.entries) {
+    const head = `  ${c.bold}${e.label}${c.reset} ${c.dim}on ${machine} · ${pct(e.level)} of its fullest window${c.reset}`;
+    const where = e.target
+      ? `${e.due ? `${c.yellow}moving` : 'would move'}${c.reset} to ${c.bold}${e.target.label}${c.reset} ${c.dim}(${e.target.shown} · ${pct(e.target.room)} free)${c.reset}`
+      : `${c.red}nowhere to move to${c.reset} ${c.dim}- no other account with room is signed in on ${machine}${c.reset}`;
+    const at = e.due ? '' : ` ${c.dim}at ${settings.at}%${c.reset}`;
+    console.log(`${head}\n    ${where}${at}`);
+  }
+  if (p.best) {
+    console.log(`  ${c.dim}${p.best.label} has ${pct(p.best.room)} free but is signed in nowhere on ${machine}${c.reset}`);
+    if (p.best.email && machine === 'this machine') console.log(`  ${c.dim}  add it: claude-tracker pool add ${p.best.email}${c.reset}`);
+  }
+}
+
+async function cmdFailover(action, args, flags) {
+  const F = await import('./failover.js');
+  if (action === 'on' || action === 'off') {
+    const at = flags.at != null ? Number(flags.at) : undefined;
+    const waitMin = flags.wait != null ? Number(flags.wait) : undefined;
+    if ((at != null && !(at > 0 && at <= 100)) || (waitMin != null && !(waitMin >= 0))) {
+      console.error('usage: claude-tracker failover on [--at 1-100] [--wait minutes]'); process.exitCode = 1; return;
+    }
+    const s = F.setFailover({ mode: action === 'on' ? 'auto' : 'off', at, waitMin });
+    console.log(s.mode === 'auto'
+      ? `${c.green}✓${c.reset} failing over at ${s.at}% - idle sessions on an account that full move to the account here with the most room`
+      : `${c.green}✓${c.reset} failover off - the plan is still shown, nothing is moved`);
+    return;
+  }
+  const ov = overview();
+  const live = liveSessions();
+  if (action === 'move') {
+    const q = args[0];
+    const s = live.find((x) => !x.machine && (x.sessionId.startsWith(q ?? '\0') || x.name === q));
+    if (!s) { console.error(`No session running here is called "${q ?? ''}". See: claude-tracker failover`); process.exitCode = 1; return; }
+    const p = F.plan(ov, live);
+    let target = p.entries.find((e) => e.account === s.accountUuid)?.target;
+    if (flags.to) {
+      const profile = F.pool().find((x) => x.email?.toLowerCase() === String(flags.to).toLowerCase());
+      if (!profile) { console.error(`No profile here is signed into ${flags.to}. Add one: claude-tracker pool add ${flags.to}`); process.exitCode = 1; return; }
+      target = profile;
+    }
+    if (!target) { console.error('There is no other account with room signed in on this machine.'); process.exitCode = 1; return; }
+    console.log(`${c.dim}moving ${s.name ?? s.sessionId.slice(0, 8)} to ${target.label ?? target.email}…${c.reset}`);
+    const m = await F.move(s, target, { fromAccount: s.accountUuid });
+    if (m.status !== 'started') { console.error(`${c.red}✗${c.reset} ${m.error}`); process.exitCode = 1; return; }
+    console.log(`${c.green}✓${c.reset} it carries on in the background${m.continued ? ', picking up where it was cut off' : ''}. Open it:\n  ${F.attachCommand(m)}`);
+    return;
+  }
+
+  const s = F.failoverSettings();
+  console.log(`\n${c.bold}Failover${c.reset}  ${s.mode === 'auto' ? `${c.green}on${c.reset} at ${s.at}%` : `${c.dim}off${c.reset} ${c.dim}(claude-tracker failover on)${c.reset}`}${s.mode === 'auto' && s.waitMin ? ` ${c.dim}· not when the account frees up within ${s.waitMin}m${c.reset}` : ''}\n`);
+  printPlan(F.plan(ov, live, s), 'this machine', s);
+  for (const r of ov.failover.remote) {
+    console.log();
+    printPlan({ entries: r.entries.map((e) => ({ ...e, target: e.target && { ...e.target } })), best: r.best }, r.machine, { at: r.at });
+  }
+  const moves = ov.failover.moves;
+  if (moves.length) {
+    console.log(`\n${c.bold}Moved today${c.reset}`);
+    for (const m of moves) {
+      console.log(`  ${when(m.ts)}  ${m.name} ${c.dim}${m.from} →${c.reset} ${m.to}  ${m.status === 'started' ? `${c.dim}${m.attach}${c.reset}` : `${c.red}${m.error}${c.reset}`}`);
+    }
+  }
+  console.log();
+}
+
+async function cmdPool(action, args, flags) {
+  const F = await import('./failover.js');
+  if (action === 'add') {
+    const email = args[0];
+    if (!email || !/^[^\s@]+@[^\s@]+$/.test(email)) { console.error('usage: claude-tracker pool add <email> [--as <name>]'); process.exitCode = 1; return; }
+    const { HOME, configFileOf, discoverProfiles } = await import('./paths.js');
+    const { profileAccount } = await import('./accounts.js');
+    const fs = await import('node:fs');
+    const path = await import('node:path');
+    const { spawn } = await import('node:child_process');
+    const already = F.pool().find((p) => p.email?.toLowerCase() === email.toLowerCase());
+    if (already) { console.log(`${email} is already signed in on this machine, in ${already.shown}.`); return; }
+    const name = String(flags.as ?? email.split('@')[0]).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+    const dir = path.join(HOME, `.claude-${name}`);
+    fs.mkdirSync(path.join(dir, 'projects'), { recursive: true });
+    // Carry over how Claude Code is set up here, so a session moved into this
+    // profile behaves as it did: settings copied, instructions and agents linked.
+    const main = discoverProfiles().find((p) => p.isDefault);
+    if (main) {
+      const from = (f) => path.join(main.dir, f);
+      if (fs.existsSync(from('settings.json')) && !fs.existsSync(path.join(dir, 'settings.json'))) fs.copyFileSync(from('settings.json'), path.join(dir, 'settings.json'));
+      for (const f of ['CLAUDE.md', 'agents', 'commands', 'skills', 'output-styles']) {
+        if (!fs.existsSync(from(f)) || fs.existsSync(path.join(dir, f))) continue;
+        try { fs.symlinkSync(fs.realpathSync(from(f)), path.join(dir, f)); } catch { /* not linkable here */ }
+      }
+    }
+    console.log(`Signing ${email} into ${dir.replace(HOME, '~')} - finish the login in your browser.\n`);
+    const code = await new Promise((resolve) => {
+      const child = spawn(process.env.CLAUDE_TRACKER_CLAUDE || 'claude', ['auth', 'login', '--email', email],
+        { env: { ...process.env, CLAUDE_CONFIG_DIR: dir }, stdio: 'inherit' });
+      child.on('error', () => resolve(-1));
+      child.on('close', resolve);
+    });
+    const who = profileAccount({ dir, configFile: configFileOf(dir) });
+    if (code !== 0 || !who) { console.error(`\n${c.red}✗${c.reset} not signed in - run it again when ready: claude-tracker pool add ${email}`); process.exitCode = 1; return; }
+    const note = who.email?.toLowerCase() === email.toLowerCase() ? '' : ` ${c.yellow}(not ${email} - the browser signed in as someone else)${c.reset}`;
+    console.log(`\n${c.green}✓${c.reset} ${dir.replace(HOME, '~')} is signed in as ${c.bold}${who.email}${c.reset}${note}; sessions can now be moved to it.`);
+    return;
+  }
+
+  const ov = overview();
+  const byUuid = new Map(ov.accounts.map((a) => [a.accountUuid, a]));
+  const room = (uuid) => { const a = byUuid.get(uuid); return a ? (a.available.now ? `${pct(F.headroom(a))} free` : `out until ${when(a.available.at)}`) : ''; };
+  console.log(`\n${c.bold}Signed-in profiles - where sessions can be moved${c.reset}\n`);
+  for (const p of F.pool()) console.log(`  ${pad(p.shown, 22)} ${pad(p.email ?? p.accountUuid, 28)} ${c.dim}${room(p.accountUuid)}${c.reset}`);
+  for (const m of (await import('./replica.js')).remoteMachines()) {
+    for (const p of m.profiles.filter((x) => x.accountUuid)) console.log(`  ${pad(`${p.dir} (${m.name})`, 22)} ${pad(p.email ?? p.accountUuid, 28)} ${c.dim}${room(p.accountUuid)}${c.reset}`);
+  }
+  const signed = new Set([...F.pool().map((p) => p.accountUuid)]);
+  const missing = ov.accounts.filter((a) => !signed.has(a.accountUuid) && a.available.now && a.email);
+  if (missing.length) {
+    console.log(`\n  ${c.dim}Not signed in on this machine:${c.reset}`);
+    for (const a of missing) console.log(`  ${pad(a.email, 50)} ${c.dim}${room(a.accountUuid)} · claude-tracker pool add ${a.email}${c.reset}`);
+  }
+  console.log();
+}
+
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const ago = (t) => (t ? `${duration(Date.now() - t)} ago` : 'never');
 
@@ -419,6 +550,10 @@ ${c.bold}claude-tracker${c.reset} — local usage and rate-limit tracking for Cl
   ${c.bold}service${c.reset} install|uninstall     run in the background at login (launchd or systemd)
   ${c.bold}sync${c.reset} add <ssh-host>           sync with the tracker on another machine, over ssh
   ${c.bold}sync${c.reset} [status]|remove <host>|name <name>
+  ${c.bold}failover${c.reset} [status]|on|off      move sessions off an account that runs low
+        ${c.dim}on [--at 90] [--wait 15]${c.reset}  at what fill, and not if it frees up that soon
+        ${c.dim}move <session> [--to <email>]${c.reset}  move one now
+  ${c.bold}pool${c.reset} [list]|add <email>        accounts signed in here, that sessions can move to
 
 ${c.dim}In the terminal dashboard: q quit · r refresh · a cycle account · w switch
 window · space pause · ↑↓/jk scroll${c.reset}
@@ -466,6 +601,8 @@ export async function runCli(argv) {
       case 'statusline': await cmdStatusline(rest[1] ?? 'status', flags); break;
       case 'service': await cmdService(rest[1] ?? 'status', flags); break;
       case 'sync': await cmdSync(rest[1] ?? 'status', rest.slice(2), flags); break;
+      case 'failover': await refresh({ quiet: true }); await cmdFailover(rest[1] ?? 'status', rest.slice(2), flags); break;
+      case 'pool': await cmdPool(rest[1] ?? 'list', rest.slice(2), flags); break;
       case 'models': await refresh({ quiet: true }); cmdModels(Number(flags.days ?? 30)); break;
       case 'verify': await refresh({ quiet: true }); cmdVerify(); break;
       case 'where':

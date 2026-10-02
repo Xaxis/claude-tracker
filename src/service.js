@@ -51,6 +51,7 @@ const SERVICES = {
   <key>WorkingDirectory</key><string>${esc(REPO_DIR)}</string>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
+  <key>AbandonProcessGroup</key><true/>
   <key>ThrottleInterval</key><integer>10</integer>
   <key>StandardOutPath</key><string>${esc(LOG)}</string>
   <key>StandardErrorPath</key><string>${esc(LOG)}</string>
@@ -135,6 +136,9 @@ WorkingDirectory=${pct(REPO_DIR)}
 ${Object.entries(env).map(([k, v]) => `Environment=${q(`${k}=${v}`)}`).join('\n')}
 Restart=always
 RestartSec=10
+# Sessions it starts when failing over are its children until Claude Code's own
+# daemon takes them; stopping the tracker must not take them with it.
+KillMode=process
 StandardOutput=append:${pct(LOG)}
 StandardError=append:${pct(LOG)}
 
