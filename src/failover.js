@@ -2,34 +2,34 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { db, getMeta, setMeta } from './db.js';
-import { discoverProfiles, tildify, DATA_DIR } from './paths.js';
+import { discoverProfiles, tildify, HOME, configFileOf } from './paths.js';
 import { profileAccount } from './accounts.js';
-import { linkMemory } from './pool.js';
+import { readSignin, writeSignin, switchSignin, withStorageLock } from './signin.js';
 
 /**
- * Failing over: when the account sessions here are running on is nearly out,
- * carry them to an account with room.
+ * Failing over: when the account a profile is signed into runs low, sign the
+ * profile into another account with room - what a /login in one of its sessions
+ * does - and every session running in it carries on as that account, mid-task.
  *
- * Signing an account in takes a browser, so the tracker never does it. What it
- * can do is start Claude Code under a profile already signed into another
- * account - each profile keeps its own sign-in. So the pool is this machine's
- * signed-in profiles, and a move resumes the session's conversation, forked, as
- * a background session under the profile with the most room; `claude attach`
- * opens it. Only an idle session is moved: one mid-turn finishes the turn, or
- * is refused, first, so the old and the new never work at once.
+ * Signing in takes a browser, so it is done once per account, ahead of time,
+ * into a spare: `~/.claude-pool-<name>`, a profile that only holds a sign-in
+ * while its account is not in use. A switch moves the incoming account's
+ * sign-in out of its spare into the profile, and the outgoing one into a spare
+ * of its own. Moved, never copied: each token refresh retires the token before
+ * it, so a sign-in left in two places would go stale in one of them.
  *
- * A window you are working in moves only once its account has run out: until
- * then your next message goes to it, and a copy started early would sit unused
- * while the two drifted apart. Its status line then says where the work went.
- * A background session, which nobody types into, moves as soon as it is due.
- *
- * Each machine moves its own sessions through its own profiles. Plans travel
- * with the sync state, so every dashboard shows every machine's.
+ * The tracker service is the one thing on a machine that switches - never the
+ * sessions themselves - and a profile it has just switched is left to settle,
+ * so each running low is handled once.
  */
 
 const CORE = ['five_hour', 'seven_day'];
-/** A target needs at least this much room in its tightest window to be worth moving to. */
+/** A target needs at least this much room in its tightest window to be worth switching to. */
 const MIN_ROOM = 15;
+/** After a switch, the profile's new account has time to show before another is considered. */
+const SETTLE_MS = 10 * 60e3;
+export const SPARE_PREFIX = '.claude-pool-';
+const MARK = '.claude-tracker-spare';
 
 export function failoverSettings() {
   return {
@@ -60,190 +60,154 @@ export function level(a) {
   return Math.max(0, ...a.limits.filter((l) => CORE.includes(l.type) && l.active).map((l) => l.percent));
 }
 
-/** This machine's signed-in profiles: the accounts a session here can be moved to. */
-export function pool() {
-  return discoverProfiles().map((p) => {
-    const a = profileAccount(p);
-    return a ? { dir: p.dir, shown: tildify(p.dir), name: p.name, isDefault: p.isDefault, accountUuid: a.accountUuid, email: a.email } : null;
+const readJson = (f) => { try { return JSON.parse(fs.readFileSync(f, 'utf8')); } catch { return null; } };
+
+/** This machine's spares: what each is for, and the account whose sign-in it holds now, if any. */
+export function spares() {
+  let names = [];
+  try { names = fs.readdirSync(HOME); } catch { return []; }
+  return names.filter((n) => n.startsWith(SPARE_PREFIX)).map((n) => {
+    const dir = path.join(HOME, n);
+    const mark = readJson(path.join(dir, MARK));
+    if (!mark) return null;
+    const a = profileAccount({ dir, configFile: configFileOf(dir) });
+    return { dir, shown: tildify(dir), isDefault: false, for: mark.email ?? null, accountUuid: a?.accountUuid ?? null, email: a?.email ?? null };
   }).filter(Boolean);
 }
 
+/** Make a spare for `email` - empty until a sign-in is put in it. */
+export function makeSpare(email, name = email.split('@')[0]) {
+  const base = String(name).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') || 'account';
+  let dir = path.join(HOME, `${SPARE_PREFIX}${base}`);
+  for (let i = 2; fs.existsSync(dir) && readJson(path.join(dir, MARK))?.email?.toLowerCase() !== email.toLowerCase(); i++) {
+    dir = path.join(HOME, `${SPARE_PREFIX}${base}-${i}`);
+  }
+  fs.mkdirSync(path.join(dir, 'projects'), { recursive: true, mode: 0o700 });
+  fs.writeFileSync(path.join(dir, MARK), JSON.stringify({ email }));
+  return { dir, shown: tildify(dir), isDefault: false, for: email, accountUuid: null, email: null };
+}
+
+/** The spare an account's sign-in goes into when its profile switches away from it. */
+function spareOf(email, list = spares()) {
+  const e = email?.toLowerCase();
+  return list.find((s) => s.for?.toLowerCase() === e && !s.accountUuid) ?? makeSpare(email ?? 'account@unknown');
+}
+
 /**
- * For each account sessions here are running on: how full it is, whether it is
- * due to move, and where to. Also the account with the most room that no
- * profile here is signed into, when it would beat the best target here.
+ * For each profile sessions are running in here: the account it is signed
+ * into, how full that is, whether it is due to switch, and to which spare's
+ * account. Also the account with the most room that has no spare here, when
+ * it would beat every one that has.
  */
-export function plan(ov, live, settings = failoverSettings(), now = Date.now(), profiles = pool()) {
+export function plan(ov, live, settings = failoverSettings(), now = Date.now(), held = spares(), profiles = discoverProfiles()) {
   const accounts = new Map(ov.accounts.map((a) => [a.accountUuid, a]));
   const elsewhere = new Set(live.filter((s) => s.machine).map((s) => s.accountUuid));
-  // One way into each account here: the first profile signed into it.
-  const ways = new Map();
-  for (const p of profiles) if (!ways.has(p.accountUuid)) ways.set(p.accountUuid, p);
-  const here = new Map();
+  const working = new Map();
   for (const s of live) {
-    if (s.machine || !s.accountUuid) continue;
-    if (!here.has(s.accountUuid)) here.set(s.accountUuid, []);
-    here.get(s.accountUuid).push(s);
+    if (s.machine || !s.profileDir) continue;
+    working.set(s.profileDir, (working.get(s.profileDir) ?? 0) + 1);
   }
   const entries = [];
-  for (const [acct, sessions] of here) {
-    const a = accounts.get(acct);
+  for (const [dir, sessions] of working) {
+    const profile = profiles.find((p) => p.dir === dir);
+    const signed = profile && profileAccount(profile);
+    if (!signed) continue;
+    const a = accounts.get(signed.accountUuid);
     const lvl = level(a);
-    // Most room first; between equals, one no other machine is using.
-    const target = [...ways.values()]
-      .filter((p) => p.accountUuid !== acct)
-      .map((p) => ({ ...p, label: accounts.get(p.accountUuid)?.label ?? p.email, room: headroom(accounts.get(p.accountUuid)) }))
-      .filter((c) => c.room >= MIN_ROOM)
+    const target = held
+      .filter((s) => s.accountUuid && s.accountUuid !== signed.accountUuid)
+      .map((s) => ({ ...s, label: accounts.get(s.accountUuid)?.label ?? s.email, room: headroom(accounts.get(s.accountUuid)) }))
+      .filter((s) => s.room >= MIN_ROOM)
+      // Most room first; between equals, one no other machine is using.
       .sort((x, y) => y.room - x.room || Number(elsewhere.has(x.accountUuid)) - Number(elsewhere.has(y.accountUuid)))[0] ?? null;
-    // Out, but back within the wait: not worth a move.
+    // Out, but back within the wait: not worth a switch.
     const freesAt = a && !a.available.now ? a.available.at : null;
     const soon = freesAt != null && freesAt - now < settings.waitMin * 60e3;
     entries.push({
-      account: acct, label: a?.label ?? acct, level: lvl, due: lvl >= settings.at && !soon, out: !!a && !a.available.now, freesAt,
-      target: target && { accountUuid: target.accountUuid, label: target.label, room: target.room, dir: target.dir, shown: target.shown, isDefault: target.isDefault },
-      sessions: sessions.map((s) => ({ sessionId: s.sessionId, name: s.name, status: s.status })),
+      dir, profile: tildify(dir), isDefault: !!profile.isDefault, sessions,
+      account: signed.accountUuid, email: signed.email, label: a?.label ?? signed.email ?? signed.accountUuid,
+      level: lvl, due: lvl >= settings.at && !soon, out: !!a && !a.available.now, freesAt,
+      target: target && { accountUuid: target.accountUuid, label: target.label, email: target.email, room: target.room, dir: target.dir, shown: target.shown },
     });
   }
+  const covered = new Set([...held.map((s) => s.accountUuid), ...entries.map((e) => e.account)]);
   const top = Math.max(0, ...entries.map((e) => e.target?.room ?? 0));
   const best = ov.accounts
-    .filter((a) => a.available.now && !ways.has(a.accountUuid))
+    .filter((a) => a.available.now && !covered.has(a.accountUuid) && a.email)
     .map((a) => ({ accountUuid: a.accountUuid, label: a.label, email: a.email, room: headroom(a) }))
     .sort((x, y) => y.room - x.room)[0] ?? null;
   return { ...settings, entries, best: best && best.room >= top + 10 ? best : null };
 }
 
-/** Where a conversation's transcript lives in a profile, if it is there. */
-function findTranscript(dir, id) {
-  const projects = path.join(dir, 'projects');
-  let slugs = [];
-  try { slugs = fs.readdirSync(projects); } catch { return null; }
-  for (const slug of slugs) {
-    const file = path.join(projects, slug, `${id}.jsonl`);
-    if (fs.existsSync(file)) return { slug, file };
-  }
-  return null;
-}
-
-/** Was the conversation cut off by a refusal - refused after its last call? */
-function cutOff(id) {
-  const d = db();
-  const refused = d.prepare("SELECT MAX(ts) t FROM limit_events WHERE session_id = ? AND status = 'rejected'").get(id)?.t;
-  const called = d.prepare('SELECT MAX(ts) t FROM events WHERE session_id = ?').get(id)?.t;
-  return refused != null && (called == null || refused > called);
-}
-
-/** Run Claude Code, as a given profile, and collect what it prints. */
-function claude(args, { dir, isDefault, cwd }) {
-  const env = { ...process.env };
-  // The default profile is the one with no CLAUDE_CONFIG_DIR: naming it moves its config file.
-  delete env.CLAUDE_CONFIG_DIR;
-  if (!isDefault) env.CLAUDE_CONFIG_DIR = dir;
-  return new Promise((resolve) => {
-    const child = spawn(process.env.CLAUDE_TRACKER_CLAUDE || 'claude', args, { cwd, env, stdio: ['ignore', 'pipe', 'pipe'] });
-    let out = '';
-    child.stdout.on('data', (b) => { out += b; });
-    child.stderr.on('data', (b) => { out += b; });
-    const timer = setTimeout(() => child.kill(), 60_000);
-    child.on('error', (err) => { clearTimeout(timer); resolve({ code: -1, out: err.code === 'ENOENT' ? 'claude is not installed or not on PATH' : err.message }); });
-    child.on('close', (code) => { clearTimeout(timer); resolve({ code, out }); });
-  });
-}
-
-export const CONTINUE = 'The previous session ran out of usage on its account partway through. Carry on where it left off.';
-
-/** The command that opens a moved session. */
-export function attachCommand(row) {
-  const dir = row.to_dir ?? row.dir;
-  const viaDefault = discoverProfiles().some((p) => p.isDefault && p.dir === dir);
-  return `${viaDefault ? '' : `CLAUDE_CONFIG_DIR=${tildify(dir)} `}claude attach ${row.bg_id}`;
-}
-
-/**
- * Move one session to the account `target`'s profile: copy its transcript
- * there, and fork it as a background session. A background original is
- * stopped once its replacement runs; an interactive one is the user's to close.
- */
-export async function move(session, target, { fromAccount = null } = {}) {
-  const id = session.transcriptId ?? session.sessionId;
-  const row = {
-    ts: Date.now(), session_id: session.sessionId, transcript_id: id, name: session.name ?? id.slice(0, 8), cwd: session.cwd,
-    from_account: fromAccount ?? session.accountUuid, to_account: target.accountUuid,
-    from_dir: session.profileDir, to_dir: target.dir, bg_id: null, continued: 0, status: 'failed', error: null,
-  };
-  const record = () => {
-    db().prepare(`INSERT INTO failovers (ts, session_id, transcript_id, name, cwd, from_account, to_account, from_dir, to_dir, bg_id, continued, status, error)
-      VALUES (@ts, @session_id, @transcript_id, @name, @cwd, @from_account, @to_account, @from_dir, @to_dir, @bg_id, @continued, @status, @error)`).run(row);
-    return row;
-  };
-  if (!session.cwd || !fs.existsSync(session.cwd)) { row.error = `its folder ${session.cwd ?? ''} is gone`; return record(); }
-  const src = session.profileDir && findTranscript(session.profileDir, id);
-  if (!src) { row.error = 'its transcript was not found'; return record(); }
-  try {
-    const dest = path.join(target.dir, 'projects', src.slug, `${id}.jsonl`);
-    fs.mkdirSync(path.dirname(dest), { recursive: true });
-    if (path.resolve(dest) !== path.resolve(src.file)) fs.copyFileSync(src.file, dest);
-  } catch (err) { row.error = `could not copy its transcript: ${err.message}`; return record(); }
-
-  // Its project's memories come with it: the target reads and writes the main profile's.
-  try { linkMemory(target.dir, src.slug, { create: true }); } catch { /* resumes without them */ }
-  row.continued = cutOff(id) ? 1 : 0;
-  const args = ['--resume', id, '--fork-session', '--bg', '-n', row.name];
-  if (row.continued) args.push(CONTINUE);
-  const r = await claude(args, { dir: target.dir, isDefault: target.isDefault, cwd: session.cwd });
-  const bg = /backgrounded\s*·\s*([0-9a-f]{6,})/i.exec(r.out)?.[1];
-  if (r.code !== 0 || !bg) { row.error = (r.out.trim().split('\n').pop() || `claude exited with ${r.code}`).slice(0, 300); return record(); }
-  row.bg_id = bg;
-  row.status = 'started';
-  record();
-  // Tell the old window, through its status line, where the work went on.
-  try {
-    const dir = path.join(DATA_DIR, 'moved');
-    fs.mkdirSync(dir, { recursive: true });
-    for (const f of fs.readdirSync(dir)) {
-      const file = path.join(dir, f);
-      if (Date.now() - fs.statSync(file).mtimeMs > 3 * 86400e3) fs.rmSync(file, { force: true });
-    }
-    fs.writeFileSync(path.join(dir, `${session.sessionId}.json`),
-      JSON.stringify({ to: target.label ?? target.email, attach: attachCommand(row), at: row.ts }));
-  } catch { /* the move stands; only the hint is missing */ }
-  const from = discoverProfiles().find((p) => p.dir === session.profileDir);
-  if (session.kind === 'background' && from) {
-    await claude(['stop', session.sessionId.slice(0, 8)], { dir: from.dir, isDefault: from.isDefault, cwd: session.cwd });
-  }
+function record(row) {
+  db().prepare(`INSERT INTO switches (ts, profile, from_account, to_account, spare, status, error)
+    VALUES (@ts, @profile, @from_account, @to_account, @spare, @status, @error)`).run(row);
   return row;
 }
 
-/** Sessions moved recently, newest first. */
-export function recentMoves(since = Date.now() - 24 * 3600e3) {
-  return db().prepare('SELECT * FROM failovers WHERE ts >= ? ORDER BY ts DESC LIMIT 50').all(since);
+/** Switch one profile to the account in `target`'s spare, now. */
+export function switchProfile(entry, target) {
+  const row = { ts: Date.now(), profile: entry.dir, from_account: entry.account, to_account: target.accountUuid, spare: target.dir, status: 'failed', error: null };
+  try {
+    const list = spares();
+    const spare = list.find((s) => s.dir === target.dir);
+    if (!spare?.accountUuid) throw new Error(`${target.shown} no longer holds a sign-in`);
+    switchSignin({ dir: entry.dir, isDefault: entry.isDefault, shown: entry.profile }, spare, spareOf(entry.email, list));
+    row.status = 'switched';
+  } catch (err) {
+    row.error = String(err.message ?? err).slice(0, 300);
+  }
+  return record(row);
+}
+
+/** Switches made recently, newest first. */
+export function recentSwitches(since = Date.now() - 24 * 3600e3) {
+  return db().prepare('SELECT * FROM switches WHERE ts >= ? ORDER BY ts DESC LIMIT 50').all(since);
 }
 
 /**
- * Carry out the plan: move every idle session on an account that is due, once.
- * Returns the moves made.
+ * Carry out the plan: switch every profile that is due and has somewhere to
+ * go - once, then leave it to settle. Returns the switches made.
  */
-let busy = false;
-export async function runFailover(ov, live, now = Date.now()) {
+export function runFailover(ov, live, now = Date.now()) {
   const settings = failoverSettings();
-  if (settings.mode !== 'auto' || busy) return [];
-  busy = true;
-  try {
-    const p = plan(ov, live, settings, now);
-    // Moved once is moved for good; a move that failed is tried again after ten minutes.
-    const done = new Set(db().prepare("SELECT session_id FROM failovers WHERE status = 'started' OR ts > ?")
-      .all(now - 10 * 60e3).map((r) => r.session_id));
-    const moves = [];
-    for (const e of p.entries) {
-      if (!e.due || !e.target) continue;
-      for (const s of live) {
-        if (s.machine || s.accountUuid !== e.account || s.status !== 'idle' || done.has(s.sessionId)) continue;
-        if (s.kind !== 'background' && !e.out) continue;
-        moves.push(await move(s, e.target, { fromAccount: e.account }));
-        done.add(s.sessionId);
-      }
-    }
-    return moves;
-  } finally {
-    busy = false;
+  if (settings.mode !== 'auto') return [];
+  const settling = db().prepare('SELECT profile FROM switches WHERE ts > ?').all(now - SETTLE_MS).map((r) => r.profile);
+  const made = [];
+  for (const e of plan(ov, live, settings, now).entries) {
+    if (!e.due || !e.target || settling.includes(e.dir)) continue;
+    made.push(switchProfile(e, e.target));
   }
+  return made;
+}
+
+/* --- adding accounts ---------------------------------------------------------- */
+
+function claude(args, env) {
+  return new Promise((resolve) => {
+    const child = spawn(process.env.CLAUDE_TRACKER_CLAUDE || 'claude', args, { env, stdio: 'inherit' });
+    child.on('error', () => resolve(-1));
+    child.on('close', resolve);
+  });
+}
+
+/** Sign `email` into a spare of its own: Claude Code's own login, in the browser, once. */
+export async function addSpare(email, name, profiles = discoverProfiles()) {
+  const e = email.toLowerCase();
+  const list = spares();
+  const holding = list.find((s) => s.email?.toLowerCase() === e);
+  if (holding) return { already: `${email} is already a spare here, in ${holding.shown}.` };
+  const inUse = profiles.find((p) => !p.dir.includes(SPARE_PREFIX) && profileAccount(p)?.email?.toLowerCase() === e);
+  if (inUse?.isDefault) return { already: `${email} is what ${tildify(inUse.dir)} is signed into now; when it is switched away it gets a spare of its own.` };
+  const waiting = list.find((s) => s.for?.toLowerCase() === e && !s.accountUuid);
+  const spare = waiting ?? makeSpare(email, name ?? email.split('@')[0]);
+  const code = await claude(['auth', 'login', '--email', email], { ...process.env, CLAUDE_CONFIG_DIR: spare.dir });
+  const who = readSignin(spare);
+  if (code !== 0 || !who) return { error: 'not signed in', spare };
+  if (who.account.emailAddress?.toLowerCase() !== e) {
+    // The browser was signed into someone else; the spare was empty, so empty it again.
+    withStorageLock(spare.dir, () => writeSignin(spare, null));
+    return { error: `the browser signed in as ${who.account.emailAddress}, not ${email}, so that was undone`, spare };
+  }
+  return { added: spare };
 }

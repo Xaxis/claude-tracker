@@ -144,8 +144,8 @@ function clockAt(ts, now) {
 }
 
 /**
- * Where sessions go when their account runs low, machine by machine, and what
- * was moved in the last few hours. Nothing when nothing is running anywhere.
+ * What each profile with sessions running switches to when its account runs
+ * low, machine by machine, and the switches made in the last few hours.
  */
 function failoverLines(f, here, now) {
   if (!f) return [];
@@ -153,23 +153,20 @@ function failoverLines(f, here, now) {
   const rows = [];
   for (const p of plans) {
     for (const e of p.entries ?? []) {
-      const who = `${A.bold}${e.label}${A.reset} ${C.muted}${Math.round(e.level)}%${plans.length > 1 ? ` on ${p.machine}` : ''}${C.reset}`;
+      const who = `${C.muted}${e.profile}${plans.length > 1 ? ` on ${p.machine}` : ''}${C.reset} ${A.bold}${e.label}${A.reset} ${C.muted}${Math.round(e.level)}%${C.reset}`;
       const to = e.target
-        ? `${C.accent}${e.target.label}${C.reset} ${C.muted}${e.target.shown} · ${Math.round(e.target.room)}% free${C.reset}`
-        : `${C.critical}nowhere${C.reset} ${C.muted}- no other account with room signed in there${C.reset}`;
+        ? `${C.accent}${e.target.label}${C.reset} ${C.muted}${Math.round(e.target.room)}% free${C.reset}`
+        : `${C.critical}nothing${C.reset} ${C.muted}- no spare there with room${C.reset}`;
       const state = p.mode !== 'auto' ? `${C.muted}(off)${C.reset}`
-        : !e.target ? ''
-          : e.out ? `${C.warning}moving sessions${C.reset}`
-            : e.due ? `${C.warning}moving background sessions${C.reset} ${C.muted}· open ones when it runs out${C.reset}`
-              : `${C.muted}at ${p.at}%${C.reset}`;
+        : !e.target ? '' : e.due ? `${C.warning}switching${C.reset}` : `${C.muted}at ${p.at}%${C.reset}`;
       rows.push(`  ${C.muted}↪${C.reset} ${who} → ${to}  ${state}`);
     }
     if (p.local && p.best) rows.push(`    ${C.muted}${p.best.label} has ${Math.round(p.best.room)}% free: claude-tracker pool add ${p.best.email}${C.reset}`);
   }
-  for (const m of (f.moves ?? []).filter((x) => now - x.ts < 6 * 3600e3).slice(0, 3)) {
-    rows.push(m.status === 'started'
-      ? `    ${C.good}moved${C.reset} ${m.name} → ${m.to}  ${C.muted}${m.attach}${C.reset}`
-      : `    ${C.critical}not moved${C.reset} ${m.name}: ${C.muted}${m.error}${C.reset}`);
+  for (const m of (f.switches ?? []).filter((x) => now - x.ts < 6 * 3600e3).slice(0, 3)) {
+    rows.push(m.status === 'switched'
+      ? `    ${C.good}switched${C.reset} ${m.profile} ${m.from} → ${m.to}`
+      : `    ${C.critical}could not switch${C.reset} ${m.profile}: ${C.muted}${m.error}${C.reset}`);
   }
   if (!rows.length) return [];
   const head = f.mode === 'auto' ? `${C.good}FAILOVER${C.reset} ${C.muted}on at ${f.at}%${C.reset}` : `${C.muted}FAILOVER off · claude-tracker failover on${C.reset}`;
