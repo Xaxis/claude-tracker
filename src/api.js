@@ -449,7 +449,9 @@ export function localState() {
       entries: (f.plan?.entries ?? []).map((e) => ({
         profile: e.profile, label: e.label, level: e.level, due: e.due, out: e.out, sessions: e.sessions,
         target: e.target && { label: e.target.label, room: e.target.room, shown: e.target.shown },
+        then: (e.then ?? []).map((t) => ({ label: t.label, room: t.room })),
       })),
+      notices: (f.plan?.notices ?? []).map((n) => ({ level: n.level, text: n.text, fix: n.fix })),
       switches: f.switches.map((m) => ({ ts: m.ts, profile: m.profile, from: m.from, to: m.to, status: m.status })),
     },
   };

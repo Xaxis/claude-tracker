@@ -594,6 +594,10 @@ function renderFailover(ov) {
       row.append(main);
       row.append(el('div', 'row-value', p.mode !== 'auto' ? 'off' : !e.target ? '' : e.due ? 'switching' : `at ${p.at}%`));
       host.append(row);
+      if (e.then?.length) host.append(el('p', 'panel-note', `If that fails: ${e.then.map((t) => t.label).join(', then ')}.`));
+    }
+    for (const n of p.notices ?? []) {
+      host.append(el('p', `panel-note ${n.level === 'bad' ? 'is-bad' : 'is-warn'}`, `${plans.length > 1 ? `${p.machine}: ` : ''}${n.text}${n.fix ? ` To fix: ${n.fix}.` : ''}`));
     }
     if (p.local && p.best) host.append(el('p', 'panel-note', `${p.best.label} has ${Math.round(p.best.room)}% free and no spare here: claude-tracker pool add ${p.best.email}`));
   }

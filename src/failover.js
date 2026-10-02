@@ -22,13 +22,23 @@ import { machine } from './replica.js';
  * The tracker service is the one thing on a machine that switches - never the
  * sessions themselves - and a profile it has just switched is left to settle,
  * so each running low is handled once.
+ *
+ * How full a profile's account is comes first from the profile's own sessions:
+ * their status-line readings and refusals since it was signed in. Those cannot
+ * be pinned on the wrong account, as matching readings to accounts by reset time
+ * can when two accounts' windows reset together. An account a profile has run
+ * out on is spent until its window resets, whatever else claims it has room.
  */
 
 const CORE = ['five_hour', 'seven_day'];
 /** A target needs at least this much room in its tightest window to be worth switching to. */
 export const MIN_ROOM = 15;
-/** After a switch, the profile's new account has time to show before another is considered. */
-const SETTLE_MS = 10 * 60e3;
+/**
+ * After a switch, sessions go on using the sign-in they hold for up to ~30s: their
+ * readings in that time are still the old account's. Past it, the profile is
+ * free to switch again - at once, if the new account turns out to be out too.
+ */
+const GRACE_MS = 45e3;
 export const SPARE_PREFIX = '.claude-pool-';
 const MARK = '.claude-tracker-spare';
 
@@ -48,6 +58,53 @@ export function setFailover({ mode, at, waitMin, prefer }) {
   if (waitMin != null) setMeta('failover_wait', String(waitMin));
   if (prefer !== undefined) setMeta('failover_prefer', prefer ? String(prefer).toLowerCase() : '');
   return failoverSettings();
+}
+
+/** How big an account's plan is, in Pro-sized units: room on a Max 20x goes 20 times as far. */
+export function capacity(tier) {
+  const m = /max_(\d+)x/.exec(tier ?? '');
+  return m ? Number(m[1]) : 1;
+}
+
+/** Accounts a profile here has run out on, and until when: they are not switched to before then. */
+function spent(now = Date.now()) {
+  let all = {};
+  try { all = JSON.parse(getMeta('failover_spent', '{}')); } catch { /* start over */ }
+  return new Map(Object.entries(all).filter(([, until]) => until > now));
+}
+
+function markSpent(accountUuid, until) {
+  const all = Object.fromEntries(spent());
+  all[accountUuid] = Math.max(all[accountUuid] ?? 0, until);
+  setMeta('failover_spent', JSON.stringify(all));
+}
+
+/** When a profile's present sign-in began: its last switch, or the last sighting of it on another account. */
+function signedSince(dir, accountUuid) {
+  const d = db();
+  const switched = d.prepare("SELECT MAX(ts) t FROM switches WHERE profile = ? AND status = 'switched'").get(dir)?.t ?? 0;
+  const other = d.prepare('SELECT MAX(ts) t FROM account_observations WHERE config_dir = ? AND account_uuid IS NOT ?').get(dir, accountUuid)?.t ?? 0;
+  return Math.max(switched, other);
+}
+
+/**
+ * What the profile's own sessions say about the account it is signed into now:
+ * the latest reading of each open window, and whether they have been refused.
+ */
+function ownState(dir, since, now) {
+  const d = db();
+  const from = since + GRACE_MS;
+  const latest = new Map();
+  for (const r of d.prepare(`SELECT limit_type, pct, resets_at FROM utilization
+      WHERE config_dir = ? AND ts > ? AND resets_at > ? AND limit_type IN ('five_hour', 'seven_day') ORDER BY ts`).all(dir, from, now)) {
+    latest.set(r.limit_type, r);
+  }
+  const refused = d.prepare(`SELECT resets_at FROM limit_events
+      WHERE config_dir = ? AND ts > ? AND status = 'rejected' AND resets_at * 1000 > ? ORDER BY ts DESC LIMIT 1`).get(dir, from, now);
+  if (refused) return { level: 100, out: true, until: refused.resets_at * 1000 };
+  if (!latest.size) return null;
+  const fullest = [...latest.values()].sort((a, b) => b.pct - a.pct)[0];
+  return { level: fullest.pct, out: fullest.pct >= 100, until: fullest.resets_at };
 }
 
 /** Room left in an account's tightest window, 0 when it cannot take a request. */
@@ -118,6 +175,8 @@ function spareOf(email, list = spares()) {
  */
 export function plan(ov, live, settings = failoverSettings(), now = Date.now(), held = spares(), profiles = discoverProfiles()) {
   const accounts = new Map(ov.accounts.map((a) => [a.accountUuid, a]));
+  const tiers = new Map(db().prepare('SELECT account_uuid, rate_limit_tier FROM accounts').all().map((r) => [r.account_uuid, r.rate_limit_tier]));
+  const out = spent(now);
   const elsewhere = new Set(live.filter((s) => s.machine).map((s) => s.accountUuid));
   const working = new Map();
   for (const s of live) {
@@ -130,27 +189,36 @@ export function plan(ov, live, settings = failoverSettings(), now = Date.now(), 
     const signed = profile && profileAccount(profile);
     if (!signed) continue;
     const a = accounts.get(signed.accountUuid);
-    const lvl = level(a);
-    // Most room - within 5 points counts as equal - and, between equals, one no
-    // other machine is using; then this machine's turn among what is left.
-    const rank = (x) => [Math.round(x.room / 5), elsewhere.has(x.accountUuid) ? 0 : 1];
+    // The profile's own sessions, when they have said anything since it was signed in; else the account's numbers.
+    const own = ownState(dir, signedSince(dir, signed.accountUuid), now);
+    const lvl = own ? own.level : level(a);
+    const isOut = own ? own.out : !!a && !a.available.now;
+    // Room weighed by plan size; within 5 points counts as equal and, between
+    // equals, one no other machine is using; then this machine's turn among them.
+    const rank = (x) => [Math.round(x.room * x.capacity / 5), elsewhere.has(x.accountUuid) ? 0 : 1];
     const options = held
-      .filter((s) => s.accountUuid && s.accountUuid !== signed.accountUuid)
-      .map((s) => ({ ...s, label: accounts.get(s.accountUuid)?.label ?? s.email, room: headroom(accounts.get(s.accountUuid)) }))
+      .filter((s) => s.accountUuid && s.accountUuid !== signed.accountUuid && !out.has(s.accountUuid))
+      .map((s) => ({ ...s, label: accounts.get(s.accountUuid)?.label ?? s.email, room: headroom(accounts.get(s.accountUuid)), capacity: capacity(tiers.get(s.accountUuid)) }))
       .filter((s) => s.room >= MIN_ROOM)
       .sort((x, y) => rank(y)[0] - rank(x)[0] || rank(y)[1] - rank(x)[1]);
-    // Your pick, while it has room; otherwise the best by room.
+    // Your pick, while it has room; otherwise the best.
     const picked = settings.prefer && options.find((x) => x.email?.toLowerCase() === settings.prefer);
-    const target = picked ? { ...picked, pinned: true }
-      : turnOf(options.filter((x) => options.length && String(rank(x)) === String(rank(options[0]))));
+    const first = picked ? { ...picked, pinned: true }
+      : turnOf(options.filter((x) => String(rank(x)) === String(rank(options[0]))));
+    // In order: where it goes, then where it goes if that fails.
+    const order = first ? [first, ...options.filter((x) => x.accountUuid !== first.accountUuid)] : [];
     // Out, but back within the wait: not worth a switch.
-    const freesAt = a && !a.available.now ? a.available.at : null;
+    const freesAt = isOut ? (own?.until ?? a?.available.at ?? null) : null;
     const soon = freesAt != null && freesAt - now < settings.waitMin * 60e3;
+    const shape = (t) => ({ accountUuid: t.accountUuid, label: t.label, email: t.email, room: t.room, capacity: t.capacity, dir: t.dir, shown: t.shown, pinned: !!t.pinned });
     entries.push({
       dir, profile: tildify(dir), isDefault: !!profile.isDefault, sessions,
       account: signed.accountUuid, email: signed.email, label: a?.label ?? signed.email ?? signed.accountUuid,
-      level: lvl, due: lvl >= settings.at && !soon, out: !!a && !a.available.now, freesAt,
-      target: target && { accountUuid: target.accountUuid, label: target.label, email: target.email, room: target.room, dir: target.dir, shown: target.shown, pinned: !!target.pinned },
+      level: lvl, due: lvl >= settings.at && !soon, out: isOut, freesAt, measured: !!own,
+      // Until when this account is no use, when the profile's own sessions say it is full.
+      spentUntil: own && own.level >= settings.at ? own.until : null,
+      target: order[0] ? shape(order[0]) : null,
+      then: order.slice(1, 4).map(shape),
     });
   }
   const covered = new Set([...held.map((s) => s.accountUuid), ...entries.map((e) => e.account)]);
@@ -159,7 +227,33 @@ export function plan(ov, live, settings = failoverSettings(), now = Date.now(), 
     .filter((a) => a.available.now && !covered.has(a.accountUuid) && a.email)
     .map((a) => ({ accountUuid: a.accountUuid, label: a.label, email: a.email, room: headroom(a) }))
     .sort((x, y) => y.room - x.room)[0] ?? null;
-  return { ...settings, entries, best: best && best.room >= top + 10 ? best : null };
+  return { ...settings, entries, best: best && best.room >= top + 10 ? best : null, notices: notices(entries, held, profiles, out, accounts) };
+}
+
+/**
+ * What needs doing by hand for failover to keep working: an account to add
+ * when nothing is left to switch to, or a spare that no longer holds a sign-in.
+ */
+function notices(entries, held, profiles, out, accounts) {
+  const list = [];
+  const ADD = 'add another Claude account (a Max plan goes furthest): sign it up at claude.ai, then run claude-tracker pool add <email> on this machine';
+  for (const e of entries) {
+    if (!e.target) {
+      const back = [...out.values()].sort((x, y) => x - y)[0] ?? null;
+      list.push({ level: 'bad', text: `${e.profile} has nothing left to switch to: every spare here is out, low or empty.`, fix: ADD, until: back });
+    } else if (!e.then.length) {
+      list.push({ level: 'warn', text: `${e.profile} has one spare left with room: ${e.target.label}.`, fix: ADD });
+    }
+  }
+  // A spare emptied by a switch is fine while its account is signed into a profile; otherwise its sign-in is gone.
+  const signedHere = new Set(profiles.filter((p) => !p.dir.includes(SPARE_PREFIX)).map((p) => profileAccount(p)?.email?.toLowerCase()).filter(Boolean));
+  const holding = new Set(held.map((s) => s.email?.toLowerCase()).filter(Boolean));
+  for (const s of held) {
+    const e = s.for?.toLowerCase();
+    if (s.accountUuid || !e || signedHere.has(e) || holding.has(e)) continue;
+    list.push({ level: 'warn', text: `${s.shown} no longer holds a sign-in for ${s.for}.`, fix: `claude-tracker pool add ${s.for}` });
+  }
+  return list;
 }
 
 function record(row) {
@@ -195,11 +289,18 @@ export function recentSwitches(since = Date.now() - 24 * 3600e3) {
 export function runFailover(ov, live, now = Date.now()) {
   const settings = failoverSettings();
   if (settings.mode !== 'auto') return [];
-  const settling = db().prepare('SELECT profile FROM switches WHERE ts > ?').all(now - SETTLE_MS).map((r) => r.profile);
+  const settling = db().prepare("SELECT profile FROM switches WHERE ts > ? AND status = 'switched'").all(now - GRACE_MS).map((r) => r.profile);
   const made = [];
   for (const e of plan(ov, live, settings, now).entries) {
     if (!e.due || !e.target || settling.includes(e.dir)) continue;
-    made.push(switchProfile(e, e.target));
+    // Not to come back to this account before it resets, whatever its numbers say.
+    if (e.spentUntil) markSpent(e.account, e.spentUntil);
+    // The first that works: a spare that fails to switch to, the next one is tried.
+    for (const t of [e.target, ...e.then]) {
+      const m = switchProfile(e, t);
+      made.push(m);
+      if (m.status === 'switched') break;
+    }
   }
   return made;
 }
