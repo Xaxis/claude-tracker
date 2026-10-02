@@ -355,15 +355,24 @@ memory to the main profile's, so a session moved there remembers what it did and
 what it learns is kept in one place. `claude-tracker pool link` does the same for
 profiles made by hand, keeping anything they have of their own unless `--force`.
 
-When an account in use crosses the threshold, each of its sessions is moved as
-soon as it is idle - one mid-turn finishes the turn, or is refused, first - so the
-old and the new never work at once. A move copies the session's transcript into
-the profile with the most room and resumes it there, forked, as a background
-session: `claude attach <id>` opens it, and the dashboards and a notification
-give the exact command. A session cut off by a refusal is told to carry on where
-it stopped; one that was waiting for you waits for you. A background original is
-stopped; an interactive one is yours to close. Nothing moves when the account
-frees up within 15 minutes (`--wait`).
+A session is only ever moved while it is idle - one mid-turn finishes the turn,
+or is refused, first - so the old and the new never work at once. A move copies
+the session's transcript into the profile with the most room and resumes it
+there, forked, as a background session, in the same folder, with its history,
+settings and memories: `claude attach <id>` opens it.
+
+- **A window you are working in** moves when its account runs out. Until then
+  your next message goes to it, and a copy started early would only drift from
+  it. When work you left running is cut off by the limit, it carries on as the
+  other account within about 20 seconds, told to pick up where it stopped; a
+  window that was waiting for you waits for you there. Its old window cannot be
+  switched from outside, so its status line says where the work went and how to
+  open it: `⇢ continues as proton: CLAUDE_CONFIG_DIR=~/.claude-proton claude attach 1a2b3c4d`.
+  Carry on there, not in the old window.
+- **A background session** moves as soon as its account crosses the threshold,
+  and its original is stopped, so only one carries on.
+
+Nothing moves when the account frees up within 15 minutes (`--wait`).
 
 The plan is always on show, switched on or not: in the terminal under `USE NOW`,
 in the browser as a Failover panel, and with `claude-tracker failover` - each

@@ -442,7 +442,7 @@ export function localState() {
     failover: {
       mode: f.mode, at: f.at, best: f.plan?.best ? { label: f.plan.best.label, room: f.plan.best.room } : null,
       entries: (f.plan?.entries ?? []).map((e) => ({
-        label: e.label, level: e.level, due: e.due,
+        label: e.label, level: e.level, due: e.due, out: e.out,
         target: e.target && { label: e.target.label, room: e.target.room, shown: e.target.shown },
         sessions: e.sessions.length,
       })),

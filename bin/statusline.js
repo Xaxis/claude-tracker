@@ -66,6 +66,11 @@ const color = (pct) => (PLAIN ? '' : pct >= 90 ? '\x1b[31m' : pct >= 70 ? '\x1b[
 const DIM = PLAIN ? '' : '\x1b[2m', RESET = PLAIN ? '' : '\x1b[0m';
 
 const parts = [];
+// The tracker moved this session's work to another account: say where it went on.
+try {
+  const moved = JSON.parse(fs.readFileSync(path.join(DATA_DIR, 'moved', `${d.session_id}.json`), 'utf8'));
+  parts.push(`${PLAIN ? '' : '\x1b[33m'}⇢ continues as ${String(moved.to).split('@')[0]}: ${moved.attach}${RESET}`);
+} catch { /* not moved */ }
 if (who) parts.push(`${DIM}${who.split('@')[0]}${RESET}`);
 for (const [key, label] of [['five_hour', '5h'], ['seven_day', '7d'], ['spend_limit', 'spend']]) {
   const l = limits[key];

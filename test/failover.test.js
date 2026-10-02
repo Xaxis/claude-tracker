@@ -45,11 +45,11 @@ function inChild(body) {
       return dir;
     };
     const sleepers = [];
-    const running = (dir, id, name, status) => {
+    const running = (dir, id, name, status, kind = 'interactive') => {
       const p = spawn('sleep', ['60'], { stdio: 'ignore' }); sleepers.push(p);
       const cwd = path.join(HOME, 'work', 'app');
       fs.mkdirSync(cwd, { recursive: true });
-      fs.writeFileSync(path.join(dir, 'sessions', p.pid + '.json'), JSON.stringify({ pid: p.pid, sessionId: id, name, status, cwd, updatedAt: now }));
+      fs.writeFileSync(path.join(dir, 'sessions', p.pid + '.json'), JSON.stringify({ pid: p.pid, sessionId: id, name, status, kind, cwd, updatedAt: now }));
       fs.mkdirSync(path.join(dir, 'projects', '-work-app'), { recursive: true });
       fs.writeFileSync(path.join(dir, 'projects', '-work-app', id + '.jsonl'), '{}\\n');
     };
@@ -68,7 +68,7 @@ function inChild(body) {
 
 const calls = () => fs.readFileSync(path.join(root, 'claude.log'), 'utf8').trim().split('\n').map((l) => JSON.parse(l));
 
-test('an idle session on an account running low moves to the profile with the most room', () => {
+test('a background session on an account running low moves to the profile with the most room; an open window waits', () => {
   const out = inChild(`
     const main = profile('.claude', 'A', 'a@x.com');
     const roomy = profile('.claude-b', 'B', 'b@x.com');
@@ -77,26 +77,39 @@ test('an idle session on an account running low moves to the profile with the mo
     read('B', 'five_hour', 20, now + 2 * HOUR); read('B', 'seven_day', 30, now + 4 * 86400e3);
     // C has more room on paper, but the API refused it until later.
     db().prepare("INSERT INTO limit_events (ts, session_id, account_uuid, limit_type, resets_at, status) VALUES (?, 'rc', 'C', 'five_hour', ?, 'rejected')").run(now - MIN, Math.floor((now + 2 * HOUR) / 1000));
-    running(main, 'aaaaaaaa-idle', 'idle-one', 'idle');
+    running(main, 'aaaaaaaa-idle', 'idle-one', 'idle', 'background');
     running(main, 'bbbbbbbb-busy', 'busy-one', 'busy');
+    // An open window, idle while you think: its account still works, so it stays.
+    running(main, 'cccccccc-open', 'open-one', 'idle');
     F.setFailover({ mode: 'auto', at: 90 });
     const ov = api.overview(), live = api.liveSessions();
     const p = F.plan(ov, live);
     const first = await F.runFailover(ov, live);
     const again = await F.runFailover(api.overview(), api.liveSessions());
     const memory = path.join(roomy, 'projects', '-work-app', 'memory');
+    const marker = JSON.parse(fs.readFileSync(path.join(process.env.CLAUDE_TRACKER_DIR, 'moved', 'aaaaaaaa-idle.json'), 'utf8'));
     return { plan: p.entries.map((e) => ({ label: e.label, due: e.due, target: e.target?.label, dir: e.target?.dir })), first, again: again.length,
       copied: fs.existsSync(path.join(roomy, 'projects', '-work-app', 'aaaaaaaa-idle.jsonl')), roomy,
-      memory: fs.lstatSync(memory).isSymbolicLink() && fs.realpathSync(memory) === fs.realpathSync(path.join(main, 'projects', '-work-app', 'memory')) };
+      memory: fs.lstatSync(memory).isSymbolicLink() && fs.realpathSync(memory) === fs.realpathSync(path.join(main, 'projects', '-work-app', 'memory')),
+      marker };
   `);
   assert.deepEqual(out.plan, [{ label: 'a@x.com', due: true, target: 'b@x.com', dir: out.roomy }]);
-  assert.equal(out.first.length, 1, 'only the idle session moves; the busy one finishes its turn first');
+  assert.equal(out.first.length, 1, 'the busy session finishes its turn first, and the open window still works');
   assert.deepEqual([out.first[0].session_id, out.first[0].status, out.first[0].bg_id, out.first[0].continued], ['aaaaaaaa-idle', 'started', 'aaaaaaaa', 0], out.first[0].error);
   assert.equal(out.again, 0, 'a session moves once');
   assert.equal(out.copied, true, 'its transcript is where the new profile can resume it');
   assert.equal(out.memory, true, "its project's memories come with it");
-  const [c] = calls();
+  const [c, stop] = calls();
   assert.deepEqual(c, { args: ['--resume', 'aaaaaaaa-idle', '--fork-session', '--bg', '-n', 'idle-one'], cwd: path.join(root, 'work', 'app'), configDir: out.roomy });
+  assert.deepEqual(stop.args, ['stop', 'aaaaaaaa'], 'the background original stops, so only one carries on');
+  assert.deepEqual(out.marker, { to: 'b@x.com', attach: 'CLAUDE_CONFIG_DIR=~/.claude-b claude attach aaaaaaaa', at: out.first[0].ts });
+
+  // The old session's status line says where its work went on.
+  const line = spawnSync(process.execPath, [path.join(path.dirname(new URL(import.meta.url).pathname), '..', 'bin', 'statusline.js')], {
+    input: JSON.stringify({ session_id: 'aaaaaaaa-idle', rate_limits: { five_hour: { used_percentage: 96, resets_at: Math.floor(Date.now() / 1000) + 3600 } } }),
+    env: { ...process.env, HOME: root, CLAUDE_TRACKER_DIR: path.join(root, 'data'), NO_COLOR: '1', CLAUDE_CONFIG_DIR: '' }, encoding: 'utf8',
+  });
+  assert.match(line.stdout, /^⇢ continues as b: CLAUDE_CONFIG_DIR=~\/\.claude-b claude attach aaaaaaaa · /);
 });
 
 test('a session cut off by a refusal is told to carry on; one that frees up soon stays', async () => {

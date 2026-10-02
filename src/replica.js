@@ -398,7 +398,7 @@ export function saveState(id, state) {
     mode: clean(f.mode, 10), at: num(f.at),
     best: f.best ? { label: clean(f.best.label), room: num(f.best.room) } : null,
     entries: (Array.isArray(f.entries) ? f.entries : []).slice(0, 20).map((e) => ({
-      label: clean(e?.label), level: num(e?.level), due: !!e?.due, sessions: num(e?.sessions) ?? 0,
+      label: clean(e?.label), level: num(e?.level), due: !!e?.due, out: !!e?.out, sessions: num(e?.sessions) ?? 0,
       target: e?.target ? { label: clean(e.target.label), room: num(e.target.room), shown: clean(e.target.shown) } : null,
     })),
     moves: (Array.isArray(f.moves) ? f.moves : []).slice(0, 20).map((m) => ({

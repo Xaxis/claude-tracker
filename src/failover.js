@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { db, getMeta, setMeta } from './db.js';
-import { discoverProfiles, tildify } from './paths.js';
+import { discoverProfiles, tildify, DATA_DIR } from './paths.js';
 import { profileAccount } from './accounts.js';
 import { linkMemory } from './pool.js';
 
@@ -17,6 +17,11 @@ import { linkMemory } from './pool.js';
  * a background session under the profile with the most room; `claude attach`
  * opens it. Only an idle session is moved: one mid-turn finishes the turn, or
  * is refused, first, so the old and the new never work at once.
+ *
+ * A window you are working in moves only once its account has run out: until
+ * then your next message goes to it, and a copy started early would sit unused
+ * while the two drifted apart. Its status line then says where the work went.
+ * A background session, which nobody types into, moves as soon as it is due.
  *
  * Each machine moves its own sessions through its own profiles. Plans travel
  * with the sync state, so every dashboard shows every machine's.
@@ -94,7 +99,7 @@ export function plan(ov, live, settings = failoverSettings(), now = Date.now(), 
     const freesAt = a && !a.available.now ? a.available.at : null;
     const soon = freesAt != null && freesAt - now < settings.waitMin * 60e3;
     entries.push({
-      account: acct, label: a?.label ?? acct, level: lvl, due: lvl >= settings.at && !soon, freesAt,
+      account: acct, label: a?.label ?? acct, level: lvl, due: lvl >= settings.at && !soon, out: !!a && !a.available.now, freesAt,
       target: target && { accountUuid: target.accountUuid, label: target.label, room: target.room, dir: target.dir, shown: target.shown, isDefault: target.isDefault },
       sessions: sessions.map((s) => ({ sessionId: s.sessionId, name: s.name, status: s.status })),
     });
@@ -190,6 +195,17 @@ export async function move(session, target, { fromAccount = null } = {}) {
   row.bg_id = bg;
   row.status = 'started';
   record();
+  // Tell the old window, through its status line, where the work went on.
+  try {
+    const dir = path.join(DATA_DIR, 'moved');
+    fs.mkdirSync(dir, { recursive: true });
+    for (const f of fs.readdirSync(dir)) {
+      const file = path.join(dir, f);
+      if (Date.now() - fs.statSync(file).mtimeMs > 3 * 86400e3) fs.rmSync(file, { force: true });
+    }
+    fs.writeFileSync(path.join(dir, `${session.sessionId}.json`),
+      JSON.stringify({ to: target.label ?? target.email, attach: attachCommand(row), at: row.ts }));
+  } catch { /* the move stands; only the hint is missing */ }
   const from = discoverProfiles().find((p) => p.dir === session.profileDir);
   if (session.kind === 'background' && from) {
     await claude(['stop', session.sessionId.slice(0, 8)], { dir: from.dir, isDefault: from.isDefault, cwd: session.cwd });
@@ -221,6 +237,7 @@ export async function runFailover(ov, live, now = Date.now()) {
       if (!e.due || !e.target) continue;
       for (const s of live) {
         if (s.machine || s.accountUuid !== e.account || s.status !== 'idle' || done.has(s.sessionId)) continue;
+        if (s.kind !== 'background' && !e.out) continue;
         moves.push(await move(s, e.target, { fromAccount: e.account }));
         done.add(s.sessionId);
       }

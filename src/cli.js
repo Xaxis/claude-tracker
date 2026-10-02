@@ -282,10 +282,13 @@ function printPlan(p, machine, settings) {
   if (!p.entries.length) { console.log(`  ${c.dim}${machine}: no sessions running${c.reset}`); return; }
   for (const e of p.entries) {
     const head = `  ${c.bold}${e.label}${c.reset} ${c.dim}on ${machine} · ${pct(e.level)} of its fullest window${c.reset}`;
+    const verb = e.out ? `${c.yellow}moving sessions${c.reset}`
+      : e.due ? `${c.yellow}moving background sessions${c.reset}` : 'would move sessions';
     const where = e.target
-      ? `${e.due ? `${c.yellow}moving` : 'would move'}${c.reset} to ${c.bold}${e.target.label}${c.reset} ${c.dim}(${e.target.shown} · ${pct(e.target.room)} free)${c.reset}`
+      ? `${verb} to ${c.bold}${e.target.label}${c.reset} ${c.dim}(${e.target.shown} · ${pct(e.target.room)} free)${c.reset}`
       : `${c.red}nowhere to move to${c.reset} ${c.dim}- no other account with room is signed in on ${machine}${c.reset}`;
-    const at = e.due ? '' : ` ${c.dim}at ${settings.at}%${c.reset}`;
+    const at = !e.target || e.out ? '' : e.due ? ` ${c.dim}- open windows when it runs out${c.reset}`
+      : ` ${c.dim}- background ones at ${settings.at}%, open windows when it runs out${c.reset}`;
     console.log(`${head}\n    ${where}${at}`);
   }
   if (p.best) {

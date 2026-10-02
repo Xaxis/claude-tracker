@@ -593,7 +593,8 @@ function renderFailover(ov) {
         ? `${Math.round(e.level)}% full${plans.length > 1 ? ` on ${p.machine}` : ''} · moves to ${e.target.shown}, ${Math.round(e.target.room)}% free`
         : `${Math.round(e.level)}% full${plans.length > 1 ? ` on ${p.machine}` : ''} · no other account with room is signed in there`));
       row.append(main);
-      row.append(el('div', 'row-value', p.mode !== 'auto' ? 'off' : e.due && e.target ? 'moving idle sessions' : `at ${p.at}%`));
+      row.append(el('div', 'row-value', p.mode !== 'auto' ? 'off' : !e.target ? ''
+        : e.out ? 'moving sessions' : e.due ? 'moving background sessions · open ones when it runs out' : `at ${p.at}%`));
       host.append(row);
     }
     if (p.local && p.best) host.append(el('p', 'panel-note', `${p.best.label} has ${Math.round(p.best.room)}% free but no profile here is signed into it: claude-tracker pool add ${p.best.email}`));
