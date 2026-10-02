@@ -258,7 +258,7 @@ export async function serve({ port = 4785, open = false, refresh, fastRefresh, a
       failing = true;
       try {
         const ov = overview(), live = liveSessions();
-        setMeta('failover_plan', JSON.stringify({ at: Date.now(), ...plan(ov, live) }));
+        setMeta('failover_plan', JSON.stringify({ ...plan(ov, live), computedAt: Date.now() }));
         const moves = await runFailover(ov, live);
         for (const m of moves) {
           send(m.status === 'started' ? 'Claude session moved' : 'Claude session not moved',
