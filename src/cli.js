@@ -277,24 +277,16 @@ async function cmdService(action, flags) {
 const pct = (n) => `${Math.round(n)}%`;
 const when = (ts) => new Date(ts).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
 
-/** One line per account in use somewhere: how full, and where its sessions go. */
+/** One line per profile sessions run in: its account, how full, and what it switches to. */
 function printPlan(p, machine, settings) {
-  if (!p.entries.length) { console.log(`  ${c.dim}${machine}: no sessions running${c.reset}`); return; }
+  if (!p.entries?.length) { console.log(`  ${c.dim}${machine}: no sessions running${c.reset}`); return; }
   for (const e of p.entries) {
-    const head = `  ${c.bold}${e.label}${c.reset} ${c.dim}on ${machine} · ${pct(e.level)} of its fullest window${c.reset}`;
-    const verb = e.out ? `${c.yellow}moving sessions${c.reset}`
-      : e.due ? `${c.yellow}moving background sessions${c.reset}` : 'would move sessions';
-    const where = e.target
-      ? `${verb} to ${c.bold}${e.target.label}${c.reset} ${c.dim}(${e.target.shown} · ${pct(e.target.room)} free)${c.reset}`
-      : `${c.red}nowhere to move to${c.reset} ${c.dim}- no other account with room is signed in on ${machine}${c.reset}`;
-    const at = !e.target || e.out ? '' : e.due ? ` ${c.dim}- open windows when it runs out${c.reset}`
-      : ` ${c.dim}- background ones at ${settings.at}%, open windows when it runs out${c.reset}`;
-    console.log(`${head}\n    ${where}${at}`);
+    console.log(`  ${c.bold}${e.profile}${c.reset} ${c.dim}on ${machine} · signed into${c.reset} ${e.label} ${c.dim}· ${pct(e.level)} of its fullest window · ${e.sessions} session${e.sessions === 1 ? '' : 's'}${c.reset}`);
+    console.log(e.target
+      ? `    ${e.due ? `${c.yellow}switching${c.reset}` : 'switches'} to ${c.bold}${e.target.label}${c.reset} ${c.dim}(${pct(e.target.room)} free)${e.due ? '' : ` at ${settings.at}%`}${c.reset}`
+      : `    ${c.red}nothing to switch to${c.reset} ${c.dim}- no spare on ${machine} holds an account with room${c.reset}`);
   }
-  if (p.best) {
-    console.log(`  ${c.dim}${p.best.label} has ${pct(p.best.room)} free but is signed in nowhere on ${machine}${c.reset}`);
-    if (p.best.email && machine === 'this machine') console.log(`  ${c.dim}  add it: claude-tracker pool add ${p.best.email}${c.reset}`);
-  }
+  if (p.best) console.log(`  ${c.dim}${p.best.label} has ${pct(p.best.room)} free and no spare on ${machine}${p.best.email ? `: claude-tracker pool add ${p.best.email}` : ''}${c.reset}`);
 }
 
 async function cmdFailover(action, args, flags) {
@@ -307,43 +299,38 @@ async function cmdFailover(action, args, flags) {
     }
     const s = F.setFailover({ mode: action === 'on' ? 'auto' : 'off', at, waitMin });
     console.log(s.mode === 'auto'
-      ? `${c.green}✓${c.reset} failing over at ${s.at}% - idle sessions on an account that full move to the account here with the most room`
-      : `${c.green}✓${c.reset} failover off - the plan is still shown, nothing is moved`);
+      ? `${c.green}✓${c.reset} at ${s.at}%, a profile's sessions switch to the spare account with the most room`
+      : `${c.green}✓${c.reset} failover off - the plan is still shown, nothing switches`);
     return;
   }
   const ov = overview();
   const live = liveSessions();
-  if (action === 'move') {
-    const q = args[0];
-    const s = live.find((x) => !x.machine && (x.sessionId.startsWith(q ?? '\0') || x.name === q));
-    if (!s) { console.error(`No session running here is called "${q ?? ''}". See: claude-tracker failover`); process.exitCode = 1; return; }
-    const p = F.plan(ov, live);
-    let target = p.entries.find((e) => e.account === s.accountUuid)?.target;
+  const p = F.plan(ov, live);
+  if (action === 'switch') {
+    // Switch now: the profile named (default ~/.claude's entry, or the only one), to the spare named or the best.
+    const e = p.entries.find((x) => (flags.profile ? x.profile === flags.profile || x.dir === flags.profile : x.isDefault)) ?? (p.entries.length === 1 ? p.entries[0] : null);
+    if (!e) { console.error('No profile here has sessions running to switch. Name one: --profile ~/.claude'); process.exitCode = 1; return; }
+    let target = e.target;
     if (flags.to) {
-      const profile = F.pool().find((x) => x.email?.toLowerCase() === String(flags.to).toLowerCase());
-      if (!profile) { console.error(`No profile here is signed into ${flags.to}. Add one: claude-tracker pool add ${flags.to}`); process.exitCode = 1; return; }
-      target = profile;
+      const s = F.spares().find((x) => x.email?.toLowerCase() === String(flags.to).toLowerCase());
+      if (!s) { console.error(`No spare here holds ${flags.to}. Add it: claude-tracker pool add ${flags.to}`); process.exitCode = 1; return; }
+      target = { accountUuid: s.accountUuid, label: s.email, dir: s.dir, shown: s.shown };
     }
-    if (!target) { console.error('There is no other account with room signed in on this machine.'); process.exitCode = 1; return; }
-    console.log(`${c.dim}moving ${s.name ?? s.sessionId.slice(0, 8)} to ${target.label ?? target.email}…${c.reset}`);
-    const m = await F.move(s, target, { fromAccount: s.accountUuid });
-    if (m.status !== 'started') { console.error(`${c.red}✗${c.reset} ${m.error}`); process.exitCode = 1; return; }
-    console.log(`${c.green}✓${c.reset} it carries on in the background${m.continued ? ', picking up where it was cut off' : ''}. Open it:\n  ${F.attachCommand(m)}`);
+    if (!target) { console.error('No spare here holds an account with room.'); process.exitCode = 1; return; }
+    const r = F.switchProfile(e, target);
+    if (r.status !== 'switched') { console.error(`${c.red}✗${c.reset} ${r.error}`); process.exitCode = 1; return; }
+    console.log(`${c.green}✓${c.reset} ${e.profile} is signed into ${c.bold}${target.label}${c.reset}; its ${e.sessions} session${e.sessions === 1 ? '' : 's'} carry on as that account within about 30 seconds.`);
     return;
   }
 
   const s = F.failoverSettings();
-  console.log(`\n${c.bold}Failover${c.reset}  ${s.mode === 'auto' ? `${c.green}on${c.reset} at ${s.at}%` : `${c.dim}off${c.reset} ${c.dim}(claude-tracker failover on)${c.reset}`}${s.mode === 'auto' && s.waitMin ? ` ${c.dim}· not when the account frees up within ${s.waitMin}m${c.reset}` : ''}\n`);
-  printPlan(F.plan(ov, live, s), 'this machine', s);
-  for (const r of ov.failover.remote) {
-    console.log();
-    printPlan({ entries: r.entries.map((e) => ({ ...e, target: e.target && { ...e.target } })), best: r.best }, r.machine, { at: r.at });
-  }
-  const moves = ov.failover.moves;
-  if (moves.length) {
-    console.log(`\n${c.bold}Moved today${c.reset}`);
-    for (const m of moves) {
-      console.log(`  ${when(m.ts)}  ${m.name} ${c.dim}${m.from} →${c.reset} ${m.to}  ${m.status === 'started' ? `${c.dim}${m.attach}${c.reset}` : `${c.red}${m.error}${c.reset}`}`);
+  console.log(`\n${c.bold}Failover${c.reset}  ${s.mode === 'auto' ? `${c.green}on${c.reset} at ${s.at}%` : `${c.dim}off${c.reset} ${c.dim}(claude-tracker failover on)${c.reset}`}\n`);
+  printPlan(p, 'this machine', s);
+  for (const r of ov.failover.remote) { console.log(); printPlan(r, r.machine, { at: r.at }); }
+  if (ov.failover.switches.length) {
+    console.log(`\n${c.bold}Switched today${c.reset}`);
+    for (const m of ov.failover.switches) {
+      console.log(`  ${when(m.ts)}  ${m.profile} ${c.dim}${m.from} →${c.reset} ${m.to}${m.status === 'switched' ? '' : `  ${c.red}${m.error}${c.reset}`}`);
     }
   }
   console.log();
@@ -354,89 +341,44 @@ async function cmdPool(action, args, flags) {
   if (action === 'add') {
     const email = args[0];
     if (!email || !/^[^\s@]+@[^\s@]+$/.test(email)) { console.error('usage: claude-tracker pool add <email> [--as <name>]'); process.exitCode = 1; return; }
-    const { HOME, configFileOf } = await import('./paths.js');
-    const { profileAccount } = await import('./accounts.js');
-    const fs = await import('node:fs');
-    const path = await import('node:path');
-    const { spawn } = await import('node:child_process');
-    const already = F.pool().find((p) => p.email?.toLowerCase() === email.toLowerCase());
-    if (already) {
-      console.log(`${email} is already signed in on this machine, in ${already.shown}.`);
-      if (!already.isDefault) console.log(`${c.dim}To have it share this machine's settings, skills and memories: claude-tracker pool link${c.reset}`);
-      return;
-    }
-    const name = String(flags.as ?? email.split('@')[0]).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
-    const dir = path.join(HOME, `.claude-${name}`);
-    // Never sign over a profile that is another account's: two emails can share a name.
-    const holder = profileAccount({ dir, configFile: configFileOf(dir) });
-    if (holder && holder.email?.toLowerCase() !== email.toLowerCase()) {
-      console.error(`${dir.replace(HOME, '~')} is already signed in as ${holder.email}. Give this one another name:\n  claude-tracker pool add ${email} --as <name>`);
+    console.log(`Signing ${email} into a spare - finish the login in your browser.\n`);
+    const r = await F.addSpare(email, typeof flags.as === 'string' ? flags.as : undefined);
+    if (r.already) { console.log(r.already); return; }
+    if (r.error) {
+      console.error(`\n${c.red}✗${c.reset} ${r.error}. Try again with a private browser window: claude-tracker pool add ${email}${flags.as ? ` --as ${flags.as}` : ''}`);
       process.exitCode = 1;
       return;
     }
-    fs.mkdirSync(path.join(dir, 'projects'), { recursive: true });
-    // The same setup as the main profile, so a session moved here behaves as it did.
-    const { shareSetup } = await import('./pool.js');
-    shareSetup(dir);
-    console.log(`Signing ${email} into ${dir.replace(HOME, '~')} - finish the login in your browser.\n`);
-    const code = await new Promise((resolve) => {
-      const child = spawn(process.env.CLAUDE_TRACKER_CLAUDE || 'claude', ['auth', 'login', '--email', email],
-        { env: { ...process.env, CLAUDE_CONFIG_DIR: dir }, stdio: 'inherit' });
-      child.on('error', () => resolve(-1));
-      child.on('close', resolve);
-    });
-    const who = profileAccount({ dir, configFile: configFileOf(dir) });
-    const again = `claude-tracker pool add ${email}${flags.as ? ` --as ${flags.as}` : ''}`;
-    if (code !== 0 || !who) { console.error(`\n${c.red}✗${c.reset} not signed in - run it again when ready: ${again}`); process.exitCode = 1; return; }
-    if (who.email?.toLowerCase() !== email.toLowerCase()) {
-      // The browser was signed into another account. The profile was empty before,
-      // so sign it out again rather than leave it holding the wrong one.
-      await new Promise((resolve) => {
-        const child = spawn(process.env.CLAUDE_TRACKER_CLAUDE || 'claude', ['auth', 'logout'],
-          { env: { ...process.env, CLAUDE_CONFIG_DIR: dir }, stdio: 'ignore' });
-        child.on('error', resolve);
-        child.on('close', resolve);
-      });
-      console.error(`\n${c.red}✗${c.reset} the browser signed in as ${who.email}, not ${email}, so that was undone.`);
-      console.error(`  Open the sign-in link in a private window, sign in as ${email}, and run: ${again}`);
-      process.exitCode = 1;
-      return;
-    }
-    // Now there is a config file to carry MCP servers and folder trust into.
-    const shared = shareSetup(dir);
-    console.log(`\n${c.green}✓${c.reset} ${dir.replace(HOME, '~')} is signed in as ${c.bold}${who.email}${c.reset}; sessions can now be moved to it.`);
-    if (shared.copied.length) console.log(`  ${c.dim}also given: ${shared.copied.join(', ')}${c.reset}`);
-    return;
-  }
-
-  if (action === 'link') {
-    const { shareSetup, mainProfile } = await import('./pool.js');
-    const main = mainProfile();
-    for (const p of F.pool().filter((x) => !x.isDefault)) {
-      const r = shareSetup(p.dir, { force: !!flags.force });
-      const did = [...r.linked, ...r.copied, ...(r.memories ? [`${r.memories} project memories`] : [])];
-      console.log(`  ${pad(p.shown, 24)} ${did.length ? `${c.green}shared${c.reset} ${did.join(', ')}` : `${c.dim}already shares ${main ? main.name : 'the main profile'}'s setup${c.reset}`}`);
-      if (r.kept.length) console.log(`  ${' '.repeat(24)} ${c.yellow}kept its own${c.reset} ${r.kept.join(', ')} ${c.dim}- --force replaces them, keeping the old as .pre-pool${c.reset}`);
-    }
+    console.log(`\n${c.green}✓${c.reset} ${email} is a spare, in ${r.added.shown}; a profile running low can switch to it.`);
     return;
   }
 
   const ov = overview();
   const byUuid = new Map(ov.accounts.map((a) => [a.accountUuid, a]));
   const room = (uuid) => { const a = byUuid.get(uuid); return a ? (a.available.now ? `${pct(F.headroom(a))} free` : `out until ${when(a.available.at)}`) : ''; };
-  console.log(`\n${c.bold}Signed-in profiles - where sessions can be moved${c.reset}\n`);
-  for (const p of F.pool()) console.log(`  ${pad(p.shown, 22)} ${pad(p.email ?? p.accountUuid, 28)} ${c.dim}${room(p.accountUuid)}${c.reset}`);
-  for (const m of (await import('./replica.js')).remoteMachines()) {
-    for (const p of m.profiles.filter((x) => x.accountUuid)) console.log(`  ${pad(`${p.dir} (${m.name})`, 22)} ${pad(p.email ?? p.accountUuid, 28)} ${c.dim}${room(p.accountUuid)}${c.reset}`);
+  const { discoverProfiles } = await import('./paths.js');
+  const { profileAccount } = await import('./accounts.js');
+  console.log(`\n${c.bold}Signed in on this machine${c.reset}\n`);
+  for (const p of discoverProfiles().filter((x) => !x.dir.includes(F.SPARE_PREFIX))) {
+    const a = profileAccount(p);
+    if (a) console.log(`  ${pad(tildePath(p.dir), 26)} ${pad(a.email ?? a.accountUuid, 28)} ${c.dim}${room(a.accountUuid)} · in use${c.reset}`);
   }
-  const signed = new Set([...F.pool().map((p) => p.accountUuid)]);
-  const missing = ov.accounts.filter((a) => !signed.has(a.accountUuid) && a.available.now && a.email);
+  for (const s of F.spares()) {
+    console.log(s.accountUuid
+      ? `  ${pad(s.shown, 26)} ${pad(s.email, 28)} ${c.dim}${room(s.accountUuid)} · spare${c.reset}`
+      : `  ${pad(s.shown, 26)} ${pad(s.for ?? '', 28)} ${c.dim}signed into a profile right now${c.reset}`);
+  }
+  const here = new Set([...F.spares().map((s) => s.email?.toLowerCase()), ...F.spares().map((s) => s.for?.toLowerCase()),
+    ...discoverProfiles().map((p) => profileAccount(p)?.email?.toLowerCase())]);
+  const missing = ov.accounts.filter((a) => a.email && !here.has(a.email.toLowerCase()));
   if (missing.length) {
-    console.log(`\n  ${c.dim}Not signed in on this machine:${c.reset}`);
-    for (const a of missing) console.log(`  ${pad(a.email, 50)} ${c.dim}${room(a.accountUuid)} · claude-tracker pool add ${a.email}${c.reset}`);
+    console.log(`\n  ${c.dim}No spare on this machine:${c.reset}`);
+    for (const a of missing) console.log(`  ${pad(a.email, 54)} ${c.dim}${room(a.accountUuid)} · claude-tracker pool add ${a.email}${c.reset}`);
   }
   console.log();
 }
+
+const tildePath = (p) => p.replace(process.env.HOME ?? '', '~');
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const ago = (t) => (t ? `${duration(Date.now() - t)} ago` : 'never');
@@ -585,11 +527,10 @@ ${c.bold}claude-tracker${c.reset} — local usage and rate-limit tracking for Cl
   ${c.bold}service${c.reset} install|uninstall     run in the background at login (launchd or systemd)
   ${c.bold}sync${c.reset} add <ssh-host>           sync with the tracker on another machine, over ssh
   ${c.bold}sync${c.reset} [status]|remove <host>|name <name>
-  ${c.bold}failover${c.reset} [status]|on|off      move sessions off an account that runs low
+  ${c.bold}failover${c.reset} [status]|on|off      switch a profile off an account that runs low
         ${c.dim}on [--at 90] [--wait 15]${c.reset}  at what fill, and not if it frees up that soon
-        ${c.dim}move <session> [--to <email>]${c.reset}  move one now
-  ${c.bold}pool${c.reset} [list]|add <email>        accounts signed in here, that sessions can move to
-        ${c.dim}link [--force]${c.reset}           share this machine's setup with every pool profile
+        ${c.dim}switch [--to <email>]${c.reset}     switch now
+  ${c.bold}pool${c.reset} [list]|add <email>        spare sign-ins on this machine, to switch to
 
 ${c.dim}In the terminal dashboard: q quit · r refresh · a cycle account · w switch
 window · space pause · ↑↓/jk scroll${c.reset}

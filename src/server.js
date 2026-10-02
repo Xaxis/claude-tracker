@@ -9,7 +9,7 @@ import { startWatcher } from './watcher.js';
 import { listAccounts } from './accounts.js';
 import { notify } from './notify.js';
 import { PROTOCOL, advertise, startSync } from './sync.js';
-import { plan, runFailover, attachCommand } from './failover.js';
+import { plan, runFailover } from './failover.js';
 import { send } from './notify.js';
 import { setMeta } from './db.js';
 
@@ -259,12 +259,15 @@ export async function serve({ port = 4785, open = false, refresh, fastRefresh, a
       try {
         const ov = overview(), live = liveSessions();
         setMeta('failover_plan', JSON.stringify({ ...plan(ov, live), computedAt: Date.now() }));
-        const moves = await runFailover(ov, live);
-        for (const m of moves) {
-          send(m.status === 'started' ? 'Claude session moved' : 'Claude session not moved',
-            m.status === 'started' ? `${m.name} carries on as another account: ${attachCommand(m)}` : `${m.name}: ${m.error}`);
+        const names = new Map(ov.accounts.map((a) => [a.accountUuid, a.label]));
+        const made = runFailover(ov, live);
+        for (const m of made) {
+          send(m.status === 'switched' ? 'Claude switched accounts' : 'Claude could not switch accounts',
+            m.status === 'switched'
+              ? `${names.get(m.from_account) ?? 'The account'} ran low; its sessions carry on as ${names.get(m.to_account) ?? 'another account'}.`
+              : m.error);
         }
-        if (moves.length) push({ reason: 'failover' });
+        if (made.length) push({ reason: 'failover' });
       } catch (err) {
         if (ui) ui.reportError(`failover: ${err.message}`); else console.error('failover failed:', err.message);
       } finally {

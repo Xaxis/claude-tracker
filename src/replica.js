@@ -398,11 +398,11 @@ export function saveState(id, state) {
     mode: clean(f.mode, 10), at: num(f.at),
     best: f.best ? { label: clean(f.best.label), room: num(f.best.room) } : null,
     entries: (Array.isArray(f.entries) ? f.entries : []).slice(0, 20).map((e) => ({
-      label: clean(e?.label), level: num(e?.level), due: !!e?.due, out: !!e?.out, sessions: num(e?.sessions) ?? 0,
+      profile: clean(e?.profile), label: clean(e?.label), level: num(e?.level), due: !!e?.due, out: !!e?.out, sessions: num(e?.sessions) ?? 0,
       target: e?.target ? { label: clean(e.target.label), room: num(e.target.room), shown: clean(e.target.shown) } : null,
     })),
-    moves: (Array.isArray(f.moves) ? f.moves : []).slice(0, 20).map((m) => ({
-      ts: num(m?.ts), name: clean(m?.name), to: clean(m?.to), status: clean(m?.status, 10),
+    switches: (Array.isArray(f.switches) ? f.switches : []).slice(0, 20).map((m) => ({
+      ts: num(m?.ts), profile: clean(m?.profile), from: clean(m?.from), to: clean(m?.to), status: clean(m?.status, 10),
     })),
   } : null;
   const now = Date.now();

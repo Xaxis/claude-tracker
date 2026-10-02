@@ -81,8 +81,8 @@ Run it from any directory once linked:
 | `claude-tracker sync add me@devbox` | sync with the tracker on another machine, over ssh |
 | `claude-tracker sync` | which machines it syncs with, and how that is going |
 | `claude-tracker failover` | where sessions go when their account runs low |
-| `claude-tracker failover on` | move them automatically |
-| `claude-tracker pool add me@example.com` | sign another account into its own profile, as a place to move to |
+| `claude-tracker failover on` | switch accounts automatically when one runs low |
+| `claude-tracker pool add me@example.com` | sign an account into a spare, to switch to |
 
 Or from inside the repo, without linking — `yarn` and `npm run` both work:
 
@@ -334,53 +334,38 @@ whose five-hour windows reset at the same moment stay two accounts.
 
 ### Failing over
 
-When the account your sessions are on runs low, the tracker can carry them to the
-account with the most room:
+When the account a profile is signed into runs low, the tracker signs that
+profile into another account with room - exactly what a `/login` in one of its
+sessions does - and every session running in it carries on as that account,
+mid-task, within about 30 seconds:
 
 ```sh
 claude-tracker pool add me@example.com    # once per account, per machine: a browser login
-claude-tracker failover on                # move at 90% (--at to change)
+claude-tracker failover on                # switch at 90% (--at to change)
 ```
 
-Signing in takes a browser, so the tracker never does it - `pool add` creates a
-profile (`~/.claude-me`) and opens Claude Code's own login once. From then on
-that profile stays signed in, and a session can be started on it at any time.
+Signing in takes a browser, so it is done once per account, ahead of time:
+`pool add` signs the account into a spare, `~/.claude-pool-<name>`, which holds
+its sign-in while it is not in use. When a profile's account crosses the
+threshold, the tracker service - the one thing on the machine that switches, never
+the sessions - moves the sign-in of the spare account with the most room into the
+profile, and the outgoing account's into a spare of its own. Then it leaves the
+profile ten minutes to settle. Nothing switches when the account frees up within
+15 minutes (`--wait`).
 
-A pool profile is your setup with another sign-in. It links your main profile's
-settings (hooks, permissions, status line), instructions, skills, agents,
-commands, plugins and keybindings, so a change to any of them shows in every
-profile; copies in your user-level MCP servers and the folders you have trusted,
-which live in the config file beside the sign-in; and links each project's
-memory to the main profile's, so a session moved there remembers what it did and
-what it learns is kept in one place. `claude-tracker pool link` does the same for
-profiles made by hand, keeping anything they have of their own unless `--force`.
-
-A session is only ever moved while it is idle - one mid-turn finishes the turn,
-or is refused, first - so the old and the new never work at once. A move copies
-the session's transcript into the profile with the most room and resumes it
-there, forked, as a background session, in the same folder, with its history,
-settings and memories: `claude attach <id>` opens it.
-
-- **A window you are working in** moves when its account runs out. Until then
-  your next message goes to it, and a copy started early would only drift from
-  it. When work you left running is cut off by the limit, it carries on as the
-  other account within about 20 seconds, told to pick up where it stopped; a
-  window that was waiting for you waits for you there. Its old window cannot be
-  switched from outside, so its status line says where the work went and how to
-  open it: `⇢ continues as proton: CLAUDE_CONFIG_DIR=~/.claude-proton claude attach 1a2b3c4d`.
-  Carry on there, not in the old window.
-- **A background session** moves as soon as its account crosses the threshold,
-  and its original is stopped, so only one carries on.
-
-Nothing moves when the account frees up within 15 minutes (`--wait`).
+A sign-in is moved, never copied: each token refresh retires the token before it,
+so one left in two places would go stale in one of them. The switch takes Claude
+Code's own lock on its credentials, writes in an order that can never lose one,
+and touches only the account's tokens and details - an MCP server's own tokens
+stay with the profile. On macOS the sign-ins are Keychain items, as Claude Code
+keeps them; elsewhere, files in each profile. They never leave the machine: each
+machine switches with its own spares.
 
 The plan is always on show, switched on or not: in the terminal under `USE NOW`,
 in the browser as a Failover panel, and with `claude-tracker failover` - each
-account in use, how full it is, and where its sessions would go. Each machine
-moves its own sessions through its own profiles; synced machines show each
-other's plans. When no profile on a machine is signed into an account with room,
-it says so and names the account with the most, with the `pool add` that would
-make it a target. `claude-tracker failover move <session>` moves one now.
+profile with sessions running, the account it is on, how full, and what it would
+switch to, on every synced machine. `claude-tracker failover switch` switches now;
+`claude-tracker pool` lists what is signed in where.
 
 ### Realtime
 
@@ -550,7 +535,7 @@ to every account on the plan.
 
 Everything stays on this machine, unless you sync it: then the index is copied
 to the machines you added, over ssh, and theirs to this one. The tracker reads
-Claude Code's transcripts and config files, and never reads credentials. `statusline install` edits only the
+Claude Code's transcripts and config files. It reads and moves sign-ins only to fail over, between profiles on the same machine, never anywhere else. `statusline install` edits only the
 `statusLine` key of each profile's `settings.json`, after writing a backup.
 Notifications go through macOS's own notification centre. The web server binds
 to `127.0.0.1` only, and the index lives in `~/.claude/tracker/`. A sync
@@ -585,7 +570,8 @@ depend on your own usage history.
 | `src/service.js` | the login service: launchd or systemd |
 | `src/replica.js` | what syncing copies between machines, and how it merges |
 | `src/sync.js` | the sync connection: ssh, the relay, the protocol |
-| `src/failover.js` | where sessions go when their account runs low, and moving them |
+| `src/failover.js` | which account a profile switches to when its own runs low, and when |
+| `src/signin.js` | a profile's sign-in, read and moved the way Claude Code keeps it |
 | `src/billing.js` | projects the subscription cycle from its start date |
 | `src/api.js` | aggregation for both dashboards |
 | `src/tui.js` | terminal dashboard |
