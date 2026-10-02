@@ -281,7 +281,7 @@ const when = (ts) => new Date(ts).toLocaleString([], { month: 'short', day: 'num
 function printPlan(p, machine, settings) {
   if (!p.entries?.length) { console.log(`  ${c.dim}${machine}: no sessions running${c.reset}`); return; }
   for (const e of p.entries) {
-    console.log(`  ${c.bold}${e.profile}${c.reset} ${c.dim}on ${machine} · signed into${c.reset} ${e.label} ${c.dim}· ${pct(e.level)} of its fullest window · ${e.sessions} session${e.sessions === 1 ? '' : 's'}${c.reset}`);
+    console.log(`  ${c.bold}${e.profile ?? "a profile"}${c.reset} ${c.dim}on ${machine} · signed into${c.reset} ${e.label} ${c.dim}· ${pct(e.level)} of its fullest window · ${e.sessions} session${e.sessions === 1 ? '' : 's'}${c.reset}`);
     console.log(e.target
       ? `    ${e.due ? `${c.yellow}switching${c.reset}` : 'switches'} to ${c.bold}${e.target.label}${c.reset} ${c.dim}(${pct(e.target.room)} free)${e.due ? '' : ` at ${settings.at}%`}${c.reset}`
       : `    ${c.red}nothing to switch to${c.reset} ${c.dim}- no spare on ${machine} holds an account with room${c.reset}`);

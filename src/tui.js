@@ -153,7 +153,7 @@ function failoverLines(f, here, now) {
   const rows = [];
   for (const p of plans) {
     for (const e of p.entries ?? []) {
-      const who = `${C.muted}${e.profile}${plans.length > 1 ? ` on ${p.machine}` : ''}${C.reset} ${A.bold}${e.label}${A.reset} ${C.muted}${Math.round(e.level)}%${C.reset}`;
+      const who = `${C.muted}${e.profile ?? "a profile"}${plans.length > 1 ? ` on ${p.machine}` : ''}${C.reset} ${A.bold}${e.label}${A.reset} ${C.muted}${Math.round(e.level)}%${C.reset}`;
       const to = e.target
         ? `${C.accent}${e.target.label}${C.reset} ${C.muted}${Math.round(e.target.room)}% free${C.reset}`
         : `${C.critical}nothing${C.reset} ${C.muted}- no spare there with room${C.reset}`;
