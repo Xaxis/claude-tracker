@@ -360,6 +360,13 @@ async function cmdPool(action, args, flags) {
     if (already) { console.log(`${email} is already signed in on this machine, in ${already.shown}.`); return; }
     const name = String(flags.as ?? email.split('@')[0]).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
     const dir = path.join(HOME, `.claude-${name}`);
+    // Never sign over a profile that is another account's: two emails can share a name.
+    const holder = profileAccount({ dir, configFile: configFileOf(dir) });
+    if (holder && holder.email?.toLowerCase() !== email.toLowerCase()) {
+      console.error(`${dir.replace(HOME, '~')} is already signed in as ${holder.email}. Give this one another name:\n  claude-tracker pool add ${email} --as <name>`);
+      process.exitCode = 1;
+      return;
+    }
     fs.mkdirSync(path.join(dir, 'projects'), { recursive: true });
     // Carry over how Claude Code is set up here, so a session moved into this
     // profile behaves as it did: settings copied, instructions and agents linked.
