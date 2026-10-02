@@ -203,3 +203,21 @@ esac
   r = add('main@x.com', 'main@x.com');
   assert.match(r.stdout, /is what ~\/\.claude is signed into now/, 'the account in use needs no spare yet');
 });
+
+test('two machines running low together take different spares when the best are equally free', () => {
+  const root = scratch();
+  const out = inChild(root, `${SETUP}
+    const { machine } = await import('${SRC}replica.js');
+    db().prepare("DELETE FROM utilization WHERE account_uuid IN ('B', 'C')").run();   // B and C both untouched: equally free
+    reading('A', 'five_hour', 95, now + 3 * HOUR);
+    const pick = () => F.plan(api.overview(), api.liveSessions()).entries[0].target.label;
+    const alone = pick();
+    // Another machine joins whose id sorts before this one's: this one takes the next turn.
+    db().prepare("INSERT INTO sync_machines (machine_id, name) VALUES ('000000000000', 'other')").run();
+    const second = pick();
+    return { alone, second, me: machine().id > '000000000000' };
+  `);
+  assert.equal(out.me, true);
+  assert.notEqual(out.alone, out.second, 'each machine its own turn');
+  assert.deepEqual([out.alone, out.second].sort(), ['b@x.com', 'c@x.com']);
+});
