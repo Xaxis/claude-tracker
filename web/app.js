@@ -119,6 +119,15 @@ async function getJson(url) {
 
 /* --- accounts ------------------------------------------------------------- */
 
+/** A moment ahead as a clock time, with the day when it is not today. */
+function clock(ts) {
+  if (!ts) return 'unknown';
+  const d = new Date(ts);
+  const opts = d.toDateString() === new Date().toDateString()
+    ? { hour: '2-digit', minute: '2-digit' } : { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' };
+  return d.toLocaleString([], opts);
+}
+
 /**
  * Where each account is in use: signed into a machine's main profile, or
  * billing a session running there. Account -> machine names, null for this
@@ -170,7 +179,12 @@ function renderAccounts(data, live = []) {
       pill.append(el('span', 'dot', '●'), document.createTextNode(` ${named ? m ?? data.sync.name : 'in use'}`));
       pills.append(pill);
     }
-    if (!where.length && a.limits.some((l) => l.blocked)) pills.append(el('span', 'pill blocked', 'limited'));
+    // An account that cannot take a request says when it can again.
+    if (!a.available.now) {
+      const out = el('span', 'pill blocked', `${a.available.sure ? '' : '≈ '}out until ${clock(a.available.at)}`);
+      out.title = `${a.limits.find((l) => l.type === a.available.limit)?.label ?? 'A limit'} is full; usable again ${clock(a.available.at)}, in ${duration(a.available.at - data.now)}.`;
+      pills.append(out);
+    }
     if (pills.childNodes.length) head.append(pills);
     card.append(head);
 
@@ -179,9 +193,11 @@ function renderAccounts(data, live = []) {
         ? `resets in ${duration(l.resetsInMs)}`
         : 'idle — next request opens a new window';
       const m = meter({ label: l.label, percent: l.percent, blocked: l.blocked, foot });
-      if (l.confidence === 'exact') {
-        const tag = el('span', 'exact-tag', 'exact');
-        tag.title = `Reported by Claude Code ${duration(Date.now() - l.exactAt)} ago, carried forward with calls since`;
+      if (l.confidence === 'exact' || l.confidence === 'carried') {
+        const tag = el('span', 'exact-tag', l.confidence === 'exact' ? 'exact' : '≈ carried');
+        tag.title = l.confidence === 'exact'
+          ? `Reported by Claude Code ${duration(Date.now() - l.exactAt)} ago`
+          : `Reported by Claude Code ${duration(Date.now() - l.exactAt)} ago, plus an estimate of the calls made since`;
         m.querySelector('.meter-name').append(tag);
       }
       m.dataset.resetAt = l.end ?? '';
@@ -195,7 +211,7 @@ function renderAccounts(data, live = []) {
       }
       // Every unmeasured ceiling says so, on its own row - suppressing one to
       // reduce clutter would leave an estimate looking like a measurement.
-      if (l.confidence !== 'measured' && l.confidence !== 'exact') {
+      if (!['measured', 'exact', 'carried'].includes(l.confidence)) {
         const note = {
           partial: '≈ ceiling from one observed limit',
           tier: '≈ ceiling borrowed from a same-plan account',
@@ -289,6 +305,7 @@ function renderHero(data) {
     percent: limit.percent,
     blocked: limit.blocked,
     foot: limit.confidence === 'exact' ? 'exact, reported by Claude Code'
+      : limit.confidence === 'carried' ? 'reported by Claude Code, plus the calls since (≈)'
       : limit.used == null ? '' : `${money(limit.used)} of ~${money(limit.capacity)}`,
   }));
   const m = host.firstChild;

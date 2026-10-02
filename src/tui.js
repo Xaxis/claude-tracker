@@ -134,6 +134,15 @@ function sparkline(values, max) {
 
 /* --- the dashboard -------------------------------------------------------- */
 
+/** A moment ahead as a clock time - with the day when it is not today - and how far off it is. */
+function clockAt(ts, now) {
+  if (!ts) return 'unknown';
+  const d = new Date(ts);
+  const hm = d.toTimeString().slice(0, 5);
+  const day = d.toDateString() === new Date(now).toDateString() ? '' : `${d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })} `;
+  return `${day}${hm} (in ${duration(ts - now)})`;
+}
+
 /** The machines this one syncs with, for the header: bright while they report, dim once they stop. */
 function syncMark(sync, now) {
   if (!sync) return '';
@@ -299,7 +308,10 @@ export function startTui({ webUrl, onQuit }) {
       const tier = a.tier ? `${C.muted}${a.tier.replace('default_claude_', '').replace(/_/g, ' ')}${C.reset}` : '';
       const exact = a.limits.some((l) => l.confidence === 'exact') ? `${C.good}exact${C.reset} ${C.muted}·${C.reset} ` : '';
       const stats = `${exact}${C.muted}${money(a.totalCost)} · ${a.sessions} session${a.sessions === 1 ? '' : 's'}${C.reset}`;
-      const name = `${mark} ${A.bold}${a.label}${A.reset} ${on}${tier}`;
+      // An account that cannot take a request says when it can again.
+      const out = a.available.now ? ''
+        : `${C.critical}${a.available.sure ? '' : '≈ '}out until ${clockAt(a.available.at, now)}${C.reset} `;
+      const name = `${mark} ${A.bold}${a.label}${A.reset} ${out}${on}${tier}`;
       L.push(`  ${padEnd(truncate(name, inner - vlen(stats) - 2), inner - vlen(stats))}${stats}`);
 
       // Budget the row explicitly, then give the bar whatever is left. Widths
@@ -346,7 +358,12 @@ export function startTui({ webUrl, onQuit }) {
         tier: 'borrowed from another account on the same plan',
         default: 'estimated — no limit observed anywhere yet',
       };
-      const soft = a.limits.filter((l) => l.confidence !== 'measured' && l.confidence !== 'exact');
+      const carried = a.limits.filter((l) => l.confidence === 'carried');
+      if (carried.length) {
+        const age = Math.max(...carried.map((l) => now - (l.exactAt ?? now)));
+        L.push(`    ${C.muted}${carried.map((l) => l.label).join(' + ')}: Claude Code's reading ${duration(age)} ago, plus the calls made since (≈)${C.reset}`);
+      }
+      const soft = a.limits.filter((l) => !['measured', 'exact', 'carried'].includes(l.confidence));
       if (soft.length) {
         // Group so two limits sharing a confidence produce one line, not two.
         const seen = new Set();

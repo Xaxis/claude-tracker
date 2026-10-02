@@ -14,6 +14,7 @@ import { db, tx } from './db.js';
 export const LIVE_DIR = path.join(DATA_DIR, 'live');
 const KEEP_MS = 24 * 3600e3;
 const IDLE_MS = 2 * 60_000;
+const SPANS = { five_hour: 5 * 3600e3, seven_day: 7 * 86400e3 };
 
 const toMs = (v) => {
   if (v == null) return null;
@@ -47,6 +48,7 @@ export function ingestLive() {
   const d = db();
   const last = d.prepare('SELECT pct, resets_at FROM utilization WHERE session_id = ? AND limit_type = ? ORDER BY ts DESC LIMIT 1');
   const lastCall = d.prepare('SELECT MAX(ts) t FROM events WHERE session_id = ?');
+  const lastRead = d.prepare('SELECT MAX(ts) t FROM utilization WHERE session_id = ?');
   const ins = d.prepare(`INSERT OR IGNORE INTO utilization (ts, session_id, config_dir, account_uuid, limit_type, pct, resets_at)
                          VALUES (?,?,?,?,?,?,?)`);
   const now = Date.now();
@@ -59,9 +61,15 @@ export function ingestLive() {
       if (!rec?.session_id || !rec.ts) continue;
       if (now - rec.ts > KEEP_MS) { try { fs.unlinkSync(file); } catch { /* gone */ } continue; }
       // The status line repeats the last response's numbers on every render, so
-      // an idle session's reading is only as new as its last call.
+      // an idle session's reading is only as new as its last call - the first
+      // time it is read after that call. Numbers that change again with no call
+      // since were fetched afresh (a /login, a resume) and are as new as the
+      // render; and none can predate the window they describe.
       const lc = lastCall.get(rec.session_id)?.t;
-      const at = lc != null && rec.ts - lc > IDLE_MS ? lc : rec.ts;
+      const seen = lastRead.get(rec.session_id)?.t;
+      const opened = Math.max(0, ...Object.entries(rec.rate_limits ?? {})
+        .map(([type, l]) => (SPANS[type] && toMs(l?.resets_at) ? toMs(l.resets_at) - SPANS[type] : 0)));
+      const at = lc != null && rec.ts - lc > IDLE_MS && (seen == null || seen < lc) && lc >= opened ? lc : rec.ts;
       let acct;
       for (const [type, l] of Object.entries(rec.rate_limits ?? {})) {
         if (typeof l?.used_percentage !== 'number') continue;

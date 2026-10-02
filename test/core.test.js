@@ -569,9 +569,12 @@ test('a bar anchors to the exact reading and moves with calls made since', async
   call('c2', reading + 5 * MIN, 5);     // $5 since -> another 25 points
   const a = overview(now).accounts.find((x) => x.accountUuid === 'A');
   const l = a.limits.find((x) => x.type === 'five_hour');
-  assert.equal(l.confidence, 'exact');
+  assert.equal(l.confidence, 'carried', 'the calls since are an estimate on top of the reading');
   assert.ok(Math.abs(l.percent - 75) < 0.5, `expected ~75%, got ${l.percent}`);
   assert.equal(l.end, now + 2 * HOUR, 'the reset time is the one Claude Code reported');
+  db().prepare("DELETE FROM events WHERE call_id = 'c2'").run();
+  const plain = overview(now).accounts.find((x) => x.accountUuid === 'A').limits.find((x) => x.type === 'five_hour');
+  assert.deepEqual([plain.confidence, Math.round(plain.percent)], ['exact', 50], 'with no calls since, the reading stands as read');
 });
 
 test('an old sighting does not claim a profile for months', () => {
@@ -846,4 +849,94 @@ test('rows from another machine keep their profiles apart, and merge without fla
   assert.throws(() => R.importBatch(other, 'events', ['call_id', 'ts'], [['c1', 'yesterday']], 9), /events\.ts is not a valid number/);
   assert.throws(() => R.importBatch(other, 'nope', [], [], 1), /unknown table/);
   assert.equal(db().prepare("SELECT COUNT(*) n FROM sync_cursors WHERE tbl = 'events'").get().n, 0);
+});
+
+/* ---------------------------------------------------- when accounts free up */
+
+const observe = (dir, ts, account) => db().prepare(
+  "INSERT INTO account_observations (ts, config_dir, account_uuid, source) VALUES (?,?,?,'watch')").run(ts, dir, account);
+
+test('a session repeating its first email after a /login elsewhere follows the login', async () => {
+  reset();
+  const { attributeEvents: attribute } = await import('../src/accounts.js');
+  const dir = '/home/me/.claude', t0 = Date.UTC(2026, 8, 30, 10, 0);
+  db().prepare("INSERT INTO accounts (account_uuid, email) VALUES ('X', 'x@x.com'), ('Y', 'y@x.com')").run();
+  session('s1', t0, dir);
+  point('s1', t0, { email: 'x@x.com', source: 'context' });
+  for (let t = t0; t < t0 + 2 * HOUR; t += 10 * MIN) observe(dir, t, 'X');
+  // A /login typed into another session moves the profile, and s1 with it...
+  for (let t = t0 + 2 * HOUR; t < t0 + 3 * HOUR; t += 10 * MIN) observe(dir, t, 'Y');
+  // ...but s1 goes on writing the email it started with.
+  point('s1', t0 + 2 * HOUR + 30 * MIN, { email: 'x@x.com', source: 'context' });
+  rawEvent('before', 's1', t0 + HOUR, dir);
+  rawEvent('after', 's1', t0 + 2 * HOUR + 40 * MIN, dir);
+  attribute({ all: true });
+  assert.equal(acctOf('before'), 'X');
+  assert.equal(acctOf('after'), 'Y', 'a repeat of the email it started with is not news');
+});
+
+test('two accounts sharing a five-hour reset are told apart by their weekly windows', async () => {
+  reset();
+  const { attributeEvents: attribute } = await import('../src/accounts.js');
+  const t0 = Date.UTC(2026, 9, 1, 12, 0), r5 = t0 + 4 * HOUR;
+  db().prepare("INSERT INTO accounts (account_uuid, email) VALUES ('A', 'a@x.com'), ('B', 'b@x.com')").run();
+  const read = (sid, dir, ts, type, pct, resetsAt) => db().prepare(`INSERT INTO utilization
+    (ts, session_id, config_dir, account_uuid, limit_type, pct, resets_at) VALUES (?,?,?,NULL,?,?,?)`).run(ts, sid, dir, type, pct, resetsAt);
+  // Two profiles, each watched on its own account, each running a session; both
+  // five-hour windows opened in the same ten minutes, so they share a reset.
+  for (const [sid, dir, acct, week, pct] of [['sa', '/a', 'A', t0 + 3 * 86400e3, 60], ['sb', '/b', 'B', t0 + 5 * 86400e3, 10]]) {
+    session(sid, t0, dir);
+    for (let t = t0 - HOUR; t < t0 + 2 * HOUR; t += 10 * MIN) observe(dir, t, acct);
+    for (let i = 0; i < 6; i++) {
+      const ts = t0 + i * 10 * MIN;
+      read(sid, dir, ts, 'five_hour', pct + i, r5);
+      read(sid, dir, ts, 'seven_day', pct + 20 + i, week);
+    }
+    rawEvent(`${sid}-call`, sid, t0 + 30 * MIN, dir);
+  }
+  attribute({ all: true });
+  const filed = (sid, type) => [...new Set(db().prepare('SELECT account_uuid a FROM utilization WHERE session_id = ? AND limit_type = ?').all(sid, type).map((r) => r.a))];
+  assert.deepEqual([filed('sa', 'five_hour'), filed('sa', 'seven_day')], [['A'], ['A']]);
+  assert.deepEqual([filed('sb', 'five_hour'), filed('sb', 'seven_day')], [['B'], ['B']], 'one reset, two accounts');
+  assert.deepEqual([acctOf('sa-call'), acctOf('sb-call')], ['A', 'B']);
+});
+
+test('a full window says when its account frees up; one whose time is up reads empty', async () => {
+  reset();
+  const { overview } = await import('../src/api.js');
+  const now = Date.now();
+  db().prepare("INSERT INTO accounts (account_uuid, email, last_seen) VALUES ('E', 'e@x.com', ?), ('F', 'f@x.com', ?)").run(now, now);
+  db().prepare(`INSERT INTO utilization (ts, session_id, account_uuid, limit_type, pct, resets_at)
+                VALUES (?, 'se', 'E', 'five_hour', 100, ?)`).run(now - 5 * MIN, now + HOUR);
+  // F used a window that has since run out its five hours.
+  db().prepare("INSERT INTO events (call_id, ts, session_id, cost_usd, account_uuid) VALUES ('f1', ?, 'sf', 400, 'F')").run(now - 6 * HOUR);
+  const ov = overview(now);
+  const e = ov.accounts.find((x) => x.accountUuid === 'E');
+  assert.deepEqual(e.available, { now: false, at: now + HOUR, limit: 'five_hour', sure: true });
+  const f = ov.accounts.find((x) => x.accountUuid === 'F');
+  const f5 = f.limits.find((x) => x.type === 'five_hour');
+  assert.deepEqual([f5.active, f5.percent], [false, 0], 'the next request opens a fresh window');
+  assert.ok(f5.lastPercent > 0, 'how full it got is kept, as history');
+  assert.equal(f.available.now, true);
+  assert.notEqual(ov.recommendation?.accountUuid, 'E', 'an account that is out is never recommended');
+});
+
+test('an idle session whose numbers change with no call since is read as of now', async () => {
+  reset();
+  const { ingestLive, LIVE_DIR } = await import('../src/live.js');
+  fs.mkdirSync(LIVE_DIR, { recursive: true });
+  const now = Date.now(), lastCall = now - HOUR;
+  db().prepare("INSERT INTO events (call_id, ts, session_id, cost_usd) VALUES ('idle2', ?, 'sess-fresh', 1)").run(lastCall);
+  const snap = (pct, resetsAt, ts) => fs.writeFileSync(path.join(LIVE_DIR, 'sess-fresh.json'), JSON.stringify({
+    ts, session_id: 'sess-fresh', config_dir: '/home/me/.claude', account_uuid: 'A',
+    rate_limits: { five_hour: { used_percentage: pct, resets_at: Math.floor(resetsAt / 1000) } } }));
+  snap(30, now + HOUR, now - 10 * MIN);
+  ingestLive();
+  // The first reading after the call is that call's numbers...
+  // ...but a /login or a resume fetches new ones without a call: those are as new as the render.
+  snap(5, now + 4 * HOUR, now);
+  ingestLive();
+  const at = db().prepare("SELECT pct, ts FROM utilization WHERE session_id = 'sess-fresh' ORDER BY ts").all().map((r) => [r.pct, r.ts]);
+  assert.deepEqual(at, [[30, lastCall], [5, now]]);
+  fs.rmSync(LIVE_DIR, { recursive: true, force: true });
 });

@@ -142,7 +142,9 @@ function cmdStatus() {
     const marker = where.includes(null) ? `${c.green}●${c.reset}` : where.length ? `${c.blue}●${c.reset}` : `${c.gray}○${c.reset}`;
     const on = synced && where.length ? ` ${c.dim}on ${where.map((m) => m ?? o.sync.name).join(', ')}${c.reset}` : '';
     const tier = a.tier ? ` ${c.dim}${a.tier.replace('default_claude_', '')}${c.reset}` : '';
-    console.log(`${marker} ${c.bold}${a.label}${c.reset}${on}${tier}  ${c.dim}${money(a.totalCost)} tracked · ${a.sessions} session${a.sessions === 1 ? '' : 's'}${c.reset}`);
+    const out = a.available.now ? ''
+      : ` ${c.red}${a.available.sure ? '' : '≈ '}out until ${new Date(a.available.at).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })} (in ${duration(a.available.at - o.now)})${c.reset}`;
+    console.log(`${marker} ${c.bold}${a.label}${c.reset}${out}${on}${tier}  ${c.dim}${money(a.totalCost)} tracked · ${a.sessions} session${a.sessions === 1 ? '' : 's'}${c.reset}`);
     for (const l of a.limits) {
       const blocked = l.blocked ? ` ${c.red}LIMIT HIT${c.reset}` : '';
       const conf = l.confidence === 'default' ? `${c.dim}(est)${c.reset}` : l.confidence === 'partial' ? `${c.dim}(~)${c.reset}` : '';
