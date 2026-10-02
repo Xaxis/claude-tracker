@@ -393,9 +393,21 @@ export function saveState(id, state) {
     name: clean(p?.name), dir: clean(p?.dir, 1000), isDefault: !!p?.isDefault,
     accountUuid: clean(p?.accountUuid, 64), email: clean(p?.email),
   }));
+  const f = state?.failover;
+  const failover = f && typeof f === 'object' ? {
+    mode: clean(f.mode, 10), at: num(f.at),
+    best: f.best ? { label: clean(f.best.label), room: num(f.best.room) } : null,
+    entries: (Array.isArray(f.entries) ? f.entries : []).slice(0, 20).map((e) => ({
+      label: clean(e?.label), level: num(e?.level), due: !!e?.due, sessions: num(e?.sessions) ?? 0,
+      target: e?.target ? { label: clean(e.target.label), room: num(e.target.room), shown: clean(e.target.shown) } : null,
+    })),
+    moves: (Array.isArray(f.moves) ? f.moves : []).slice(0, 20).map((m) => ({
+      ts: num(m?.ts), name: clean(m?.name), to: clean(m?.to), status: clean(m?.status, 10),
+    })),
+  } : null;
   const now = Date.now();
   stmt('UPDATE sync_machines SET state = ?, state_at = ?, last_seen = ? WHERE machine_id = ?')
-    .run(JSON.stringify({ running, profiles }), now, now, id);
+    .run(JSON.stringify({ running, profiles, failover }), now, now, id);
 }
 
 export function heardFrom(id) {
@@ -416,6 +428,7 @@ export function remoteMachines(now = Date.now()) {
       online: !!r.last_seen && now - r.last_seen < ONLINE_MS,
       running: current ? state?.running ?? [] : [],
       profiles: current ? state?.profiles ?? [] : [],
+      failover: current ? state?.failover ?? null : null,
     };
   });
 }

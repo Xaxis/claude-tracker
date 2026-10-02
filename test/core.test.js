@@ -755,6 +755,7 @@ test('the systemd unit hands every argument over unchanged', async () => {
   assert.match(unit, /^ExecStart="\/usr\/bin\/node" "\/a dir\/cli.js" "50%%d" "q\\"uote" "\$\$HOME"$/m);
   assert.match(unit, /^Environment="PATH=\/x%%y"$/m);
   assert.match(unit, /^Restart=always$/m);
+  assert.match(unit, /^KillMode=process$/m, 'sessions it started outlive a restart');
   assert.match(unit, /^WantedBy=default.target$/m);
 });
 

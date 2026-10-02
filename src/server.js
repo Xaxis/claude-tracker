@@ -9,6 +9,9 @@ import { startWatcher } from './watcher.js';
 import { listAccounts } from './accounts.js';
 import { notify } from './notify.js';
 import { PROTOCOL, advertise, startSync } from './sync.js';
+import { plan, runFailover, attachCommand } from './failover.js';
+import { send } from './notify.js';
+import { setMeta } from './db.js';
 
 const WEB_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'web');
 
@@ -244,11 +247,40 @@ export async function serve({ port = 4785, open = false, refresh, fastRefresh, a
     server.on('upgrade', (req, socket, head) => sync.accept(req, socket, head, advert.token));
   }
 
+  // Failing over is this process's too: every 20s, work out where sessions here
+  // would go and keep that for the dashboards and other machines - and, when
+  // it is switched on, move the ones that are due.
+  let failTimer = null;
+  if (web) {
+    let failing = false;
+    const failover = async () => {
+      if (failing) return;
+      failing = true;
+      try {
+        const ov = overview(), live = liveSessions();
+        setMeta('failover_plan', JSON.stringify({ at: Date.now(), ...plan(ov, live) }));
+        const moves = await runFailover(ov, live);
+        for (const m of moves) {
+          send(m.status === 'started' ? 'Claude session moved' : 'Claude session not moved',
+            m.status === 'started' ? `${m.name} carries on as another account: ${attachCommand(m)}` : `${m.name}: ${m.error}`);
+        }
+        if (moves.length) push({ reason: 'failover' });
+      } catch (err) {
+        if (ui) ui.reportError(`failover: ${err.message}`); else console.error('failover failed:', err.message);
+      } finally {
+        failing = false;
+      }
+    };
+    failTimer = setInterval(failover, 20_000);
+    setTimeout(failover, 3_000).unref();
+  }
+
   let closing = false;
   const shutdown = () => {
     if (closing) return;
     closing = true;
     clearInterval(fullTimer);
+    clearInterval(failTimer);
     stopWatching();
     sync?.stop();
     advert?.withdraw();

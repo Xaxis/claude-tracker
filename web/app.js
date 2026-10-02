@@ -578,6 +578,33 @@ function syncNote(sync) {
     (failing.length && !sync.machines.some((m) => m.online) ? ` ${failing.join('; ')}` : '');
 }
 
+/** Where sessions go when their account runs low, on every machine, and what was moved. */
+function renderFailover(ov) {
+  const f = ov.failover;
+  const host = $('#failover-rows');
+  host.textContent = '';
+  const plans = f ? [{ machine: ov.sync?.name ?? 'here', mode: f.mode, at: f.at, ...(f.plan ?? { entries: [] }), local: true }, ...f.remote] : [];
+  for (const p of plans) {
+    for (const e of p.entries ?? []) {
+      const row = el('div', 'row');
+      const main = el('div', 'row-main');
+      main.append(el('div', 'row-title', `${e.label} → ${e.target ? e.target.label : 'nowhere to move to'}`));
+      main.append(el('div', 'row-sub', e.target
+        ? `${Math.round(e.level)}% full${plans.length > 1 ? ` on ${p.machine}` : ''} · moves to ${e.target.shown}, ${Math.round(e.target.room)}% free`
+        : `${Math.round(e.level)}% full${plans.length > 1 ? ` on ${p.machine}` : ''} · no other account with room is signed in there`));
+      row.append(main);
+      row.append(el('div', 'row-value', p.mode !== 'auto' ? 'off' : e.due && e.target ? 'moving idle sessions' : `at ${p.at}%`));
+      host.append(row);
+    }
+    if (p.local && p.best) host.append(el('p', 'panel-note', `${p.best.label} has ${Math.round(p.best.room)}% free but no profile here is signed into it: claude-tracker pool add ${p.best.email}`));
+  }
+  for (const m of (f?.moves ?? []).filter((x) => Date.now() - x.ts < 6 * 3600e3).slice(0, 3)) {
+    host.append(el('p', 'panel-note', m.status === 'started' ? `Moved ${m.name} to ${m.to} - open it: ${m.attach}` : `Could not move ${m.name}: ${m.error}`));
+  }
+  $('#failover-mode').textContent = f?.mode === 'auto' ? `on at ${f.at}%` : 'off · claude-tracker failover on';
+  $('#failover').hidden = !host.childNodes.length;
+}
+
 /* --- sessions ------------------------------------------------------------- */
 
 function renderLive(rows) {
@@ -663,6 +690,7 @@ async function loadFast() {
     state.overview = ov;
     renderHero(ov);
     renderRecommendation(ov);
+    renderFailover(ov);
     renderAccounts(ov, live);
     renderLive(live);
     syncAccountFilter(ov);

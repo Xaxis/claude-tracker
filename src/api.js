@@ -9,6 +9,8 @@ import { modelLabel } from './pricing.js';
 import { billingPeriod, periodSpend } from './billing.js';
 import { accountAggregates } from './aggregates.js';
 import { machine, remoteMachines, listPeers, machineNameOf } from './replica.js';
+import { failoverSettings, recentMoves, attachCommand } from './failover.js';
+import { getMeta } from './db.js';
 
 const UNATTRIBUTED = '__unattributed__';
 
@@ -230,6 +232,7 @@ export function overview(now = Date.now()) {
     current: cur ? { accountUuid: cur.accountUuid, email: cur.email } : null,
     recommendation: recommend(rows, now),
     sync: syncSummary(now),
+    failover: failoverSummary(now),
   };
 }
 
@@ -411,6 +414,8 @@ export function localSessions(now = Date.now()) {
       lastCallAt: last,
       lastActivityAt: Math.max(s.updatedAt ?? 0, last ?? 0) || null,
       profile: profile.name,
+      profileDir: profile.dir,
+      transcriptId: sid,
       accountUuid: acct?.account_uuid ?? null,
       account: acct ? accountLabel(acct) : null,
       accountSource: source,
@@ -431,7 +436,36 @@ export function profileStates() {
 
 /** What this machine tells the machines it syncs with. */
 export function localState() {
-  return { running: localSessions(), profiles: profileStates() };
+  const f = failoverSummary();
+  return {
+    running: localSessions(), profiles: profileStates(),
+    failover: {
+      mode: f.mode, at: f.at, best: f.plan?.best ? { label: f.plan.best.label, room: f.plan.best.room } : null,
+      entries: (f.plan?.entries ?? []).map((e) => ({
+        label: e.label, level: e.level, due: e.due,
+        target: e.target && { label: e.target.label, room: e.target.room, shown: e.target.shown },
+        sessions: e.sessions.length,
+      })),
+      moves: f.moves.map((m) => ({ ts: m.ts, name: m.name, to: m.to, status: m.status })),
+    },
+  };
+}
+
+/**
+ * Failing over, for the dashboards: this machine's settings, the plan the
+ * service last worked out, the sessions it moved today, and every other
+ * machine's plan and moves as they last reported them.
+ */
+function failoverSummary(now = Date.now()) {
+  let cached = null;
+  try { cached = JSON.parse(getMeta('failover_plan') ?? 'null'); } catch { /* none yet */ }
+  const names = new Map(db().prepare('SELECT account_uuid, email, label FROM accounts').all().map((a) => [a.account_uuid, a.label ?? a.email]));
+  const moves = recentMoves(now - 24 * 3600e3).map((m) => ({
+    ts: m.ts, name: m.name, from: names.get(m.from_account) ?? m.from_account, to: names.get(m.to_account) ?? m.to_account,
+    status: m.status, error: m.error, attach: m.bg_id ? attachCommand(m) : null,
+  }));
+  const remote = remoteMachines(now).filter((m) => m.failover).map((m) => ({ machine: m.name, ...m.failover }));
+  return { ...failoverSettings(), plan: cached, moves, remote };
 }
 
 /**

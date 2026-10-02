@@ -249,6 +249,25 @@ CREATE TABLE IF NOT EXISTS sync_machines (
   state_at   INTEGER
 );
 
+-- Sessions carried to another account because theirs ran low (see failover.js).
+CREATE TABLE IF NOT EXISTS failovers (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts            INTEGER NOT NULL,
+  session_id    TEXT NOT NULL,       -- the session moved
+  transcript_id TEXT,                -- the conversation it resumed
+  name          TEXT,
+  cwd           TEXT,
+  from_account  TEXT,
+  to_account    TEXT,
+  from_dir      TEXT,
+  to_dir        TEXT,
+  bg_id         TEXT,                -- what \`claude attach\` takes
+  continued     INTEGER,             -- told to carry on, having been cut off mid-task
+  status        TEXT,                -- 'started' | 'failed'
+  error         TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_failovers_session ON failovers(session_id);
+
 -- Machines this tracker connects to over ssh, and how that is going.
 CREATE TABLE IF NOT EXISTS sync_peers (
   target     TEXT PRIMARY KEY,
