@@ -1,5 +1,6 @@
 import { spawn } from 'node:child_process';
 import { overview, liveSessions, modelBreakdown, windowHistory, inUse } from './api.js';
+import { plan, setFailover, failoverSettings, spares, switchProfile, headroom, MIN_ROOM } from './failover.js';
 
 /**
  * Live terminal dashboard.
@@ -155,7 +156,7 @@ function failoverLines(f, here, now) {
     for (const e of p.entries ?? []) {
       const who = `${C.muted}${e.profile ?? "a profile"}${plans.length > 1 ? ` on ${p.machine}` : ''}${C.reset} ${A.bold}${e.label}${A.reset} ${C.muted}${Math.round(e.level)}%${C.reset}`;
       const to = e.target
-        ? `${C.accent}${e.target.label}${C.reset} ${C.muted}${Math.round(e.target.room)}% free${C.reset}`
+        ? `${C.accent}${e.target.label}${C.reset} ${C.muted}${Math.round(e.target.room)}% free${e.target.pinned ? ' · your pick' : ''}${C.reset}`
         : `${C.critical}nothing${C.reset} ${C.muted}- no spare there with room${C.reset}`;
       const state = p.mode !== 'auto' ? `${C.muted}(off)${C.reset}`
         : !e.target ? '' : e.due ? `${C.warning}switching${C.reset}` : `${C.muted}at ${p.at}%${C.reset}`;
@@ -169,7 +170,8 @@ function failoverLines(f, here, now) {
       : `    ${C.critical}could not switch${C.reset} ${m.profile}: ${C.muted}${m.error}${C.reset}`);
   }
   if (!rows.length) return [];
-  const head = f.mode === 'auto' ? `${C.good}FAILOVER${C.reset} ${C.muted}on at ${f.at}%${C.reset}` : `${C.muted}FAILOVER off · claude-tracker failover on${C.reset}`;
+  const pick = f.prefer ? ` · prefers ${f.prefer}` : '';
+  const head = f.mode === 'auto' ? `${C.good}FAILOVER${C.reset} ${C.muted}on at ${f.at}%${pick} · f t +/- s${C.reset}` : `${C.muted}FAILOVER off${pick} · f to turn on${C.reset}`;
   return [`  ${head}`, ...rows];
 }
 
@@ -198,6 +200,9 @@ export function startTui({ webUrl, onQuit }) {
     live: true,
     lastRefresh: Date.now(),
     error: null,
+    note: null,          // what a key just did, shown in the footer for a few seconds
+    noteAt: 0,
+    confirmSwitch: 0,    // when s was first pressed: a second press within 5s switches
   };
 
   let data = { overview: null, live: [], models: [], windows: [] };
@@ -213,9 +218,12 @@ export function startTui({ webUrl, onQuit }) {
     // has only a single window and makes the history look broken.
     const focus = picked ?? [...accounts].sort((a, b) => b.totalEvents - a.totalEvents)[0];
     const slow = force || Date.now() - slowAt > 10_000;
+    const live = liveSessions();
     data = {
       overview: ov,
-      live: liveSessions(),
+      live,
+      // Worked out here, not the service's copy: a key pressed here shows at once.
+      plan: plan(ov, live),
       models: slow ? modelBreakdown(7, picked?.accountUuid ?? null) : data.models,
       windows: slow ? (focus ? windowHistory(focus.accountUuid, state.windowType, 24) : []) : data.windows,
       focus,
@@ -303,7 +311,7 @@ export function startTui({ webUrl, onQuit }) {
     } else {
       L.push(`  ${C.critical}Every account is refused right now${C.reset} ${C.muted}- see resets below${C.reset}`);
     }
-    for (const line of failoverLines(ov.failover, ov.sync?.name, now)) L.push(line);
+    for (const line of failoverLines({ ...ov.failover, ...failoverSettings(), plan: data.plan }, ov.sync?.name, now)) L.push(line);
     L.push('');
 
     // ---- running now, each with the account it is billing *right now*
@@ -453,12 +461,15 @@ export function startTui({ webUrl, onQuit }) {
     const body = frame(width, height);
 
     const age = Math.round((Date.now() - state.lastRefresh) / 1000);
+    const noted = state.note && Date.now() - state.noteAt < 6000;
     const footer = state.error
       ? `  ${C.critical}refresh failed:${C.reset} ${state.error} ${C.muted}· showing data from ${age}s ago · r to retry${C.reset}`
-      : `  ${C.muted}q${C.reset} quit  ${C.muted}r${C.reset} refresh  ` +
-        `${C.muted}a${C.reset} account  ${C.muted}w${C.reset} window  ${C.muted}↑↓${C.reset} scroll` +
-        (url ? `  ${C.muted}o${C.reset} open web` : '') +
-        (state.live ? '' : `  ${C.warning}paused${C.reset}`);
+      : noted ? `  ${state.note}`
+        : `  ${C.muted}q${C.reset} quit  ${C.muted}r${C.reset} refresh  ` +
+          `${C.muted}a${C.reset} account  ${C.muted}w${C.reset} window  ${C.muted}↑↓${C.reset} scroll` +
+          (url ? `  ${C.muted}o${C.reset} open web` : '') +
+          `  ${C.muted}f${C.reset} failover  ${C.muted}t${C.reset} switch to  ${C.muted}+/-${C.reset} at  ${C.muted}s${C.reset} switch now` +
+          (state.live ? '' : `  ${C.warning}paused${C.reset}`);
 
     const viewH = height - 2;
     const maxScroll = Math.max(0, body.length - viewH);
@@ -494,6 +505,42 @@ export function startTui({ webUrl, onQuit }) {
     stdin.setEncoding('utf8');
   }
 
+  const say = (note) => { state.note = note; state.noteAt = Date.now(); };
+
+  /** Failover, from the keyboard: on and off, the threshold, the account it goes to, and switching now. */
+  function failoverKey(key) {
+    const s = failoverSettings();
+    if (key === 'f') {
+      const next = setFailover({ mode: s.mode === 'auto' ? 'off' : 'auto' });
+      say(next.mode === 'auto' ? `${C.good}failover on${C.reset} at ${next.at}%` : `${C.warning}failover off${C.reset} - nothing switches by itself`);
+    } else if (key === '+' || key === '=' || key === '-') {
+      const at = Math.max(50, Math.min(100, s.at + (key === '-' ? -5 : 5)));
+      setFailover({ at });
+      say(`switches at ${at}%`);
+    } else if (key === 't') {
+      // Cycle: choose by room, then each account a spare holds that has room to switch to, then back.
+      const byUuid = new Map((data.overview?.accounts ?? []).map((a) => [a.accountUuid, a]));
+      const held = spares().filter((x) => x.email && headroom(byUuid.get(x.accountUuid)) >= MIN_ROOM).map((x) => x.email.toLowerCase()).sort();
+      const i = s.prefer ? held.indexOf(s.prefer) : -1;
+      const next = i + 1 < held.length ? held[i + 1] : null;
+      setFailover({ prefer: next });
+      say(next ? `switches to ${C.accent}${next}${C.reset} while it has room - t for the next` : 'switches to the spare with the most room');
+    } else if (key === 's') {
+      const e = data.plan?.entries.find((x) => x.isDefault) ?? data.plan?.entries[0];
+      if (!e?.target) { say(`${C.critical}nothing to switch to${C.reset}`); return; }
+      if (Date.now() - state.confirmSwitch > 5000) {
+        state.confirmSwitch = Date.now();
+        say(`${C.warning}s again${C.reset} to switch ${e.profile} from ${e.label} to ${e.target.label} now`);
+        return;
+      }
+      state.confirmSwitch = 0;
+      const r = switchProfile(e, e.target);
+      say(r.status === 'switched'
+        ? `${C.good}switched${C.reset} ${e.profile} to ${e.target.label} - its sessions carry on as it within about 30s`
+        : `${C.critical}could not switch:${C.reset} ${r.error}`);
+    }
+  }
+
   const onKey = (key) => {
     const accounts = data.overview?.accounts ?? [];
     switch (key) {
@@ -513,6 +560,9 @@ export function startTui({ webUrl, onQuit }) {
       case '[5~': state.scroll = Math.max(0, state.scroll - 10); render(); return;
       case '[6~': state.scroll += 10; render(); return;
       case 'g': state.scroll = 0; render(); return;
+      case 'f': case 't': case '+': case '=': case '-': case 's':
+        try { failoverKey(key); } catch (err) { say(`${C.critical}${err.message}${C.reset}`); }
+        refreshAndRender(); return;
       default: return;
     }
   };

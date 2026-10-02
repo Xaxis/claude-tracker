@@ -221,3 +221,24 @@ test('two machines running low together take different spares when the best are 
   assert.notEqual(out.alone, out.second, 'each machine its own turn');
   assert.deepEqual([out.alone, out.second].sort(), ['b@x.com', 'c@x.com']);
 });
+
+test('a preferred account is switched to while it has room, and the best by room after', () => {
+  const root = scratch();
+  const out = inChild(root, `${SETUP}
+    reading('A', 'five_hour', 95, now + 3 * HOUR);
+    const pick = () => { const t = F.plan(api.overview(), api.liveSessions()).entries[0].target; return t && [t.label, t.pinned]; };
+    const byRoom = pick();
+    const other = byRoom[0] === 'b@x.com' ? 'c@x.com' : 'b@x.com';
+    F.setFailover({ prefer: other.toUpperCase() });
+    const preferred = pick();
+    // The pick runs low: back to choosing by room.
+    db().prepare("UPDATE utilization SET pct = 92 WHERE account_uuid = ? AND limit_type = 'five_hour'").run(other === 'b@x.com' ? 'B' : 'C');
+    const full = pick();
+    F.setFailover({ prefer: null });
+    return { byRoom, other, preferred, full, cleared: F.failoverSettings().prefer };
+  `);
+  assert.equal(out.byRoom[1], false);
+  assert.deepEqual(out.preferred, [out.other, true]);
+  assert.deepEqual(out.full, [out.byRoom[0], false]);
+  assert.equal(out.cleared, null);
+});

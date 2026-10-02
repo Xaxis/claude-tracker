@@ -588,7 +588,7 @@ function renderFailover(ov) {
     for (const e of p.entries ?? []) {
       const row = el('div', 'row');
       const main = el('div', 'row-main');
-      main.append(el('div', 'row-title', `${e.label} → ${e.target ? e.target.label : 'nothing to switch to'}`));
+      main.append(el('div', 'row-title', `${e.label} → ${e.target ? `${e.target.label}${e.target.pinned ? ' (your pick)' : ''}` : 'nothing to switch to'}`));
       main.append(el('div', 'row-sub', `${e.profile ?? 'a profile'}${plans.length > 1 ? ` on ${p.machine}` : ''} · ${Math.round(e.level)}% full · ${e.sessions} session${e.sessions === 1 ? '' : 's'}`
         + (e.target ? ` · ${Math.round(e.target.room)}% free there` : ' · no spare there with room')));
       row.append(main);

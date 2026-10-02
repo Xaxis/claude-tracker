@@ -283,7 +283,7 @@ function printPlan(p, machine, settings) {
   for (const e of p.entries) {
     console.log(`  ${c.bold}${e.profile ?? "a profile"}${c.reset} ${c.dim}on ${machine} · signed into${c.reset} ${e.label} ${c.dim}· ${pct(e.level)} of its fullest window · ${e.sessions} session${e.sessions === 1 ? '' : 's'}${c.reset}`);
     console.log(e.target
-      ? `    ${e.due ? `${c.yellow}switching${c.reset}` : 'switches'} to ${c.bold}${e.target.label}${c.reset} ${c.dim}(${pct(e.target.room)} free)${e.due ? '' : ` at ${settings.at}%`}${c.reset}`
+      ? `    ${e.due ? `${c.yellow}switching${c.reset}` : 'switches'} to ${c.bold}${e.target.label}${c.reset} ${c.dim}(${pct(e.target.room)} free${e.target.pinned ? ', your pick' : ''})${e.due ? '' : ` at ${settings.at}%`}${c.reset}`
       : `    ${c.red}nothing to switch to${c.reset} ${c.dim}- no spare on ${machine} holds an account with room${c.reset}`);
   }
   if (p.best) console.log(`  ${c.dim}${p.best.label} has ${pct(p.best.room)} free and no spare on ${machine}${p.best.email ? `: claude-tracker pool add ${p.best.email}` : ''}${c.reset}`);
@@ -301,6 +301,17 @@ async function cmdFailover(action, args, flags) {
     console.log(s.mode === 'auto'
       ? `${c.green}✓${c.reset} at ${s.at}%, a profile's sessions switch to the spare account with the most room`
       : `${c.green}✓${c.reset} failover off - the plan is still shown, nothing switches`);
+    return;
+  }
+  if (action === 'prefer') {
+    const want = args[0];
+    if (!want) { console.error('usage: claude-tracker failover prefer <email>|auto'); process.exitCode = 1; return; }
+    if (want === 'auto') { F.setFailover({ prefer: null }); console.log(`${c.green}✓${c.reset} switches to the spare with the most room`); return; }
+    if (!F.spares().some((x) => x.email?.toLowerCase() === want.toLowerCase())) {
+      console.error(`No spare here holds ${want}. Add it: claude-tracker pool add ${want}`); process.exitCode = 1; return;
+    }
+    F.setFailover({ prefer: want });
+    console.log(`${c.green}✓${c.reset} switches to ${c.bold}${want}${c.reset} while it has room, else the spare with the most`);
     return;
   }
   const ov = overview();
@@ -324,7 +335,7 @@ async function cmdFailover(action, args, flags) {
   }
 
   const s = F.failoverSettings();
-  console.log(`\n${c.bold}Failover${c.reset}  ${s.mode === 'auto' ? `${c.green}on${c.reset} at ${s.at}%` : `${c.dim}off${c.reset} ${c.dim}(claude-tracker failover on)${c.reset}`}\n`);
+  console.log(`\n${c.bold}Failover${c.reset}  ${s.mode === 'auto' ? `${c.green}on${c.reset} at ${s.at}%` : `${c.dim}off${c.reset} ${c.dim}(claude-tracker failover on)${c.reset}`}${s.prefer ? ` ${c.dim}· prefers ${s.prefer}${c.reset}` : ''}\n`);
   printPlan(p, 'this machine', s);
   for (const r of ov.failover.remote) { console.log(); printPlan(r, r.machine, { at: r.at }); }
   if (ov.failover.switches.length) {
@@ -530,10 +541,12 @@ ${c.bold}claude-tracker${c.reset} — local usage and rate-limit tracking for Cl
   ${c.bold}failover${c.reset} [status]|on|off      switch a profile off an account that runs low
         ${c.dim}on [--at 90] [--wait 15]${c.reset}  at what fill, and not if it frees up that soon
         ${c.dim}switch [--to <email>]${c.reset}     switch now
+        ${c.dim}prefer <email>|auto${c.reset}       which account it switches to
   ${c.bold}pool${c.reset} [list]|add <email>        spare sign-ins on this machine, to switch to
 
 ${c.dim}In the terminal dashboard: q quit · r refresh · a cycle account · w switch
-window · space pause · ↑↓/jk scroll${c.reset}
+window · space pause · ↑↓/jk scroll · f failover on/off · t account to switch to ·
++/- threshold · s switch now (press twice)${c.reset}
 
 ${c.dim}Data is read from your local Claude transcripts. Nothing leaves this machine except\nto machines you sync with, over ssh.${c.reset}
 `);
