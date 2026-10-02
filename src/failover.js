@@ -26,7 +26,7 @@ import { machine } from './replica.js';
 
 const CORE = ['five_hour', 'seven_day'];
 /** A target needs at least this much room in its tightest window to be worth switching to. */
-const MIN_ROOM = 15;
+export const MIN_ROOM = 15;
 /** After a switch, the profile's new account has time to show before another is considered. */
 const SETTLE_MS = 10 * 60e3;
 export const SPARE_PREFIX = '.claude-pool-';
@@ -37,13 +37,16 @@ export function failoverSettings() {
     mode: getMeta('failover_mode', 'off'),
     at: Number(getMeta('failover_at', '90')),
     waitMin: Number(getMeta('failover_wait', '15')),
+    // The account you would rather it switched to, when it has room; null to choose by room.
+    prefer: getMeta('failover_prefer', '') || null,
   };
 }
 
-export function setFailover({ mode, at, waitMin }) {
+export function setFailover({ mode, at, waitMin, prefer }) {
   if (mode) setMeta('failover_mode', mode);
   if (at != null) setMeta('failover_at', String(at));
   if (waitMin != null) setMeta('failover_wait', String(waitMin));
+  if (prefer !== undefined) setMeta('failover_prefer', prefer ? String(prefer).toLowerCase() : '');
   return failoverSettings();
 }
 
@@ -136,7 +139,10 @@ export function plan(ov, live, settings = failoverSettings(), now = Date.now(), 
       .map((s) => ({ ...s, label: accounts.get(s.accountUuid)?.label ?? s.email, room: headroom(accounts.get(s.accountUuid)) }))
       .filter((s) => s.room >= MIN_ROOM)
       .sort((x, y) => rank(y)[0] - rank(x)[0] || rank(y)[1] - rank(x)[1]);
-    const target = turnOf(options.filter((x) => options.length && String(rank(x)) === String(rank(options[0]))));
+    // Your pick, while it has room; otherwise the best by room.
+    const picked = settings.prefer && options.find((x) => x.email?.toLowerCase() === settings.prefer);
+    const target = picked ? { ...picked, pinned: true }
+      : turnOf(options.filter((x) => options.length && String(rank(x)) === String(rank(options[0]))));
     // Out, but back within the wait: not worth a switch.
     const freesAt = a && !a.available.now ? a.available.at : null;
     const soon = freesAt != null && freesAt - now < settings.waitMin * 60e3;
@@ -144,7 +150,7 @@ export function plan(ov, live, settings = failoverSettings(), now = Date.now(), 
       dir, profile: tildify(dir), isDefault: !!profile.isDefault, sessions,
       account: signed.accountUuid, email: signed.email, label: a?.label ?? signed.email ?? signed.accountUuid,
       level: lvl, due: lvl >= settings.at && !soon, out: !!a && !a.available.now, freesAt,
-      target: target && { accountUuid: target.accountUuid, label: target.label, email: target.email, room: target.room, dir: target.dir, shown: target.shown },
+      target: target && { accountUuid: target.accountUuid, label: target.label, email: target.email, room: target.room, dir: target.dir, shown: target.shown, pinned: !!target.pinned },
     });
   }
   const covered = new Set([...held.map((s) => s.accountUuid), ...entries.map((e) => e.account)]);

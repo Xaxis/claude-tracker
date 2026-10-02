@@ -9,7 +9,7 @@ import { modelLabel } from './pricing.js';
 import { billingPeriod, periodSpend } from './billing.js';
 import { accountAggregates } from './aggregates.js';
 import { machine, remoteMachines, listPeers, machineNameOf } from './replica.js';
-import { failoverSettings, recentSwitches } from './failover.js';
+import { failoverSettings, recentSwitches, spares, SPARE_PREFIX } from './failover.js';
 import { getMeta } from './db.js';
 
 const UNATTRIBUTED = '__unattributed__';
@@ -100,6 +100,10 @@ function recommend(rows, now) {
   const run = (p) => (p.isDefault ? 'claude' : `CLAUDE_CONFIG_DIR=${p.dir} claude`);
   for (const p of profileStates()) {
     if (p.accountUuid && !signedIn.has(p.accountUuid)) signedIn.set(p.accountUuid, { name: p.name, command: run(p), machine: null });
+  }
+  // An account in a spare here is one switch away: switch ~/.claude to it.
+  for (const s of spares()) {
+    if (s.accountUuid && !signedIn.has(s.accountUuid)) signedIn.set(s.accountUuid, { name: s.shown, command: `claude-tracker failover switch --to ${s.email}`, machine: null });
   }
   for (const m of remoteMachines(now)) {
     for (const p of m.profiles) {
@@ -428,7 +432,8 @@ export function localSessions(now = Date.now()) {
 
 /** Each profile on this machine and who is signed into it, as other machines are told. */
 export function profileStates() {
-  return discoverProfiles().map((p) => {
+  // Spares only hold a sign-in for failing over to; nothing is meant to run in one.
+  return discoverProfiles().filter((p) => !p.dir.includes(SPARE_PREFIX)).map((p) => {
     const a = profileAccount(p);
     return { name: p.name, dir: tildify(p.dir), isDefault: p.isDefault, accountUuid: a?.accountUuid ?? null, email: a?.email ?? null };
   });

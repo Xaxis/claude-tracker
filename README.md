@@ -367,6 +367,13 @@ profile with sessions running, the account it is on, how full, and what it would
 switch to, on every synced machine. `claude-tracker failover switch` switches now;
 `claude-tracker pool` lists what is signed in where.
 
+It picks the spare with the most room, unless you pick: `claude-tracker failover
+prefer <email>` sends it to that account while it has room (`prefer auto` hands
+the choice back). In the terminal dashboard the same settings are keys: `f`
+turns failover on or off, `t` steps through the accounts it can switch to, `+`
+and `-` move the threshold by 5 points, and `s` pressed twice switches now.
+Settings are per machine.
+
 ### Realtime
 
 Both dashboards run off one watcher inside the tracker process:
