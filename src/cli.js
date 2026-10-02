@@ -387,9 +387,23 @@ async function cmdPool(action, args, flags) {
       child.on('close', resolve);
     });
     const who = profileAccount({ dir, configFile: configFileOf(dir) });
-    if (code !== 0 || !who) { console.error(`\n${c.red}✗${c.reset} not signed in - run it again when ready: claude-tracker pool add ${email}`); process.exitCode = 1; return; }
-    const note = who.email?.toLowerCase() === email.toLowerCase() ? '' : ` ${c.yellow}(not ${email} - the browser signed in as someone else)${c.reset}`;
-    console.log(`\n${c.green}✓${c.reset} ${dir.replace(HOME, '~')} is signed in as ${c.bold}${who.email}${c.reset}${note}; sessions can now be moved to it.`);
+    const again = `claude-tracker pool add ${email}${flags.as ? ` --as ${flags.as}` : ''}`;
+    if (code !== 0 || !who) { console.error(`\n${c.red}✗${c.reset} not signed in - run it again when ready: ${again}`); process.exitCode = 1; return; }
+    if (who.email?.toLowerCase() !== email.toLowerCase()) {
+      // The browser was signed into another account. The profile was empty before,
+      // so sign it out again rather than leave it holding the wrong one.
+      await new Promise((resolve) => {
+        const child = spawn(process.env.CLAUDE_TRACKER_CLAUDE || 'claude', ['auth', 'logout'],
+          { env: { ...process.env, CLAUDE_CONFIG_DIR: dir }, stdio: 'ignore' });
+        child.on('error', resolve);
+        child.on('close', resolve);
+      });
+      console.error(`\n${c.red}✗${c.reset} the browser signed in as ${who.email}, not ${email}, so that was undone.`);
+      console.error(`  Open the sign-in link in a private window, sign in as ${email}, and run: ${again}`);
+      process.exitCode = 1;
+      return;
+    }
+    console.log(`\n${c.green}✓${c.reset} ${dir.replace(HOME, '~')} is signed in as ${c.bold}${who.email}${c.reset}; sessions can now be moved to it.`);
     return;
   }
 
