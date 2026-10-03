@@ -159,7 +159,7 @@ function failoverLines(f, here, now) {
         ? `${C.accent}${e.target.label}${C.reset} ${C.muted}${Math.round(e.target.room)}% free${e.target.pinned ? ' · your pick' : ''}${C.reset}`
         : `${C.critical}nothing${C.reset} ${C.muted}- no spare there with room${C.reset}`;
       const state = p.mode !== 'auto' ? `${C.muted}(off)${C.reset}`
-        : !e.target ? '' : e.due ? `${C.warning}switching${C.reset}` : `${C.muted}at ${p.at}%${C.reset}`;
+        : !e.target ? '' : e.due ? `${C.warning}switching${C.reset}` : `${C.muted}at ${e.at ?? p.at}%${C.reset}`;
       rows.push(`  ${C.muted}↪${C.reset} ${who} → ${to}  ${state}`);
       if (e.then?.length) rows.push(`    ${C.muted}if that fails: ${e.then.map((t) => t.label).join(' → ')}${C.reset}`);
     }

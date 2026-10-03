@@ -283,7 +283,7 @@ function printPlan(p, machine, settings) {
   for (const e of p.entries) {
     console.log(`  ${c.bold}${e.profile ?? "a profile"}${c.reset} ${c.dim}on ${machine} · signed into${c.reset} ${e.label} ${c.dim}· ${pct(e.level)} of its fullest window · ${e.sessions} session${e.sessions === 1 ? '' : 's'}${c.reset}`);
     console.log(e.target
-      ? `    ${e.due ? `${c.yellow}switching${c.reset}` : 'switches'} to ${c.bold}${e.target.label}${c.reset} ${c.dim}(${pct(e.target.room)} free${e.target.pinned ? ', your pick' : ''})${e.due ? '' : ` at ${settings.at}%`}${c.reset}`
+      ? `    ${e.due ? `${c.yellow}switching${c.reset}` : 'switches'} to ${c.bold}${e.target.label}${c.reset} ${c.dim}(${pct(e.target.room)} free${e.target.pinned ? ', your pick' : ''})${e.due ? '' : ` at ${e.at ?? settings.at}%`}${c.reset}`
       : `    ${c.red}nothing to switch to${c.reset} ${c.dim}- no spare on ${machine} holds an account with room${c.reset}`);
     if (e.then?.length) console.log(`    ${c.dim}if that fails: ${e.then.map((t) => `${t.label} (${pct(t.room)} free)`).join(', then ')}${c.reset}`);
   }

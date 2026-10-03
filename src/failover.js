@@ -34,6 +34,14 @@ const CORE = ['five_hour', 'seven_day'];
 /** A target needs at least this much room in its tightest window to be worth switching to. */
 export const MIN_ROOM = 15;
 /**
+ * Once no spare has that much, every account is nearly used up: rather than
+ * stop at the threshold, each account runs to here - just short of being
+ * refused - and then on to whichever has the most left.
+ */
+const LAST_CALL = 98;
+/** Less room than this is not worth a switch. */
+const LEFTOVER = 2;
+/**
  * After a switch, sessions go on using the sign-in they hold for up to ~30s: their
  * readings in that time are still the old account's. Past it, the profile is
  * free to switch again - at once, if the new account turns out to be out too.
@@ -196,10 +204,16 @@ export function plan(ov, live, settings = failoverSettings(), now = Date.now(), 
     // Room weighed by plan size; within 5 points counts as equal and, between
     // equals, one no other machine is using; then this machine's turn among them.
     const rank = (x) => [Math.round(x.room * x.capacity / 5), elsewhere.has(x.accountUuid) ? 0 : 1];
-    const options = held
+    const usable = held
       .filter((s) => s.accountUuid && s.accountUuid !== signed.accountUuid && !out.has(s.accountUuid))
       .map((s) => ({ ...s, label: accounts.get(s.accountUuid)?.label ?? s.email, room: headroom(accounts.get(s.accountUuid)), capacity: capacity(tiers.get(s.accountUuid)) }))
-      .filter((s) => s.room >= MIN_ROOM)
+      .filter((s) => s.room > LEFTOVER);
+    // Nothing with real room left: use this account to the end, then whatever has more than it.
+    const scarce = !usable.some((s) => s.room >= MIN_ROOM);
+    const left = isOut ? 0 : Math.max(0, 100 - lvl);
+    const at = scarce ? Math.max(settings.at, LAST_CALL) : settings.at;
+    const options = usable
+      .filter((s) => (scarce ? s.room > left + LEFTOVER : s.room >= MIN_ROOM))
       .sort((x, y) => rank(y)[0] - rank(x)[0] || rank(y)[1] - rank(x)[1]);
     // Your pick, while it has room; otherwise the best.
     const picked = settings.prefer && options.find((x) => x.email?.toLowerCase() === settings.prefer);
@@ -214,9 +228,9 @@ export function plan(ov, live, settings = failoverSettings(), now = Date.now(), 
     entries.push({
       dir, profile: tildify(dir), isDefault: !!profile.isDefault, sessions,
       account: signed.accountUuid, email: signed.email, label: a?.label ?? signed.email ?? signed.accountUuid,
-      level: lvl, due: lvl >= settings.at && !soon, out: isOut, freesAt, measured: !!own,
+      level: lvl, at, scarce, due: (lvl >= at || isOut) && !soon, out: isOut, freesAt, measured: !!own,
       // Until when this account is no use, when the profile's own sessions say it is full.
-      spentUntil: own && own.level >= settings.at ? own.until : null,
+      spentUntil: own && own.level >= at ? own.until : null,
       target: order[0] ? shape(order[0]) : null,
       then: order.slice(1, 4).map(shape),
     });
@@ -241,6 +255,8 @@ function notices(entries, held, profiles, out, accounts) {
     if (!e.target) {
       const back = [...out.values()].sort((x, y) => x - y)[0] ?? null;
       list.push({ level: 'bad', text: `${e.profile} has nothing left to switch to: every spare here is out, low or empty.`, fix: ADD, until: back });
+    } else if (e.scarce) {
+      list.push({ level: 'bad', text: `Every account is nearly used up, so ${e.profile} runs each to ${e.at}% before moving on.`, fix: ADD });
     } else if (!e.then.length) {
       list.push({ level: 'warn', text: `${e.profile} has one spare left with room: ${e.target.label}.`, fix: ADD });
     }
