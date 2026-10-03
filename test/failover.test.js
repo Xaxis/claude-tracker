@@ -338,10 +338,10 @@ test('when every account is nearly used up, each runs to the end before the next
       const e = F.plan(api.overview(), api.liveSessions()).entries[0];
       return [e.at, e.due, e.target?.label ?? null, e.then.map((t) => t.label)];
     };
-    return { at92: at(92), at98: at(98), at97: at(97), notice: F.plan(api.overview(), api.liveSessions()).notices[0] };
+    return { at50: at(50), at92: at(92), at98: at(98), notice: F.plan(api.overview(), api.liveSessions()).notices[0] };
   `);
-  assert.deepEqual(out.at92, [98, false, 'b@x.com', []], 'past 90%, it keeps going; C has less left than A');
-  assert.deepEqual(out.at97, [98, false, 'b@x.com', ['c@x.com']], 'once A has less left than C, C is next after B');
+  assert.deepEqual(out.at50, [98, false, 'b@x.com', ['c@x.com']], 'what it will move to, though both have less left than A now');
+  assert.deepEqual(out.at92, [98, false, 'b@x.com', ['c@x.com']], 'past 90%, it keeps going');
   assert.deepEqual(out.at98, [98, true, 'b@x.com', ['c@x.com']], 'at 98% it moves to the one with the most left');
   assert.equal(out.notice.level, 'bad');
   assert.match(out.notice.text, /nearly used up/);
