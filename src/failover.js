@@ -74,17 +74,17 @@ export function capacity(tier) {
   return m ? Number(m[1]) : 1;
 }
 
-/** Accounts a profile here has run out on, and until when: they are not switched to before then. */
+/** Accounts a profile here was refused on, and until when: they are not switched to before then. */
 function spent(now = Date.now()) {
   let all = {};
-  try { all = JSON.parse(getMeta('failover_spent', '{}')); } catch { /* start over */ }
+  try { all = JSON.parse(getMeta('failover_out', '{}')); } catch { /* start over */ }
   return new Map(Object.entries(all).filter(([, until]) => until > now));
 }
 
 function markSpent(accountUuid, until) {
   const all = Object.fromEntries(spent());
   all[accountUuid] = Math.max(all[accountUuid] ?? 0, until);
-  setMeta('failover_spent', JSON.stringify(all));
+  setMeta('failover_out', JSON.stringify(all));
 }
 
 /** When a profile's present sign-in began: its last switch, or the last sighting of it on another account. */
@@ -210,8 +210,9 @@ export function plan(ov, live, settings = failoverSettings(), now = Date.now(), 
       .filter((s) => s.room > LEFTOVER);
     // Nothing with real room left: use this account to the end, then whatever has more than it.
     const scarce = !usable.some((s) => s.room >= MIN_ROOM);
-    const left = isOut ? 0 : Math.max(0, 100 - lvl);
     const at = scarce ? Math.max(settings.at, LAST_CALL) : settings.at;
+    // What this account will have left when it switches: worth going to only what has more.
+    const left = isOut ? 0 : Math.min(100 - at, Math.max(0, 100 - lvl));
     const options = usable
       .filter((s) => (scarce ? s.room > left + LEFTOVER : s.room >= MIN_ROOM))
       .sort((x, y) => rank(y)[0] - rank(x)[0] || rank(y)[1] - rank(x)[1]);
@@ -229,8 +230,8 @@ export function plan(ov, live, settings = failoverSettings(), now = Date.now(), 
       dir, profile: tildify(dir), isDefault: !!profile.isDefault, sessions,
       account: signed.accountUuid, email: signed.email, label: a?.label ?? signed.email ?? signed.accountUuid,
       level: lvl, at, scarce, due: (lvl >= at || isOut) && !soon, out: isOut, freesAt, measured: !!own,
-      // Until when this account is no use, when the profile's own sessions say it is full.
-      spentUntil: own && own.level >= at ? own.until : null,
+      // Until when this account is no use, when the profile's own sessions were refused on it.
+      spentUntil: own?.out ? own.until : null,
       target: order[0] ? shape(order[0]) : null,
       then: order.slice(1, 4).map(shape),
     });
