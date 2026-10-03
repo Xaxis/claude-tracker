@@ -592,7 +592,7 @@ function renderFailover(ov) {
       main.append(el('div', 'row-sub', `${e.profile ?? 'a profile'}${plans.length > 1 ? ` on ${p.machine}` : ''} · ${Math.round(e.level)}% full · ${e.sessions} session${e.sessions === 1 ? '' : 's'}`
         + (e.target ? ` · ${Math.round(e.target.room)}% free there` : ' · no spare there with room')));
       row.append(main);
-      row.append(el('div', 'row-value', p.mode !== 'auto' ? 'off' : !e.target ? '' : e.due ? 'switching' : `at ${p.at}%`));
+      row.append(el('div', 'row-value', p.mode !== 'auto' ? 'off' : !e.target ? '' : e.due ? 'switching' : `at ${e.at ?? p.at}%`));
       host.append(row);
       if (e.then?.length) host.append(el('p', 'panel-note', `If that fails: ${e.then.map((t) => t.label).join(', then ')}.`));
     }

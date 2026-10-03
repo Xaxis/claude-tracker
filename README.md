@@ -374,6 +374,10 @@ account turns out to be out, or fills before the next check, it switches again
 within a minute; an account it ran out on is not switched back to until it
 resets. If a spare fails to switch to, the next in line is tried at once.
 
+When no spare has 15% left, stopping at the threshold would only strand what
+is left, so each account runs to 98% - just short of being refused - and then
+on to whichever has the most left, until none has any.
+
 Room counts for more on a bigger plan: 50% left on a Max 20x outlasts 100% on a
 Pro or Team seat, so small plans are a last resort. When a profile is down to
 its last spare with room, or has none, the dashboards say so and the service

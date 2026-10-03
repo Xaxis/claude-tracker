@@ -324,3 +324,25 @@ test('room on a bigger plan counts for more, and it says when another account is
   assert.equal(out.notices[0].level, 'bad');
   assert.match(out.notices[0].fix, /claude-tracker pool add/);
 });
+
+test('when every account is nearly used up, each runs to the end before the next', () => {
+  const root = scratch();
+  const out = inChild(root, `${SETUP}
+    // B has 12% left, C 7%: neither has the room a switch at 90% wants.
+    db().prepare("UPDATE utilization SET pct = 88 WHERE account_uuid = 'B' AND limit_type = 'five_hour'").run();
+    db().prepare("UPDATE utilization SET pct = 93 WHERE account_uuid = 'C' AND limit_type = 'five_hour'").run();
+    F.setFailover({ mode: 'auto', at: 90 });
+    const at = (pct) => {
+      db().prepare("DELETE FROM utilization WHERE account_uuid = 'A'").run();
+      reading('A', 'five_hour', pct, now + 3 * HOUR);
+      const e = F.plan(api.overview(), api.liveSessions()).entries[0];
+      return [e.at, e.due, e.target?.label ?? null, e.then.map((t) => t.label)];
+    };
+    return { at92: at(92), at98: at(98), at97: at(97), notice: F.plan(api.overview(), api.liveSessions()).notices[0] };
+  `);
+  assert.deepEqual(out.at92, [98, false, 'b@x.com', []], 'past 90%, it keeps going; C has less left than A');
+  assert.deepEqual(out.at97, [98, false, 'b@x.com', ['c@x.com']], 'once A has less left than C, C is next after B');
+  assert.deepEqual(out.at98, [98, true, 'b@x.com', ['c@x.com']], 'at 98% it moves to the one with the most left');
+  assert.equal(out.notice.level, 'bad');
+  assert.match(out.notice.text, /nearly used up/);
+});
