@@ -12,6 +12,7 @@ import { PROTOCOL, advertise, startSync } from './sync.js';
 import { plan, runFailover } from './failover.js';
 import { send } from './notify.js';
 import { setMeta } from './db.js';
+import { accountsCsv, exportFileName } from './export.js';
 
 const WEB_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'web');
 
@@ -74,6 +75,16 @@ function handleApi(req, res, url) {
     case '/api/models': return sendJson(res, modelBreakdown(days, account));
     case '/api/live': return sendJson(res, liveSessions());
     case '/api/accounts': return sendJson(res, listAccounts());
+    case '/api/accounts.csv': {
+      const csv = accountsCsv();
+      res.writeHead(200, {
+        'content-type': 'text/csv; charset=utf-8',
+        'content-disposition': `attachment; filename="${exportFileName()}"`,
+        'cache-control': 'no-store',
+        'content-length': Buffer.byteLength(csv),
+      });
+      return res.end(csv);
+    }
     case '/api/verify': return sendJson(res, verifyWindowModel());
     case '/api/windows':
       if (!account) return sendJson(res, { error: 'account required' }, 400);

@@ -175,6 +175,14 @@ function cmdStatus() {
   console.log();
 }
 
+async function cmdExport(file) {
+  const { exportAccounts } = await import('./export.js');
+  const r = exportAccounts(file);
+  console.log(`${c.green}✓${c.reset} ${r.count} account${r.count === 1 ? '' : 's'} → ${c.bold}${r.shown}${c.reset}`);
+  console.log(`${c.dim}  Google Sheets: File → Import → Upload, and pick that file. Phone number and${c.reset}`);
+  console.log(`${c.dim}  payment card are left blank: Claude Code is never told them.${c.reset}`);
+}
+
 function cmdAccounts() {
   const rows = listAccounts();
   console.log();
@@ -535,6 +543,7 @@ ${c.bold}claude-tracker${c.reset} — local usage and rate-limit tracking for Cl
   ${c.bold}status${c.reset}                      one-shot limit status for every account
   ${c.bold}ingest${c.reset} [--force]            read new transcript data
   ${c.bold}accounts${c.reset}                    list discovered accounts
+        ${c.dim}export [file.csv]${c.reset}         every account as a spreadsheet (Downloads by default)
   ${c.bold}label${c.reset} <uuid-prefix> <name>  give an account a readable name
   ${c.bold}models${c.reset} [--days N]           per-model usage breakdown
   ${c.bold}verify${c.reset}                      check the window model against observed resets
@@ -551,7 +560,7 @@ ${c.bold}claude-tracker${c.reset} — local usage and rate-limit tracking for Cl
 
 ${c.dim}In the terminal dashboard: q quit · r refresh · a cycle account · w switch
 window · space pause · ↑↓/jk scroll · f failover on/off · t account to switch to ·
-+/- threshold · s switch now (press twice)${c.reset}
++/- threshold · s switch now (press twice) · e export accounts${c.reset}
 
 ${c.dim}Data is read from your local Claude transcripts. Nothing leaves this machine except\nto machines you sync with, over ssh.${c.reset}
 `);
@@ -591,7 +600,10 @@ export async function runCli(argv) {
         break;
       }
       case 'status': await refresh({ quiet: true }); cmdStatus(); break;
-      case 'accounts': await refresh({ quiet: true }); cmdAccounts(); break;
+      case 'accounts':
+        await refresh({ quiet: true });
+        if (rest[1] === 'export') await cmdExport(rest[2] ?? flags.out); else cmdAccounts();
+        break;
       case 'label': cmdLabel(rest.slice(1)); break;
       case 'statusline': await cmdStatusline(rest[1] ?? 'status', flags); break;
       case 'service': await cmdService(rest[1] ?? 'status', flags); break;

@@ -473,7 +473,7 @@ export function startTui({ webUrl, onQuit }) {
         : `  ${C.muted}q${C.reset} quit  ${C.muted}r${C.reset} refresh  ` +
           `${C.muted}a${C.reset} account  ${C.muted}w${C.reset} window  ${C.muted}↑↓${C.reset} scroll` +
           (url ? `  ${C.muted}o${C.reset} open web` : '') +
-          `  ${C.muted}f${C.reset} failover  ${C.muted}t${C.reset} switch to  ${C.muted}+/-${C.reset} at  ${C.muted}s${C.reset} switch now` +
+          `  ${C.muted}f${C.reset} failover  ${C.muted}t${C.reset} switch to  ${C.muted}+/-${C.reset} at  ${C.muted}s${C.reset} switch now  ${C.muted}e${C.reset} export` +
           (state.live ? '' : `  ${C.warning}paused${C.reset}`);
 
     const viewH = height - 2;
@@ -565,6 +565,15 @@ export function startTui({ webUrl, onQuit }) {
       case '[5~': state.scroll = Math.max(0, state.scroll - 10); render(); return;
       case '[6~': state.scroll += 10; render(); return;
       case 'g': state.scroll = 0; render(); return;
+      case 'e':
+        import('./export.js').then(({ exportAccounts }) => {
+          try {
+            const r = exportAccounts();
+            say(`${C.good}exported${C.reset} ${r.count} accounts to ${r.shown} ${C.muted}- Google Sheets: File → Import → Upload${C.reset}`);
+          } catch (err) { say(`${C.critical}could not export:${C.reset} ${err.message}`); }
+          render();
+        });
+        return;
       case 'f': case 't': case '+': case '=': case '-': case 's':
         try { failoverKey(key); } catch (err) { say(`${C.critical}${err.message}${C.reset}`); }
         refreshAndRender(); return;

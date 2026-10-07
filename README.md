@@ -392,6 +392,16 @@ turns failover on or off, `t` steps through the accounts it can switch to, `+`
 and `-` move the threshold by 5 points, and `s` pressed twice switches now.
 Settings are per machine.
 
+### Exporting accounts
+
+`claude-tracker accounts export` writes every account to a spreadsheet in
+Downloads (or the file you name): email, name, plan, organization, billing,
+when it was created, subscribed and renews, where it is signed in, how much of
+its windows is used and when it is free. Phone number and payment card columns
+are left blank to fill in - Claude Code is never told either. Open it in Google
+Sheets with File → Import → Upload. The terminal dashboard exports with `e`, and
+the web dashboard has an Export link on its Accounts panel.
+
 ### Realtime
 
 Both dashboards run off one watcher inside the tracker process:

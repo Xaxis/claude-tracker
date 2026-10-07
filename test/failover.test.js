@@ -346,3 +346,20 @@ test('when every account is nearly used up, each runs to the end before the next
   assert.equal(out.notice.level, 'bad');
   assert.match(out.notice.text, /nearly used up/);
 });
+
+test('accounts export as a spreadsheet, with blank phone and card columns, and nothing a spreadsheet would run', () => {
+  const root = scratch();
+  const out = inChild(root, `${SETUP}
+    db().prepare("UPDATE accounts SET display_name = '=HYPERLINK(\\"x\\")', rate_limit_tier = 'default_claude_max_20x', org_name = 'Acme, Inc.', subscription_at = '2026-01-02T00:00:00Z', billing_type = 'stripe_subscription' WHERE account_uuid = 'B'").run();
+    const X = await import('${SRC}export.js');
+    const r = X.exportAccounts(path.join(HOME, 'out.csv'));
+    return { r, csv: fs.readFileSync(r.file, 'utf8') };
+  `);
+  const lines = out.csv.trimEnd().split('\r\n');
+  const head = lines[0].split(',');
+  assert.ok(head.includes('Phone number') && head.includes('Payment card'));
+  assert.equal(out.r.count, 3);
+  const b = lines.find((l) => l.startsWith('b@x.com'));
+  assert.match(b, /^b@x\.com,"'=HYPERLINK\(""x""\)",,,Max 20x,"Acme, Inc\.",Card subscription \(Stripe\),/);
+  assert.ok(lines.slice(1).every((l) => l.split(',').length >= head.length), 'every row has every column');
+});
