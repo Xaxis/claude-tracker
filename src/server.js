@@ -3,7 +3,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { exec } from 'node:child_process';
-import { overview, history, sessions, modelBreakdown, liveSessions, windowHistory, localState } from './api.js';
+import { overview, history, sessions, modelBreakdown, liveSessions, windowHistory, localState, boxes } from './api.js';
+import { cacheSummary } from './context.js';
 import { verifyWindowModel } from './calibrate.js';
 import { startWatcher } from './watcher.js';
 import { listAccounts } from './accounts.js';
@@ -74,6 +75,8 @@ function handleApi(req, res, url) {
     case '/api/sessions': return sendJson(res, sessions(Math.min(200, Number(q.get('limit') ?? 40)), account));
     case '/api/models': return sendJson(res, modelBreakdown(days, account));
     case '/api/live': return sendJson(res, liveSessions());
+    case '/api/box': return sendJson(res, boxes());
+    case '/api/cache': return sendJson(res, cacheSummary());
     case '/api/accounts': return sendJson(res, listAccounts());
     case '/api/accounts.csv': {
       const csv = accountsCsv();

@@ -1,5 +1,6 @@
 import { spawn } from 'node:child_process';
-import { overview, liveSessions, modelBreakdown, windowHistory, inUse } from './api.js';
+import { overview, liveSessions, modelBreakdown, windowHistory, inUse, boxes } from './api.js';
+import { cacheSummary } from './context.js';
 import { plan, setFailover, failoverSettings, spares, switchProfile, headroom, MIN_ROOM } from './failover.js';
 
 /**
@@ -180,6 +181,97 @@ function failoverLines(f, here, now) {
   return [`  ${head}`, ...rows];
 }
 
+/* --- what sessions carry, and the shared GPU and CPU ------------------------ */
+
+/** Tokens as 507k or 1.2M. */
+const tokens = (n) => (n >= 999_500 ? `${(n / 1e6).toFixed(1)}M` : `${Math.round(n / 1e3)}k`);
+
+/**
+ * Context bands, by what a turn re-reads: past 400k a turn costs over ten times
+ * a fresh session's, and the bands step up from there to the auto-compact.
+ */
+function contextColor(n) {
+  if (n >= 800e3) return C.critical;
+  if (n >= 600e3) return C.serious;
+  if (n >= 400e3) return C.warning;
+  return C.accent;
+}
+
+/** How long a job has waited: amber, then orange past 5 minutes, red past 15. */
+const waitColor = (ms) => (ms >= 15 * 60e3 ? C.critical : ms >= 5 * 60e3 ? C.serious : C.warning);
+
+/** One line for a session's job holding or waiting for the GPU or a CPU slot. */
+function leaseLine(l, now) {
+  const what = l.kind === 'gpu' ? 'the GPU' : 'a CPU slot';
+  const where = l.place ? ` in ${l.place}` : '';
+  const ms = now - l.since;
+  if (l.state === 'holds') return `${C.muted}■ holds ${what}${where} · ${duration(ms)}${C.reset}`;
+  const jobs = l.jobs > 1 ? `${l.jobs} jobs` : 'a job';
+  const pos = l.ahead === 0 ? 'next in line' : `${l.ahead} ahead`;
+  const behind = l.behind?.length ? ` · behind ${l.behind.map((b) => `${b.who} (${duration(now - b.since)})`).join(', ')}` : '';
+  return `${waitColor(ms)}▸ ${jobs}${where} waiting ${duration(ms)} for ${what}${C.reset}${C.muted} · ${pos}${behind}${C.reset}`;
+}
+
+/** The GPU lease and the CPU pool of each machine that has them: who holds, who waits. */
+function boxLines(list, inner, rule, now) {
+  const L = [];
+  const many = list.length > 1 || list.some((b) => b.machine);
+  for (const b of list) {
+    const on = many ? ` ON ${(b.machine ?? 'this machine').toUpperCase()}` : '';
+    for (const [kind, s] of [['GPU', b.gpu], ['CPU', b.cpu]]) {
+      if (!s || (!s.held.length && !s.waiting.length && kind === 'CPU')) continue;
+      const head = kind === 'GPU'
+        ? `GPU${on} · ${s.held.length ? `${s.held.length} held` : 'free'}${s.jobsWaiting ? ` · ${s.jobsWaiting} waiting` : ''}`
+        : `CPU POOL${on} · ${s.held.length} of ${s.slots} slots${s.jobsWaiting ? ` · ${s.jobsWaiting} waiting` : ''} · load ${Math.round(s.load)} on ${s.cores} cores`;
+      L.push(rule(head));
+      if (kind === 'GPU' && s.quarantined) L.push(`  ${C.critical}quarantined after a GPU fault${C.reset} ${C.muted}- gpu --enable once it is healthy${C.reset}`);
+      const nameW = 20, placeW = 15;
+      for (const h of s.held) {
+        L.push(`  ${C.accent}■${C.reset} ${padEnd(truncate(h.session ?? h.project ?? '?', nameW), nameW + 1)}${C.muted}${padEnd(truncate(h.place ?? '', placeW), placeW + 1)}${C.reset}` +
+          `${padEnd(duration(now - h.since), 8)}${C.muted}${truncate(h.cmd ?? '', Math.max(10, inner - nameW - placeW - 14))}${C.reset}`);
+      }
+      for (const w of s.waiting) {
+        const ms = now - w.since;
+        const pos = w.ahead === 0 ? 'next in line' : `${w.ahead} ahead`;
+        L.push(`  ${waitColor(ms)}▸${C.reset} ${padEnd(truncate(w.session ?? w.project ?? '?', nameW), nameW + 1)}${C.muted}${padEnd(truncate(w.place ?? '', placeW), placeW + 1)}${C.reset}` +
+          `${waitColor(ms)}${padEnd(duration(ms), 8)}${C.reset}${C.muted}${w.jobs > 1 ? `${w.jobs} jobs · ` : ''}${pos}${C.reset}`);
+      }
+      if (!s.held.length && !s.waiting.length) L.push(`  ${C.muted}nothing on the GPU${C.reset}`);
+      if (kind === 'CPU' && s.waiting.length && s.held.length < s.slots && s.load >= s.cores) {
+        L.push(`    ${C.muted}${s.slots - s.held.length === 1 ? 'a slot is' : 'slots are'} free, but jobs wait until the load drops under ${s.cores}${C.reset}`);
+      }
+      const h = kind === 'GPU' ? s.hour : null;
+      if (h?.jobs) {
+        const parts = [`${h.jobs} job${h.jobs === 1 ? '' : 's'} waited ${duration(h.waitedMs)} in all`];
+        if (h.longestWait?.ms >= 60e3) parts.push(`longest wait ${duration(h.longestWait.ms)} (${h.longestWait.project})`);
+        if (h.longestHold?.ms >= 60e3) parts.push(`longest hold ${duration(h.longestHold.ms)} (${h.longestHold.project})`);
+        L.push(`    ${C.muted}last hour: ${parts.join(' · ')}${C.reset}`);
+      }
+      L.push('');
+    }
+  }
+  return L;
+}
+
+/** Turns that re-wrote a lapsed cache: last day and week, subagents and main thread apart. */
+function cacheLines(c, inner) {
+  if (!c?.week?.turns) return [];
+  const L = [];
+  const barW = Math.max(6, Math.min(20, inner - 60));
+  const row = (label, r) => `  ${padEnd(label, 12)}${meterBar(r.share * 100, barW, r.share >= 0.2 ? C.serious : C.accent)} ` +
+    `${padEnd(`${Math.round(r.share * 100)}%`, 5)}${padEnd(money(r.cost), 9)}${C.muted}of ${money(r.spend)} spent · ${r.turns.toLocaleString()} turns${C.reset}`;
+  L.push(row('last 24h', c.day));
+  L.push(row('last 7 days', c.week));
+  const ttl = (t) => (t === '1h' ? 'keep their cache an hour' : t === '5m' ? 'keep their cache 5 minutes' : '');
+  L.push(`    ${C.muted}subagents   ${padEnd(money(c.week.sub.cost), 8)}${padEnd(`${c.week.sub.turns.toLocaleString()} turns`, 13)}${ttl(c.ttl?.sub)}${C.reset}`);
+  L.push(`    ${C.muted}main thread ${padEnd(money(c.week.main.cost), 8)}${padEnd(`${c.week.main.turns.toLocaleString()} turns`, 13)}${ttl(c.ttl?.main)}${C.reset}`);
+  if (c.hint) {
+    L.push(`  ${C.warning}!${C.reset} Subagents re-write their whole context after any pause over 5 minutes.`);
+    L.push(`    ${C.muted}Keep it an hour: ${C.reset}"${c.hint.setting}": "${c.hint.value}"${C.muted} in settings.json, or ${c.hint.env}=${c.hint.value}${C.reset}`);
+  }
+  return L;
+}
+
 /** The machines this one syncs with, for the header: bright while they report, dim once they stop. */
 function syncMark(sync, now) {
   if (!sync) return '';
@@ -229,6 +321,8 @@ export function startTui({ webUrl, onQuit }) {
       live,
       // Worked out here, not the service's copy: a key pressed here shows at once.
       plan: plan(ov, live),
+      boxes: boxes(),
+      cache: slow ? cacheSummary() : data.cache,
       models: slow ? modelBreakdown(7, picked?.accountUuid ?? null) : data.models,
       windows: slow ? (focus ? windowHistory(focus.accountUuid, state.windowType, 24) : []) : data.windows,
       focus,
@@ -243,11 +337,12 @@ export function startTui({ webUrl, onQuit }) {
     const now = Date.now();
     const ov = data.overview;
 
-    const rule = (label) => {
+    const ruleLine = (label) => {
       const text = label ? ` ${label} ` : '';
       const dashes = Math.max(0, inner - vlen(text));
-      L.push(`  ${C.muted}${text}${'─'.repeat(dashes)}${C.reset}`);
+      return `  ${C.muted}${text}${'─'.repeat(dashes)}${C.reset}`;
     };
+    const rule = (label) => L.push(ruleLine(label));
 
     // ---- header
     const liveMark = state.live ? `${C.good}●${C.reset} live` : `${C.critical}●${C.reset} paused`;
@@ -320,7 +415,19 @@ export function startTui({ webUrl, onQuit }) {
     L.push('');
 
     // ---- running now, each with the account it is billing *right now*
-    rule(`RUNNING NOW · ${data.live.length} session${data.live.length === 1 ? '' : 's'}`);
+    const carried = data.live.reduce((a, x) => a + (x.context?.tokens ?? 0), 0);
+    rule(`RUNNING NOW · ${data.live.length} session${data.live.length === 1 ? '' : 's'}${carried ? ` · ${tokens(carried)} context a turn in all` : ''}`);
+    // What each session carries into a turn, its subagents at work, and how
+    // often its cache lapsed this hour - with room made for them first.
+    const wide = inner >= 96;
+    const AGENTS = 7, RECACHE = 13;
+    const extraW = wide ? 1 + AGENTS + RECACHE : 1;
+    // The account column gives way to the machine name, not the other way round.
+    const whoWidth = (machine) => Math.max(12, Math.min(30, inner - 22 - 14 - extraW - 18 - (machine ? machine.length + 3 : 0)));
+    if (data.live.some((x) => x.context)) {
+      const w = whoWidth(null);
+      L.push(`  ${C.muted}${' '.repeat(23)}${padEnd('', w + 1)}${padEnd('context', 14)}${wide ? `${padEnd('agents', AGENTS)}${padEnd('↻ last hour', RECACHE)}` : ''}${C.reset}`);
+    }
     const shown = data.live.slice(0, 10);
     for (const s of shown) {
       const busy = s.status === 'busy';
@@ -330,13 +437,22 @@ export function startTui({ webUrl, onQuit }) {
       const who = s.account ? `${s.account}${s.background ? ' (bg)' : ''}` : 'unknown account';
       const name = s.name || s.sessionId.slice(0, 8);
       const tail = `${C.muted}${padEnd(ago, 6)}${C.reset} ${padEnd(burn, 10)}${s.machine ? `${C.muted}on ${s.machine}${C.reset}` : ''}`;
-      // The account column gives way to the machine name, not the other way round.
-      const whoW = Math.max(12, Math.min(30, inner - 22 - 18 - (s.machine ? s.machine.length + 3 : 0)));
-      L.push(`  ${dot} ${padEnd(truncate(name, 20), 21)}${C.accent}${padEnd(truncate(who, whoW), whoW + 1)}${C.reset}${tail}`);
+      // Context: the figure, and a bar up to where Claude Code compacts.
+      const c = s.context;
+      const ctx = c ? `${contextColor(c.tokens)}${padEnd(tokens(c.tokens), 5)}${C.reset}${meterBar((c.tokens / c.compactAt) * 100, 8, contextColor(c.tokens))}` : `${C.muted}${padEnd('—', 13)}${C.reset}`;
+      const agents = s.agents?.length ? `${C.muted}+${s.agents.length}${C.reset}` : '';
+      const re = s.recache?.turns ? `${s.recache.cost >= 10 ? C.serious : C.muted}↻${s.recache.turns} ${money(s.recache.cost)}${C.reset}` : '';
+      const extra = wide ? ` ${padEnd(agents, AGENTS)}${padEnd(re, RECACHE)}` : ' ';
+      const whoW = whoWidth(s.machine);
+      L.push(`  ${dot} ${padEnd(truncate(name, 20), 21)}${C.accent}${padEnd(truncate(who, whoW), whoW + 1)}${C.reset}${ctx}${extra}${tail}`);
+      for (const l of s.leases ?? []) L.push(`      ${leaseLine(l, now)}`);
     }
     if (data.live.length > shown.length) L.push(`    ${C.muted}+${data.live.length - shown.length} more${C.reset}`);
     if (!data.live.length) L.push(`  ${C.muted}no Claude Code sessions running${C.reset}`);
     L.push('');
+
+    // ---- the shared GPU and CPU pool
+    for (const line of boxLines(data.boxes ?? [], inner, ruleLine, now)) L.push(line);
 
     // ---- accounts
     rule('ACCOUNTS');
@@ -451,6 +567,15 @@ export function startTui({ webUrl, onQuit }) {
     }
     if (!data.models.length) L.push(`  ${C.muted}no usage in the last 7 days${C.reset}`);
     L.push('');
+
+    // ---- re-caching
+    const cache = cacheLines(data.cache, inner);
+    if (cache.length) {
+      rule('CACHE RE-WRITTEN AFTER A PAUSE');
+      L.push('');
+      for (const line of cache) L.push(line);
+      L.push('');
+    }
 
     if (ov.unattributed.events) {
       L.push(`  ${C.muted}${ov.unattributed.events.toLocaleString()} events (${money(ov.unattributed.cost)}) not tied to an account${C.reset}`);

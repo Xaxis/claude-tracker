@@ -433,6 +433,7 @@ export function remoteMachines(now = Date.now()) {
       running: current ? state?.running ?? [] : [],
       profiles: current ? state?.profiles ?? [] : [],
       failover: current ? state?.failover ?? null : null,
+      box: current ? state?.box ?? null : null,
     };
   });
 }

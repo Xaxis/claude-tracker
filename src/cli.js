@@ -5,7 +5,8 @@ import {
   listAccounts, accountLabel, resolveAccountEmails, setLabel, attributeEvents,
 } from './accounts.js';
 import { calibrateAll, verifyWindowModel } from './calibrate.js';
-import { overview, modelBreakdown, liveSessions, inUse } from './api.js';
+import { overview, modelBreakdown, liveSessions, inUse, boxes } from './api.js';
+import { cacheSummary } from './context.js';
 import { LIMIT_TYPES, resetWindowCache, earliestCachedChain } from './windows.js';
 import { invalidateAggregates, aggregatesCutoff } from './aggregates.js';
 import { closeDb } from './db.js';
@@ -29,8 +30,13 @@ function duration(ms) {
   const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60);
   if (h >= 24) return `${Math.floor(h / 24)}d ${h % 24}h`;
   if (h) return `${h}h ${m}m`;
+  if (!m) return `${s}s`;
   return `${m}m`;
 }
+
+const tokens = (n) => (n >= 999_500 ? `${(n / 1e6).toFixed(1)}M` : `${Math.round(n / 1e3)}k`);
+const ctxColor = (n) => (n >= 600e3 ? c.red : n >= 400e3 ? c.yellow : '');
+const waitColor = (ms) => (ms >= 5 * 60e3 ? c.red : c.yellow);
 
 function bar(percent, width = 28) {
   const filled = Math.round((Math.min(100, percent) / 100) * width);
@@ -170,7 +176,86 @@ function cmdStatus() {
     console.log(`  ${c.red}Every account is refused right now.${c.reset}`);
   }
   if (live.length) {
-    console.log(`  ${c.cyan}${live.length}${c.reset} ${c.dim}Claude Code session${live.length === 1 ? '' : 's'} running now${c.reset}`);
+    const carried = live.reduce((a, s) => a + (s.context?.tokens ?? 0), 0);
+    const waiting = boxes().reduce((a, b) => a + (b.gpu?.jobsWaiting ?? 0) + (b.cpu?.jobsWaiting ?? 0), 0);
+    console.log(`  ${c.cyan}${live.length}${c.reset} ${c.dim}Claude Code session${live.length === 1 ? '' : 's'} running now` +
+      `${carried ? ` · ${tokens(carried)} context a turn in all` : ''}${waiting ? ` · ${waiting} job${waiting === 1 ? '' : 's'} waiting for the GPU or CPU pool` : ''}` +
+      ` · claude-tracker sessions${c.reset}`);
+  }
+  console.log();
+}
+
+/** One line for a session's job holding or waiting for the GPU or a CPU slot. */
+function leaseText(l, now) {
+  const what = l.kind === 'gpu' ? 'the GPU' : 'a CPU slot';
+  const where = l.place ? ` in ${l.place}` : '';
+  const ms = now - l.since;
+  if (l.state === 'holds') return `${c.dim}■ holds ${what}${where} · ${duration(ms)}${c.reset}`;
+  const pos = l.ahead === 0 ? 'next in line' : `${l.ahead} ahead`;
+  const behind = l.behind?.length ? ` · behind ${l.behind.map((b) => `${b.who} (${duration(now - b.since)})`).join(', ')}` : '';
+  return `${waitColor(ms)}▸ ${l.jobs > 1 ? `${l.jobs} jobs` : 'a job'}${where} waiting ${duration(ms)} for ${what}${c.reset}${c.dim} · ${pos}${behind}${c.reset}`;
+}
+
+/** What is running, what each session carries into a turn, and who waits for the GPU or CPU pool. */
+function cmdSessions() {
+  const now = Date.now();
+  const live = liveSessions(now);
+  const carried = live.reduce((a, s) => a + (s.context?.tokens ?? 0), 0);
+  console.log(`\n${c.bold}Running now${c.reset} ${c.dim}· ${live.length} session${live.length === 1 ? '' : 's'}${carried ? ` · ${tokens(carried)} context a turn in all` : ''}${c.reset}\n`);
+  if (!live.length) console.log(`  ${c.dim}no Claude Code sessions running${c.reset}`);
+  for (const s of live) {
+    const dot = s.status === 'busy' ? `${c.yellow}●${c.reset}` : `${c.gray}○${c.reset}`;
+    const x = s.context;
+    const ctx = x ? `${ctxColor(x.tokens)}${pad(tokens(x.tokens), 5)}${c.reset} ${c.dim}${pad(`${money(x.perTurn)}/turn`, 11)}${c.reset}` : `${c.dim}${pad('—', 17)}${c.reset}`;
+    const agents = s.agents?.length ? `${s.agents.length} agent${s.agents.length === 1 ? '' : 's'}` : '';
+    const re = s.recache?.turns ? `↻${s.recache.turns} ${money(s.recache.cost)} this hour` : '';
+    console.log(`  ${dot} ${pad((s.name || s.sessionId.slice(0, 8)).slice(0, 22), 23)}${pad((s.account ?? 'unknown account').slice(0, 30), 31)}${ctx} ` +
+      `${c.dim}${pad(agents, 10)}${re}${s.machine ? `  on ${s.machine}` : ''}${c.reset}`);
+    if (s.agents?.length) console.log(`      ${c.dim}agents at work: ${s.agents.map((a) => a.name).join(', ')}${c.reset}`);
+    for (const l of s.leases ?? []) console.log(`      ${leaseText(l, now)}`);
+  }
+  for (const b of boxes(now)) {
+    const on = b.machine ? ` on ${b.machine}` : '';
+    for (const [kind, x] of [['gpu', b.gpu], ['cpu', b.cpu]]) {
+      if (!x || (kind === 'cpu' && !x.held.length && !x.waiting.length)) continue;
+      const head = kind === 'gpu'
+        ? `GPU${on}${c.reset} ${c.dim}· ${x.held.length ? 'held' : 'free'}${x.jobsWaiting ? ` · ${x.jobsWaiting} waiting` : ''}`
+        : `CPU pool${on}${c.reset} ${c.dim}· ${x.held.length} of ${x.slots} slots${x.jobsWaiting ? ` · ${x.jobsWaiting} waiting` : ''} · load ${Math.round(x.load)} on ${x.cores} cores`;
+      console.log(`\n${c.bold}${head}${c.reset}`);
+      for (const h of x.held) console.log(`  ${c.blue}■${c.reset} ${pad(h.session ?? h.project ?? '?', 22)} ${c.dim}${pad(h.place ?? '', 15)}${c.reset} ${pad(duration(now - h.since), 8)} ${c.dim}${(h.cmd ?? '').slice(0, 70)}${c.reset}`);
+      for (const w of x.waiting) {
+        const pos = w.ahead === 0 ? 'next in line' : `${w.ahead} ahead`;
+        console.log(`  ${waitColor(now - w.since)}▸${c.reset} ${pad(w.session ?? w.project ?? '?', 22)} ${c.dim}${pad(w.place ?? '', 15)}${c.reset} ${waitColor(now - w.since)}${pad(duration(now - w.since), 8)}${c.reset} ${c.dim}${w.jobs > 1 ? `${w.jobs} jobs · ` : ''}${pos}${c.reset}`);
+      }
+      if (kind === 'cpu' && x.waiting.length && x.held.length < x.slots && x.load >= x.cores) {
+        console.log(`  ${c.dim}${x.slots - x.held.length === 1 ? 'a slot is' : 'slots are'} free, but jobs wait until the load drops under ${x.cores}${c.reset}`);
+      }
+      const h = kind === 'gpu' ? x.hour : null;
+      if (h?.jobs) {
+        const parts = [`${h.jobs} job${h.jobs === 1 ? '' : 's'} waited ${duration(h.waitedMs)} in all`];
+        if (h.longestWait?.ms >= 60e3) parts.push(`longest wait ${duration(h.longestWait.ms)} (${h.longestWait.project})`);
+        if (h.longestHold?.ms >= 60e3) parts.push(`longest hold ${duration(h.longestHold.ms)} (${h.longestHold.project})`);
+        console.log(`  ${c.dim}last hour: ${parts.join(' · ')}${c.reset}`);
+      }
+    }
+  }
+  console.log();
+}
+
+/** Turns that re-wrote a lapsed cache, last day and week. */
+function printCache() {
+  const x = cacheSummary();
+  if (!x.week.turns) return;
+  console.log(`${c.bold}Cache re-written after a pause${c.reset}\n`);
+  for (const [label, r] of [['last 24h', x.day], ['last 7 days', x.week]]) {
+    console.log(`  ${pad(label, 12)} ${bar(r.share * 100, 20)} ${pad(`${Math.round(r.share * 100)}%`, 5)} ${pad(money(r.cost), 10)} ${c.dim}of ${money(r.spend)} · ${r.turns.toLocaleString()} turns${c.reset}`);
+  }
+  const ttl = (t) => (t === '1h' ? 'keep their cache an hour' : t === '5m' ? 'keep their cache 5 minutes' : '');
+  console.log(`    ${c.dim}subagents    ${pad(money(x.week.sub.cost), 10)} ${pad(`${x.week.sub.turns.toLocaleString()} turns`, 12)} ${ttl(x.ttl.sub)}${c.reset}`);
+  console.log(`    ${c.dim}main thread  ${pad(money(x.week.main.cost), 10)} ${pad(`${x.week.main.turns.toLocaleString()} turns`, 12)} ${ttl(x.ttl.main)}${c.reset}`);
+  if (x.hint) {
+    console.log(`\n  ${c.yellow}!${c.reset} Subagents re-write their whole context after any pause over 5 minutes. Keep it an hour:`);
+    console.log(`    "${x.hint.setting}": "${x.hint.value}" ${c.dim}in settings.json, or${c.reset} ${x.hint.env}=${x.hint.value}`);
   }
   console.log();
 }
@@ -236,6 +321,7 @@ function cmdModels(days) {
     console.log(`  ${pad(r.label, 14)} ${bar(share, 20)} ${pad(share.toFixed(1) + '%', 7)} ${pad(money(r.cost), 10)} ${c.dim}${r.events.toLocaleString()} calls${c.reset}`);
   }
   console.log(`\n  ${c.dim}total${c.reset} ${money(total)}\n`);
+  printCache();
 }
 
 function cmdVerify() {
@@ -541,6 +627,7 @@ ${c.bold}claude-tracker${c.reset} — local usage and rate-limit tracking for Cl
         ${c.dim}--no-web${c.reset}              terminal dashboard only
   ${c.bold}tui${c.reset}                         terminal dashboard alone, no HTTP server
   ${c.bold}status${c.reset}                      one-shot limit status for every account
+  ${c.bold}sessions${c.reset}                    what is running, its context a turn, who waits for the GPU or CPU
   ${c.bold}ingest${c.reset} [--force]            read new transcript data
   ${c.bold}accounts${c.reset}                    list discovered accounts
         ${c.dim}export [file.csv]${c.reset}         every account as a spreadsheet (Downloads by default)
@@ -611,6 +698,7 @@ export async function runCli(argv) {
       case 'failover': await refresh({ quiet: true }); await cmdFailover(rest[1] ?? 'status', rest.slice(2), flags); break;
       case 'pool': await cmdPool(rest[1] ?? 'list', rest.slice(2), flags); break;
       case 'models': await refresh({ quiet: true }); cmdModels(Number(flags.days ?? 30)); break;
+      case 'sessions': await refresh({ quiet: true }); cmdSessions(); break;
       case 'verify': await refresh({ quiet: true }); cmdVerify(); break;
       case 'where':
         console.log(`data dir : ${DATA_DIR}`);

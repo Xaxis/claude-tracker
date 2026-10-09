@@ -30,6 +30,18 @@ const compact = (n) => {
   return String(n);
 };
 
+/** Tokens as 507k or 1.2M. */
+const tokens = (n) => (n >= 999_500 ? `${(n / 1e6).toFixed(1)}M` : `${Math.round(n / 1e3)}k`);
+
+/**
+ * Context bands, by what a turn re-reads: past 400k a turn costs over ten times
+ * a fresh session's. The same bands as the terminal dashboard's.
+ */
+const contextBand = (n) => (n >= 800e3 ? 'critical' : n >= 600e3 ? 'serious' : n >= 400e3 ? 'warning' : 'accent');
+
+/** How long a job has waited: amber, then orange past 5 minutes, red past 15. The terminal's bands. */
+const waitBand = (ms) => (ms >= 15 * 60e3 ? 'critical' : ms >= 5 * 60e3 ? 'serious' : 'warning');
+
 /** "3h 12m" / "6d 4h" / "just now" - the reset countdown's voice. */
 function duration(ms) {
   if (ms == null) return '—';
@@ -79,8 +91,9 @@ function hideTip() {
 
 /* --- meter ---------------------------------------------------------------- */
 
-function meter({ label, percent, blocked, foot }) {
-  const sev = severity(percent, blocked);
+/** A meter. `plain` measures a share, not a limit, so it carries no severity. */
+function meter({ label, percent, blocked, foot, plain = false }) {
+  const sev = plain ? { key: 'accent', word: '' } : severity(percent, blocked);
   const wrap = el('div', `meter is-${sev.key}`);
 
   const top = el('div', 'meter-top');
@@ -636,7 +649,173 @@ function renderLive(rows) {
     val.append(ago);
     if (s.recent?.calls) val.append(document.createTextNode(` · ${money(s.recent.cost)}/5m`));
     row.append(val);
+    row.append(...sessionDetail(s));
     host.append(row);
+  }
+}
+
+/**
+ * What a running session carries into each turn - a bar up to where Claude
+ * Code compacts - its subagents at work, how often its cache lapsed this hour,
+ * and any job of its holding or waiting for the shared GPU or CPU pool.
+ * Sessions on a machine running an older tracker have none of it.
+ */
+function sessionDetail(s) {
+  const out = [];
+  const c = s.context;
+  if (c) {
+    const band = contextBand(c.tokens);
+    const bar = el('div', `ctx-bar is-${band}`);
+    const fill = el('span');
+    fill.style.width = `${Math.min(100, (c.tokens / c.compactAt) * 100)}%`;
+    bar.append(fill);
+    bar.title = `${c.tokens.toLocaleString()} tokens re-read every turn, about ${money(c.perTurn)} a turn. Claude Code compacts at about ${tokens(c.compactAt)}.`;
+    out.push(bar);
+    const parts = [`${tokens(c.tokens)} context a turn · ${money(c.perTurn)} to re-read`];
+    if (s.agents?.length) parts.push(`${s.agents.length} agent${s.agents.length === 1 ? '' : 's'} at work: ${s.agents.map((a) => a.name).join(', ')}`);
+    if (s.recache?.turns) parts.push(`cache re-written ${s.recache.turns}× this hour, ${money(s.recache.cost)}`);
+    out.push(el('div', 'row-note', parts.join(' · ')));
+  }
+  for (const l of s.leases ?? []) out.push(leaseNote(l));
+  return out;
+}
+
+/** One line for a session's job holding or waiting for the GPU or a CPU slot. */
+function leaseNote(l) {
+  const what = l.kind === 'gpu' ? 'the GPU' : 'a CPU slot';
+  const where = l.place ? ` in ${l.place}` : '';
+  const note = el('div', 'row-note');
+  const ms = Date.now() - l.since;
+  if (l.state === 'holds') {
+    note.append(el('span', 'mark is-held', '■'), document.createTextNode(` holds ${what}${where} · `), sinceSpan(l.since));
+    return note;
+  }
+  const mark = el('span', `mark is-${waitBand(ms)}`, '▸');
+  mark.title = `Waiting since ${timeOf(l.since)}`;
+  const pos = l.ahead === 0 ? 'next in line' : `${l.ahead} ahead`;
+  const behind = l.behind?.length ? ` · behind ${l.behind.map((b) => b.who).join(', ')}` : '';
+  note.append(mark, document.createTextNode(` ${l.jobs > 1 ? `${l.jobs} jobs` : 'a job'}${where} waiting `), sinceSpan(l.since),
+    document.createTextNode(` for ${what} · ${pos}${behind}`));
+  return note;
+}
+
+/** A duration that counts up by itself, from `since`. */
+function sinceSpan(since) {
+  const span = el('span', 'since', duration(Date.now() - since));
+  span.dataset.since = since;
+  return span;
+}
+
+/* --- shared GPU and CPU --------------------------------------------------- */
+
+/** Every machine's GPU lease and CPU pool: who holds each, who waits and for how long. */
+function renderBox(list) {
+  const host = $('#box-groups');
+  host.textContent = '';
+  const many = list.length > 1 || list.some((b) => b.machine);
+  let waiting = 0;
+  for (const b of list) {
+    for (const [kind, s] of [['gpu', b.gpu], ['cpu', b.cpu]]) {
+      if (!s || (kind === 'cpu' && !s.held.length && !s.waiting.length)) continue;
+      waiting += s.jobsWaiting ?? 0;
+      const group = el('div', 'box-group');
+      const on = many ? ` on ${b.machine ?? 'this machine'}` : '';
+      group.append(el('h3', null, kind === 'gpu'
+        ? `GPU${on} · ${s.held.length ? 'held' : 'free'}${s.jobsWaiting ? ` · ${s.jobsWaiting} waiting` : ''}`
+        : `CPU pool${on} · ${s.held.length} of ${s.slots} slots${s.jobsWaiting ? ` · ${s.jobsWaiting} waiting` : ''} · load ${Math.round(s.load)} on ${s.cores} cores`));
+      const rows = el('div', 'session-list');
+      for (const h of s.held) rows.append(boxRow(el('span', 'mark is-held', '■'), h, h.cmd, 'holding'));
+      for (const w of s.waiting) {
+        const mark = el('span', `mark is-${waitBand(Date.now() - w.since)}`, '▸');
+        const pos = w.ahead === 0 ? 'next in line' : `${w.ahead} ahead`;
+        rows.append(boxRow(mark, w, `${w.jobs > 1 ? `${w.jobs} jobs · ` : ''}${pos}`, 'waiting'));
+      }
+      if (!s.held.length && !s.waiting.length) rows.append(el('p', 'empty', 'Nothing on the GPU.'));
+      group.append(rows);
+      if (kind === 'gpu' && s.quarantined) group.append(el('p', 'panel-note', 'Quarantined after a GPU fault: gpu --enable once it is healthy.'));
+      if (kind === 'cpu' && s.waiting.length && s.held.length < s.slots && s.load >= s.cores) {
+        group.append(el('p', 'panel-note', `${s.slots - s.held.length === 1 ? 'A slot is' : 'Slots are'} free, but jobs wait until the load drops under ${s.cores}.`));
+      }
+      const h = kind === 'gpu' ? s.hour : null;
+      if (h?.jobs) {
+        const parts = [`${h.jobs} job${h.jobs === 1 ? '' : 's'} waited ${duration(h.waitedMs)} in all`];
+        if (h.longestWait?.ms >= 60e3) parts.push(`longest wait ${duration(h.longestWait.ms)} (${h.longestWait.project})`);
+        if (h.longestHold?.ms >= 60e3) parts.push(`longest hold ${duration(h.longestHold.ms)} (${h.longestHold.project})`);
+        group.append(el('p', 'panel-note', `Last hour: ${parts.join(' · ')}.`));
+      }
+      host.append(group);
+    }
+  }
+  $('#box-note').textContent = waiting ? `${waiting} job${waiting === 1 ? '' : 's'} waiting` : '';
+  $('#box').hidden = !host.childNodes.length;
+}
+
+function boxRow(mark, job, detail, doing) {
+  const row = el('div', 'row');
+  const main = el('div', 'row-main');
+  const title = el('div', 'row-title');
+  title.append(mark, document.createTextNode(` ${job.session ?? job.project ?? 'unknown'}`));
+  main.append(title);
+  main.append(el('div', 'row-sub', [job.project, job.place, detail].filter(Boolean).join(' · ')));
+  row.append(main);
+  const val = el('div', 'row-value');
+  val.append(sinceSpan(job.since));
+  val.title = `${doing} since ${timeOf(job.since)}`;
+  row.append(val);
+  return row;
+}
+
+/* --- re-cached context ---------------------------------------------------- */
+
+/** Turns that re-wrote a lapsed cache: the last day and week, subagents and main thread apart. */
+function renderCache(c) {
+  const box = $('#cache');
+  if (!c?.week?.turns) { box.hidden = true; return; }
+  box.hidden = false;
+  const stats = $('#cache-stats');
+  stats.textContent = '';
+  for (const [label, r] of [['Last 24 hours', c.day], ['Last 7 days', c.week]]) {
+    const tile = el('div', 'stat');
+    tile.append(el('div', 'stat-label', label));
+    tile.append(el('div', 'stat-figure', money(r.cost)));
+    tile.append(meter({ label: 'Share of all spend', percent: r.share * 100, foot: `of ${money(r.spend)} spent`, plain: true }));
+    tile.append(el('div', 'stat-sub', `${r.turns.toLocaleString()} turns re-wrote their cache, of ${r.calls.toLocaleString()}`));
+    stats.append(tile);
+  }
+
+  const split = $('#cache-split');
+  split.textContent = '';
+  const ttl = (t) => (t === '1h' ? 'keeps its cache an hour' : t === '5m' ? 'keeps its cache 5 minutes' : '');
+  const total = c.week.cost || 1;
+  for (const [label, part, t, color] of [['Subagents', c.week.sub, c.ttl?.sub, '--series-1'], ['Main thread', c.week.main, c.ttl?.main, '--series-2']]) {
+    const row = el('div', 'row');
+    const main = el('div', 'row-main');
+    const title = el('div', 'row-title');
+    const dot = el('span', 'dot');
+    dot.style.background = cssVar(color);
+    title.append(dot, document.createTextNode(` ${label}`));
+    main.append(title);
+    main.append(el('div', 'row-sub', `${part.turns.toLocaleString()} turns this week · ${ttl(t)}`));
+    row.append(main);
+    row.append(el('div', 'row-value', `${money(part.cost)}  ${Math.round((part.cost / total) * 100)}%`));
+    const bar = el('div', 'row-bar');
+    const span = el('span');
+    span.style.width = `${(part.cost / total) * 100}%`;
+    span.style.background = cssVar(color);
+    bar.append(span);
+    row.append(bar);
+    split.append(row);
+  }
+
+  const hint = $('#cache-hint');
+  hint.hidden = !c.hint;
+  if (c.hint) {
+    hint.textContent = '';
+    const code = (t) => el('code', null, t);
+    hint.append(
+      document.createTextNode('Subagents re-write their whole context after any pause over 5 minutes. Keep it an hour with '),
+      code(`"${c.hint.setting}": "${c.hint.value}"`), document.createTextNode(' in settings.json, or '),
+      code(`${c.hint.env}=${c.hint.value}`), document.createTextNode('.'));
   }
 }
 
@@ -670,6 +849,9 @@ setInterval(() => {
   for (const a of document.querySelectorAll('.ago[data-since]')) {
     a.textContent = `${duration(now - Number(a.dataset.since))} ago`;
   }
+  for (const a of document.querySelectorAll('.since[data-since]')) {
+    a.textContent = duration(now - Number(a.dataset.since));
+  }
   for (const m of document.querySelectorAll('.meter[data-active="1"]')) {
     const end = Number(m.dataset.resetAt);
     if (!end) continue;
@@ -689,13 +871,14 @@ async function loadFast() {
   if (fastBusy) { fastAgain = true; return; }
   fastBusy = true;
   try {
-    const [ov, live] = await Promise.all([getJson('/api/overview'), getJson('/api/live')]);
+    const [ov, live, box] = await Promise.all([getJson('/api/overview'), getJson('/api/live'), getJson('/api/box')]);
     state.overview = ov;
     renderHero(ov);
     renderRecommendation(ov);
     renderFailover(ov);
     renderAccounts(ov, live);
     renderLive(live);
+    renderBox(box);
     syncAccountFilter(ov);
     $('#foot-note').textContent = `Updated ${new Date().toLocaleTimeString()} · ${syncNote(ov.sync)}`;
   } finally {
@@ -720,13 +903,15 @@ function syncAccountFilter(ov) {
 /** Charts, model split, session history - heavier, and slow-moving. */
 async function loadSlow() {
   const acct = state.account === 'all' ? '' : `&account=${encodeURIComponent(state.account)}`;
-  const [daily, models, sess] = await Promise.all([
+  const [daily, models, sess, cache] = await Promise.all([
     getJson(`/api/history?days=${state.days}${acct}`),
     getJson(`/api/models?days=${state.days}${acct}`),
     getJson(`/api/sessions?limit=40${acct}`),
+    getJson('/api/cache'),
   ]);
   renderDaily(daily);
   renderModels(models);
+  renderCache(cache);
   renderSessions(sess, state.overview?.accounts ?? []);
   await loadWindows();
 }

@@ -9,6 +9,10 @@ directory you use, reconstructs the 5-hour and 7-day rate-limit windows per
 account, and shows how full each one is right now — in the terminal, in the
 browser, or both at once. New accounts are picked up on their own.
 
+It also shows what each running session carries into every turn, which jobs
+are waiting for a machine's shared GPU or CPU pool, and how much of your spend
+goes to re-writing prompt caches that lapsed.
+
 Everything stays on your machine unless you sync it with another of yours,
 over ssh. There are no dependencies, no API calls, and no network access beyond
 a loopback HTTP server you start yourself.
@@ -21,10 +25,12 @@ a loopback HTTP server you start yourself.
 
   USE NOW  personal@example.com  96% headroom  CLAUDE_CONFIG_DIR=~/.claude-personal claude
 
-   RUNNING NOW · 3 sessions ─────────────────────────────────────────────────
-  ● api-server           work@example.com               4s     $1.20/5m
-  ● docs-site            personal@example.com           1m     $0.35/5m
-  ○ nightly-job          work@example.com (bg)          12m
+   RUNNING NOW · 3 sessions · 1.3M context a turn in all ────────────────────
+                                              context
+  ● api-server       work@example.com         612k ██████░░ +3  4s   $1.20/5m
+      ▸ a job in render-fix waiting 9m for the GPU · next in line · behind docs-site
+  ● docs-site        personal@example.com     480k ████░░░░     1m   $0.35/5m
+  ○ nightly-job      work@example.com (bg)    210k ██░░░░░░     12m
 
    ACCOUNTS ─────────────────────────────────────────────────────────────────
 
@@ -72,6 +78,7 @@ Run it from any directory once linked:
 | `claude-tracker tui` | terminal only, no HTTP server |
 | `claude-tracker serve --no-tui` | web only, good for leaving running |
 | `claude-tracker status` | one-shot summary — fine for a shell prompt |
+| `claude-tracker sessions` | what is running, the context each carries, who waits for the GPU or CPU |
 | `claude-tracker models --days 7` | where the spend went |
 | `claude-tracker verify` | check the window model against your own resets |
 | `claude-tracker accounts` | list accounts and their UUIDs |
@@ -107,8 +114,9 @@ Both dashboards run in one process off a single file watcher, so the browser and
 the terminal never disagree and the transcripts are only scanned once.
 
 Running sessions are listed at the top of both dashboards, each with the account
-it is billing right now, whether it is busy, when it last did anything, and what
-it has spent in the last five minutes.
+it is billing right now, whether it is busy, when it last did anything, what
+it has spent in the last five minutes, the context it carries into each turn,
+its subagents at work, and any job of its waiting for the GPU or a CPU slot.
 
 In the terminal dashboard: `q` quit · `r` refresh · `a` cycle account ·
 `w` switch window · `space` pause · `↑↓`/`jk` scroll · `o` open the web
@@ -402,6 +410,63 @@ are left blank to fill in - Claude Code is never told either. Open it in Google
 Sheets with File → Import → Upload. The terminal dashboard exports with `e`, and
 the web dashboard has an Export link on its Accounts panel.
 
+### What each session carries
+
+Every turn re-sends the whole conversation, so the context a session carries is
+what it costs per turn. At 600k tokens a turn re-reads eighteen times what a
+fresh session does, even when nothing new happens. On a machine running a dozen
+long sessions most spend goes to that: on the one this was measured on, main
+threads spent a third of their turns above 600k, and those turns were over half
+of their spend. Seeing it is what tells you a session is due a hand-off.
+
+Each running session shows the context of its main thread's latest turn, with a
+bar up to where Claude Code compacts (about 967k on 1M-context models), and what
+re-reading it costs per turn. Beside it: how many of its subagents have worked in
+the last 15 minutes, by name in the browser, and how many of its turns this hour
+re-wrote a lapsed cache (`↻`), and what that cost. Colour follows the context:
+amber past 400k, orange past 600k, red past 800k.
+
+It costs nothing to read: every call's tokens are already in the index.
+
+### The shared GPU and CPU pool
+
+On a machine where claude-core's `gpu` and `heavy` lease commands
+share out the GPU and CPU among sessions, a job can wait a long time behind
+someone else's render, and neither tool says whose session is waiting. The
+tracker reads their state - `/tmp/box-gpu` and `/tmp/box-heavy`, or wherever
+`BOX_GPU_DIR` and `BOX_HEAVY_DIR` point - and names every holder and waiter by
+its Claude session and worktree, from the job's own environment: Claude Code
+puts `CLAUDE_CODE_SESSION_ID` in every command it runs.
+
+Both dashboards and `claude-tracker sessions` show who holds the GPU and for how
+long, who waits behind it, oldest first, with one agent's batch of jobs as one
+wait, and what the lease log says about the last hour: how long jobs waited in
+all, the longest wait and the longest hold. The CPU pool says when its slots are
+free but the load keeps jobs waiting. Each running session that has a job
+waiting says so on its own row. A synced machine's pool shows on the other, as
+it last reported it.
+
+A Mac has no `/proc` to read an environment from, so there jobs are listed by
+project. A machine without either tool shows neither.
+
+### Cache re-written after a pause
+
+Most of a turn's context is read from the prompt cache. The cache lapses after a
+pause - by default 5 minutes for subagents and an hour for the main thread on a
+subscription - and the turn after it writes the whole context again, at 12 to 20
+times the price of reading it. A subagent waiting 9 minutes for the GPU with
+500k of context pays that on its next turn.
+
+Both dashboards and `claude-tracker models` show how much the last day and
+week of such turns cost, as a share of all spend, for subagents and the main
+thread apart, and how long each keeps its cache now. A turn counts when at least
+half of a context of 50k or more was written rather than read; a fresh agent's
+first turn is smaller than that. While subagents still write 5-minute caches and
+it costs more than a twentieth of spend, the dashboards name the setting that
+keeps them an hour, `"subagentPromptCacheTtl": "1h"` in `settings.json`; once
+they write hour-long caches, the advice goes away and the figures show what
+changed.
+
 ### Realtime
 
 Both dashboards run off one watcher inside the tracker process:
@@ -572,6 +637,9 @@ Everything stays on this machine, unless you sync it: then the index is copied
 to the machines you added, over ssh, and theirs to this one. The tracker reads
 Claude Code's transcripts and config files. It reads and moves sign-ins only to fail over, between profiles on the same machine, never anywhere else. `statusline install` edits only the
 `statusLine` key of each profile's `settings.json`, after writing a backup.
+From the jobs holding or waiting for the GPU and CPU pool, it reads
+`/proc/<pid>/environ` - your own processes only - for two variables,
+`CLAUDE_CODE_SESSION_ID` and `PWD`, and keeps nothing else from it.
 Notifications go through macOS's own notification centre. The web server binds
 to `127.0.0.1` only, and the index lives in `~/.claude/tracker/`. A sync
 connection reaches it only through `sync serve`, which has to show a token kept
@@ -609,6 +677,8 @@ depend on your own usage history.
 | `src/signin.js` | a profile's sign-in, read and moved the way Claude Code keeps it |
 | `src/billing.js` | projects the subscription cycle from its start date |
 | `src/api.js` | aggregation for both dashboards |
+| `src/context.js` | what each session carries per turn, and caches re-written after a pause |
+| `src/box.js` | the shared GPU lease and CPU pool, each job named by its session |
 | `src/tui.js` | terminal dashboard |
 | `src/server.js` | HTTP API, static files, live updates |
 | `web/` | browser dashboard |

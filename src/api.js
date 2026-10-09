@@ -11,6 +11,8 @@ import { accountAggregates } from './aggregates.js';
 import { machine, remoteMachines, listPeers, machineNameOf } from './replica.js';
 import { failoverSettings, recentSwitches, spares, SPARE_PREFIX } from './failover.js';
 import { getMeta } from './db.js';
+import { boxState, boxView, sessionLeases } from './box.js';
+import { mainContext, activeAgents, sessionRecaches, placeName } from './context.js';
 
 const UNATTRIBUTED = '__unattributed__';
 
@@ -381,9 +383,11 @@ export function localSessions(now = Date.now()) {
   const lastCall = d.prepare(`SELECT session_id sid, MAX(ts) last FROM events WHERE session_id >= ? AND session_id < ? || '~'`);
   const who = accountResolver();
 
+  const entries = [...runningEntries()];
+  const box = boxPanel(now, entries);
   const out = [];
   const signedInTo = new Map();
-  for (const { profile, s } of runningEntries()) {
+  for (const { profile, s } of entries) {
     if (!signedInTo.has(profile.dir)) signedInTo.set(profile.dir, profileAccount(profile));
     const signedIn = signedInTo.get(profile.dir);
     // A parked job writes its transcript under its job id, not the host session's.
@@ -411,6 +415,7 @@ export function localSessions(now = Date.now()) {
       if (lc && (!last || lc > last)) last = lc;
     }
 
+    const ids = [...new Set([sid, ...keys])].filter(Boolean);
     out.push({
       sessionId: s.sessionId, pid: s.pid, cwd: s.cwd, name: s.name,
       status: s.status, kind: s.kind, background: !!s.parkedJobId,
@@ -424,10 +429,50 @@ export function localSessions(now = Date.now()) {
       account: acct ? accountLabel(acct) : null,
       accountSource: source,
       recent: { calls, cost, perHour: cost * 12 },
+      ...sessionDetail(ids, sid ?? s.sessionId, now),
+      leases: sessionLeases(box, ids),
       machine: null,
     });
   }
   return out.sort((a, b) => (b.lastActivityAt ?? 0) - (a.lastActivityAt ?? 0));
+}
+
+/**
+ * What a running session carries into each turn, which of its subagents are at
+ * work, and how often its cache lapsed in the last hour. The context is read
+ * fresh; the rest changes slowly and is re-read every few seconds at most.
+ */
+const detailMemo = new Map();
+function sessionDetail(ids, transcriptId, now) {
+  const key = ids.join('|');
+  let slow = detailMemo.get(key);
+  if (!slow || now - slow.at > 5000) {
+    slow = { at: now, agents: activeAgents(transcriptId, now), recache: sessionRecaches(ids, now - 3600e3) };
+    detailMemo.set(key, slow);
+    if (detailMemo.size > 200) detailMemo.delete(detailMemo.keys().next().value);
+  }
+  return { context: mainContext(ids), agents: slow.agents, recache: slow.recache };
+}
+
+/**
+ * The shared GPU and CPU pool on this machine, every job named by the running
+ * session it belongs to. Null where neither exists.
+ */
+export function boxPanel(now = Date.now(), entries = null) {
+  const names = new Map();
+  for (const { s } of entries ?? runningEntries()) {
+    for (const id of [s.sessionId, s.parkedJobId]) if (id && s.name) names.set(id, s.name);
+  }
+  return boxView(boxState(now), (id) => names.get(id) ?? null, placeName);
+}
+
+/** Every machine's GPU and CPU pool: this one's, then each synced machine's as it last reported. */
+export function boxes(now = Date.now()) {
+  const out = [];
+  const here = boxPanel(now);
+  if (here) out.push({ machine: null, ...here });
+  for (const m of remoteMachines(now)) if (m.box) out.push({ machine: m.name, ...m.box });
+  return out;
 }
 
 /** Each profile on this machine and who is signed into it, as other machines are told. */
@@ -443,7 +488,7 @@ export function profileStates() {
 export function localState() {
   const f = failoverSummary();
   return {
-    running: localSessions(), profiles: profileStates(),
+    running: localSessions(), profiles: profileStates(), box: boxPanel(),
     failover: {
       mode: f.mode, at: f.at, best: f.plan?.best ? { label: f.plan.best.label, room: f.plan.best.room } : null,
       entries: (f.plan?.entries ?? []).map((e) => ({

@@ -63,6 +63,14 @@
     <div id="live-sessions" class="session-list live-grid"></div>
   </section>
 
+  <section class="panel" id="box" hidden>
+    <div class="panel-head">
+      <h2>Shared GPU &amp; CPU</h2>
+      <p class="panel-note" id="box-note"></p>
+    </div>
+    <div id="box-groups" class="box-groups"></div>
+  </section>
+
   <section class="panel">
     <div class="panel-head">
       <h2>Accounts</h2>
@@ -124,6 +132,16 @@
       <div id="model-list" class="model-list"></div>
     </section>
   </div>
+
+  <section class="panel" id="cache" hidden>
+    <div class="panel-head">
+      <h2>Cache re-written after a pause</h2>
+      <p class="panel-note">Turns that wrote most of their context again because the prompt cache had lapsed.</p>
+    </div>
+    <div class="stat-grid" id="cache-stats"></div>
+    <div id="cache-split" class="model-list"></div>
+    <p class="callout" id="cache-hint" hidden></p>
+  </section>
 
   <section class="panel">
     <div class="panel-head"><h2>Recent sessions</h2></div>
