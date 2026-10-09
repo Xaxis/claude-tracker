@@ -1,7 +1,8 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import { execFileSync } from 'node:child_process';
 import { db } from './db.js';
-import { discoverProfiles, HOME, tildify } from './paths.js';
+import { discoverProfiles, HOME, tildify, REPO_DIR } from './paths.js';
 import { accountLabel, listAccounts, currentAccount, profileAccount, accountResolver } from './accounts.js';
 import { capacityFor } from './calibrate.js';
 import { LIMIT_TYPES, currentWindow, burnRate, recentWindows, sumBetween } from './windows.js';
@@ -316,7 +317,12 @@ export function liveSessions(now = Date.now()) {
   for (const m of remoteMachines(now)) {
     for (const s of m.running) {
       const acct = s.accountUuid ? byUuid.get(s.accountUuid) : null;
-      out.push({ ...s, account: acct ? accountLabel(acct) : s.account, machine: m.name });
+      // A tracker from before session detail sends none; its calls are synced
+      // here, so what each of its sessions carries is worked out here instead.
+      const detail = s.context === undefined
+        ? sessionDetail([...new Set([s.transcriptId, s.sessionId, s.parkedJobId])].filter(Boolean), null, now)
+        : null;
+      out.push({ ...s, ...detail, account: acct ? accountLabel(acct) : s.account, machine: m.name });
     }
   }
   return out.sort((a, b) => (b.lastActivityAt ?? 0) - (a.lastActivityAt ?? 0));
@@ -455,6 +461,36 @@ function sessionDetail(ids, transcriptId, now) {
 }
 
 /**
+ * Which tracker this is: its commit, and when that commit was made. Read once,
+ * when first asked - the service asks as it starts - so it names the code that
+ * is running, not whatever was pulled since. Null outside a git checkout.
+ */
+let built;
+export function build() {
+  if (built !== undefined) return built;
+  built = null;
+  try {
+    const [id, at] = execFileSync('git', ['-C', REPO_DIR, 'log', '-1', '--format=%h %ct'],
+      { encoding: 'utf8', timeout: 3000, stdio: ['ignore', 'pipe', 'ignore'] }).trim().split(' ');
+    if (id && Number(at)) built = { id, at: Number(at) * 1000 };
+  } catch { /* not a git checkout */ }
+  return built;
+}
+
+/**
+ * How another machine's tracker compares with this one, by when each one's
+ * code was committed: 'older', 'newer', or null when the same or unknown. One
+ * that reports but sends no build predates builds, and so is older.
+ */
+export function versionOf(peer) {
+  const mine = build();
+  if (peer === undefined || !mine) return null;
+  if (!peer) return 'older';
+  if (peer.id === mine.id) return null;
+  return peer.at < mine.at ? 'older' : peer.at > mine.at ? 'newer' : null;
+}
+
+/**
  * The shared GPU and CPU pool on this machine, every job named by the running
  * session it belongs to. Null where neither exists.
  */
@@ -488,7 +524,7 @@ export function profileStates() {
 export function localState() {
   const f = failoverSummary();
   return {
-    running: localSessions(), profiles: profileStates(), box: boxPanel(),
+    running: localSessions(), profiles: profileStates(), box: boxPanel(), build: build(),
     failover: {
       mode: f.mode, at: f.at, best: f.plan?.best ? { label: f.plan.best.label, room: f.plan.best.room } : null,
       entries: (f.plan?.entries ?? []).map((e) => ({
@@ -526,7 +562,7 @@ function failoverSummary(now = Date.now()) {
 function syncSummary(now) {
   const peers = listPeers().map((p) => ({ target: p.target, status: p.status, error: p.error, at: p.status_at }));
   const remote = remoteMachines(now);
-  const machines = remote.map(({ id, name, online, lastSeen }) => ({ id, name, online, lastSeen }));
+  const machines = remote.map(({ id, name, online, lastSeen, build: b }) => ({ id, name, online, lastSeen, version: versionOf(b) }));
   const signedIn = [];
   const main = profileStates().find((p) => p.isDefault);
   if (main?.accountUuid) signedIn.push({ machine: null, accountUuid: main.accountUuid });

@@ -434,6 +434,8 @@ export function remoteMachines(now = Date.now()) {
       profiles: current ? state?.profiles ?? [] : [],
       failover: current ? state?.failover ?? null : null,
       box: current ? state?.box ?? null : null,
+      // Undefined while it is not reporting; null when it reports without one.
+      build: current && state ? state.build ?? null : undefined,
     };
   });
 }

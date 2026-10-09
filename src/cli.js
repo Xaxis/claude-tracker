@@ -5,12 +5,12 @@ import {
   listAccounts, accountLabel, resolveAccountEmails, setLabel, attributeEvents,
 } from './accounts.js';
 import { calibrateAll, verifyWindowModel } from './calibrate.js';
-import { overview, modelBreakdown, liveSessions, inUse, boxes } from './api.js';
+import { overview, modelBreakdown, liveSessions, inUse, boxes, versionOf } from './api.js';
 import { cacheSummary } from './context.js';
 import { LIMIT_TYPES, resetWindowCache, earliestCachedChain } from './windows.js';
 import { invalidateAggregates, aggregatesCutoff } from './aggregates.js';
 import { closeDb } from './db.js';
-import { importMark } from './replica.js';
+import { importMark, remoteMachines } from './replica.js';
 import { DATA_DIR, DB_PATH } from './paths.js';
 
 const C = {
@@ -35,6 +35,21 @@ function duration(ms) {
 }
 
 const tokens = (n) => (n >= 999_500 ? `${(n / 1e6).toFixed(1)}M` : `${Math.round(n / 1e3)}k`);
+const cut = (s, n) => (s.length > n ? `${s.slice(0, n - 1)}…` : s);
+
+/** Agent names, once each, with a count where several share one: `Explore ×2, speed`. */
+function agentList(agents) {
+  const n = new Map();
+  for (const a of agents) n.set(a.name, (n.get(a.name) ?? 0) + 1);
+  return [...n].map(([name, k]) => (k > 1 ? `${name} ×${k}` : name)).join(', ');
+}
+
+/** What fixes a synced machine running a different tracker, or null when it runs the same. */
+function skewNote(name, version) {
+  if (version === 'older') return `${name} runs an older claude-tracker, so it shows no session detail. On ${name}: git pull in its claude-tracker checkout, then claude-tracker service install`;
+  if (version === 'newer') return `${name} runs a newer claude-tracker than this machine. Here: git pull in the claude-tracker checkout, then claude-tracker service install`;
+  return null;
+}
 const ctxColor = (n) => (n >= 600e3 ? c.red : n >= 400e3 ? c.yellow : '');
 const waitColor = (ms) => (ms >= 5 * 60e3 ? c.red : c.yellow);
 
@@ -202,6 +217,10 @@ function cmdSessions() {
   const live = liveSessions(now);
   const carried = live.reduce((a, s) => a + (s.context?.tokens ?? 0), 0);
   console.log(`\n${c.bold}Running now${c.reset} ${c.dim}· ${live.length} session${live.length === 1 ? '' : 's'}${carried ? ` · ${tokens(carried)} context a turn in all` : ''}${c.reset}\n`);
+  for (const m of remoteMachines(now)) {
+    const note = skewNote(m.name, versionOf(m.build));
+    if (note) console.log(`  ${c.yellow}!${c.reset} ${note}\n`);
+  }
   if (!live.length) console.log(`  ${c.dim}no Claude Code sessions running${c.reset}`);
   for (const s of live) {
     const dot = s.status === 'busy' ? `${c.yellow}●${c.reset}` : `${c.gray}○${c.reset}`;
@@ -211,7 +230,7 @@ function cmdSessions() {
     const re = s.recache?.turns ? `↻${s.recache.turns} ${money(s.recache.cost)} this hour` : '';
     console.log(`  ${dot} ${pad((s.name || s.sessionId.slice(0, 8)).slice(0, 22), 23)}${pad((s.account ?? 'unknown account').slice(0, 30), 31)}${ctx} ` +
       `${c.dim}${pad(agents, 10)}${re}${s.machine ? `  on ${s.machine}` : ''}${c.reset}`);
-    if (s.agents?.length) console.log(`      ${c.dim}agents at work: ${s.agents.map((a) => a.name).join(', ')}${c.reset}`);
+    if (s.agents?.length) console.log(`      ${c.dim}agents at work: ${agentList(s.agents)}${c.reset}`);
     for (const l of s.leases ?? []) console.log(`      ${leaseText(l, now)}`);
   }
   for (const b of boxes(now)) {
@@ -222,10 +241,10 @@ function cmdSessions() {
         ? `GPU${on}${c.reset} ${c.dim}· ${x.held.length ? 'held' : 'free'}${x.jobsWaiting ? ` · ${x.jobsWaiting} waiting` : ''}`
         : `CPU pool${on}${c.reset} ${c.dim}· ${x.held.length} of ${x.slots} slots${x.jobsWaiting ? ` · ${x.jobsWaiting} waiting` : ''} · load ${Math.round(x.load)} on ${x.cores} cores`;
       console.log(`\n${c.bold}${head}${c.reset}`);
-      for (const h of x.held) console.log(`  ${c.blue}■${c.reset} ${pad(h.session ?? h.project ?? '?', 22)} ${c.dim}${pad(h.place ?? '', 15)}${c.reset} ${pad(duration(now - h.since), 8)} ${c.dim}${(h.cmd ?? '').slice(0, 70)}${c.reset}`);
+      for (const h of x.held) console.log(`  ${c.blue}■${c.reset} ${pad(h.session ?? h.project ?? '?', 22)} ${c.dim}${pad(cut(h.place ?? '', 16), 16)}${c.reset} ${pad(duration(now - h.since), 8)} ${c.dim}${(h.cmd ?? '').slice(0, 70)}${c.reset}`);
       for (const w of x.waiting) {
         const pos = w.ahead === 0 ? 'next in line' : `${w.ahead} ahead`;
-        console.log(`  ${waitColor(now - w.since)}▸${c.reset} ${pad(w.session ?? w.project ?? '?', 22)} ${c.dim}${pad(w.place ?? '', 15)}${c.reset} ${waitColor(now - w.since)}${pad(duration(now - w.since), 8)}${c.reset} ${c.dim}${w.jobs > 1 ? `${w.jobs} jobs · ` : ''}${pos}${c.reset}`);
+        console.log(`  ${waitColor(now - w.since)}▸${c.reset} ${pad(w.session ?? w.project ?? '?', 22)} ${c.dim}${pad(cut(w.place ?? '', 16), 16)}${c.reset} ${waitColor(now - w.since)}${pad(duration(now - w.since), 8)}${c.reset} ${c.dim}${w.jobs > 1 ? `${w.jobs} jobs · ` : ''}${pos}${c.reset}`);
       }
       if (kind === 'cpu' && x.waiting.length && x.held.length < x.slots && x.load >= x.cores) {
         console.log(`  ${c.dim}${x.slots - x.held.length === 1 ? 'a slot is' : 'slots are'} free, but jobs wait until the load drops under ${x.cores}${c.reset}`);
@@ -613,6 +632,8 @@ async function cmdSync(action, args, flags) {
       const seen = m.online ? 'online' : `last heard ${ago(m.lastSeen)}`;
       const running = m.running.length ? ` · ${m.running.length} session${m.running.length === 1 ? '' : 's'} running` : '';
       console.log(`  ${mark} ${pad(m.name, 28)} ${seen}${running}`);
+      const note = skewNote(m.name, versionOf(m.build));
+      if (note) console.log(`    ${c.yellow}${note}${c.reset}`);
     }
   }
   console.log();
@@ -645,8 +666,9 @@ ${c.bold}claude-tracker${c.reset} — local usage and rate-limit tracking for Cl
         ${c.dim}prefer <email>|auto${c.reset}       which account it switches to
   ${c.bold}pool${c.reset} [list]|add <email>        spare sign-ins on this machine, to switch to
 
-${c.dim}In the terminal dashboard: q quit · r refresh · a cycle account · w switch
-window · space pause · ↑↓/jk scroll · f failover on/off · t account to switch to ·
+${c.dim}In the terminal dashboard: q quit · r refresh · d detail on/off (context per turn,
+agents, GPU and CPU pool, re-written caches) · a cycle account · w switch window ·
+space pause · ↑↓/jk scroll · f failover on/off · t account to switch to ·
 +/- threshold · s switch now (press twice) · e export accounts${c.reset}
 
 ${c.dim}Data is read from your local Claude transcripts. Nothing leaves this machine except\nto machines you sync with, over ssh.${c.reset}

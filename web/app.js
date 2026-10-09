@@ -118,6 +118,8 @@ function meter({ label, percent, blocked, foot, plain = false }) {
 
 const state = {
   overview: null,
+  // Detail: what each session carries, the GPU and CPU pool, re-written caches.
+  detail: localStorage.getItem('ct-detail') === '1',
   days: 30,
   account: 'all',
   windowType: 'five_hour',
@@ -623,11 +625,13 @@ function renderFailover(ov) {
 
 /* --- sessions ------------------------------------------------------------- */
 
-function renderLive(rows) {
+function renderLive(rows, waiting = 0) {
   const host = $('#live-sessions');
   host.textContent = '';
   const busy = rows.filter((r) => r.status === 'busy').length;
-  $('#live-count').textContent = rows.length ? `${rows.length} running · ${busy} busy` : '';
+  // With detail off, jobs waiting for the GPU or CPU still get a word.
+  const wait = !state.detail && waiting ? ` · ${waiting} job${waiting === 1 ? '' : 's'} waiting for the GPU or CPU` : '';
+  $('#live-count').textContent = rows.length ? `${rows.length} running · ${busy} busy${wait}` : '';
   if (!rows.length) { host.append(el('p', 'empty', 'No Claude Code sessions running.')); return; }
   for (const s of rows) {
     const row = el('div', 'row');
@@ -672,12 +676,30 @@ function sessionDetail(s) {
     bar.title = `${c.tokens.toLocaleString()} tokens re-read every turn, about ${money(c.perTurn)} a turn. Claude Code compacts at about ${tokens(c.compactAt)}.`;
     out.push(bar);
     const parts = [`${tokens(c.tokens)} context a turn · ${money(c.perTurn)} to re-read`];
-    if (s.agents?.length) parts.push(`${s.agents.length} agent${s.agents.length === 1 ? '' : 's'} at work: ${s.agents.map((a) => a.name).join(', ')}`);
+    if (s.agents?.length) parts.push(`${s.agents.length} agent${s.agents.length === 1 ? '' : 's'} at work: ${agentList(s.agents)}`);
     if (s.recache?.turns) parts.push(`cache re-written ${s.recache.turns}× this hour, ${money(s.recache.cost)}`);
     out.push(el('div', 'row-note', parts.join(' · ')));
   }
   for (const l of s.leases ?? []) out.push(leaseNote(l));
   return out;
+}
+
+/** Agent names, once each, with a count where several share one: `Explore ×2, speed`. */
+function agentList(agents) {
+  const n = new Map();
+  for (const a of agents) n.set(a.name, (n.get(a.name) ?? 0) + 1);
+  return [...n].map(([name, k]) => (k > 1 ? `${name} ×${k}` : name)).join(', ');
+}
+
+/** A synced machine on a different tracker shows less on both sides: say which, and what fixes it. */
+function renderSkew(ov) {
+  const notes = (ov.sync?.machines ?? []).map((m) => (m.version === 'older'
+    ? `${m.name} runs an older claude-tracker, so it shows no session detail. On ${m.name}: git pull in its claude-tracker checkout, then claude-tracker service install.`
+    : m.version === 'newer'
+      ? `${m.name} runs a newer claude-tracker than this machine. Here: git pull in the claude-tracker checkout, then claude-tracker service install.`
+      : null)).filter(Boolean);
+  $('#skew').hidden = !notes.length;
+  $('#skew').textContent = notes.join(' ');
 }
 
 /** One line for a session's job holding or waiting for the GPU or a CPU slot. */
@@ -877,8 +899,9 @@ async function loadFast() {
     renderRecommendation(ov);
     renderFailover(ov);
     renderAccounts(ov, live);
-    renderLive(live);
+    renderLive(live, box.reduce((a, b) => a + (b.gpu?.jobsWaiting ?? 0) + (b.cpu?.jobsWaiting ?? 0), 0));
     renderBox(box);
+    renderSkew(ov);
     syncAccountFilter(ov);
     $('#foot-note').textContent = `Updated ${new Date().toLocaleTimeString()} · ${syncNote(ov.sync)}`;
   } finally {
@@ -950,6 +973,24 @@ $('#toggle-table').addEventListener('click', (e) => {
   $('#daily-table').hidden = !state.showTable;
   e.currentTarget.setAttribute('aria-pressed', String(state.showTable));
 });
+
+// Detail on and off, remembered per browser; d does it too.
+function applyDetail() {
+  document.body.classList.toggle('detail', state.detail);
+  $('#detail-toggle').setAttribute('aria-pressed', String(state.detail));
+  try { localStorage.setItem('ct-detail', state.detail ? '1' : '0'); } catch { /* private mode */ }
+}
+function toggleDetail() {
+  state.detail = !state.detail;
+  applyDetail();
+  if (state.overview) loadAll().catch(() => {});
+}
+$('#detail-toggle').addEventListener('click', toggleDetail);
+document.addEventListener('keydown', (e) => {
+  if (e.key !== 'd' || e.metaKey || e.ctrlKey || e.altKey || /^(INPUT|SELECT|TEXTAREA)$/.test(e.target.tagName)) return;
+  toggleDetail();
+});
+applyDetail();
 
 // Theme: auto → light → dark, remembered per browser.
 const THEMES = ['auto', 'light', 'dark'];

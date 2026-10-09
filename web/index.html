@@ -19,6 +19,8 @@
       <span class="live-dot" aria-hidden="true"></span>
       <span id="live-label">connecting…</span>
     </span>
+    <button id="detail-toggle" class="ghost-btn" type="button" aria-pressed="false"
+            title="Context per turn, agents, the GPU and CPU pool, re-written caches (d)">Detail</button>
     <button id="theme-toggle" class="ghost-btn" type="button" aria-label="Switch colour theme">
       <span id="theme-label">Auto</span>
     </button>
@@ -26,6 +28,8 @@
 </header>
 
 <main>
+  <p class="callout" id="skew" hidden></p>
+
   <!-- Hero: the one thing you opened this page to find out. -->
   <section class="hero" id="hero" hidden>
     <div class="hero-body">

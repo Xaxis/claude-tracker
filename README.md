@@ -25,12 +25,10 @@ a loopback HTTP server you start yourself.
 
   USE NOW  personal@example.com  96% headroom  CLAUDE_CONFIG_DIR=~/.claude-personal claude
 
-   RUNNING NOW · 3 sessions · 1.3M context a turn in all ────────────────────
-                                              context
-  ● api-server       work@example.com         612k ██████░░ +3  4s   $1.20/5m
-      ▸ a job in render-fix waiting 9m for the GPU · next in line · behind docs-site
-  ● docs-site        personal@example.com     480k ████░░░░     1m   $0.35/5m
-  ○ nightly-job      work@example.com (bg)    210k ██░░░░░░     12m
+   RUNNING NOW · 3 sessions · 1 job waiting for the GPU or CPU · d for detail ─
+  ● api-server           work@example.com               4s     $1.20/5m
+  ● docs-site            personal@example.com           1m     $0.35/5m
+  ○ nightly-job          work@example.com (bg)          12m
 
    ACCOUNTS ─────────────────────────────────────────────────────────────────
 
@@ -114,11 +112,28 @@ Both dashboards run in one process off a single file watcher, so the browser and
 the terminal never disagree and the transcripts are only scanned once.
 
 Running sessions are listed at the top of both dashboards, each with the account
-it is billing right now, whether it is busy, when it last did anything, what
-it has spent in the last five minutes, the context it carries into each turn,
-its subagents at work, and any job of its waiting for the GPU or a CPU slot.
+it is billing right now, whether it is busy, when it last did anything, and what
+it has spent in the last five minutes.
 
-In the terminal dashboard: `q` quit · `r` refresh · `a` cycle account ·
+**Detail** - `d` in the terminal, the Detail button (or `d`) in the browser - adds
+what each session carries into every turn, its subagents at work, its jobs on
+the GPU or CPU pool, the pool itself, and how much spend went to re-written
+caches, all above the accounts:
+
+```
+   RUNNING NOW · 3 sessions · 1.3M context a turn in all ────────────────────
+                                              context       agents ↻ last hour
+  ● api-server       work@example.com         612k ██████░░ +3     ↻4 $9.10   4s
+      agents: render-fix, docs ×2
+      ▸ a job in render-fix waiting 9m for the GPU · next in line · behind docs-site
+  ● docs-site        personal@example.com     480k ████░░░░                   1m
+      ■ holds the GPU · 12m
+```
+
+Either way is remembered. With detail off, jobs waiting for the GPU or CPU still
+get a word in the RUNNING NOW heading.
+
+In the terminal dashboard: `q` quit · `r` refresh · `d` detail · `a` cycle account ·
 `w` switch window · `space` pause · `↑↓`/`jk` scroll · `o` open the web
 dashboard. The address in its header is a link as well: Cmd-click it in
 terminals that support hyperlinks, such as iTerm2, Ghostty, kitty, WezTerm and
@@ -427,6 +442,15 @@ re-wrote a lapsed cache (`↻`), and what that cost. Colour follows the context:
 amber past 400k, orange past 600k, red past 800k.
 
 It costs nothing to read: every call's tokens are already in the index.
+
+Each machine works this out for its own sessions and sends it with them when it
+syncs, so both dashboards show every session's detail. A machine on an older
+tracker sends none; its calls are synced all the same, so its sessions' context
+and re-written caches are worked out from them here, and only its subagents and
+GPU waits are missing. Each tracker also sends which commit it runs, and a
+machine on an older or newer one is named at the top of both dashboards and in
+`claude-tracker sync`, with what updates it: `git pull` in its claude-tracker
+checkout, then `claude-tracker service install`.
 
 ### The shared GPU and CPU pool
 

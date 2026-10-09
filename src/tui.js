@@ -1,6 +1,7 @@
 import { spawn } from 'node:child_process';
 import { overview, liveSessions, modelBreakdown, windowHistory, inUse, boxes } from './api.js';
 import { cacheSummary } from './context.js';
+import { getMeta, setMeta } from './db.js';
 import { plan, setFailover, failoverSettings, spares, switchProfile, headroom, MIN_ROOM } from './failover.js';
 
 /**
@@ -272,6 +273,28 @@ function cacheLines(c, inner) {
   return L;
 }
 
+/** Agent names, once each, with a count where several share one: `Explore ×2, speed`. */
+function agentList(agents) {
+  const n = new Map();
+  for (const a of agents) n.set(a.name, (n.get(a.name) ?? 0) + 1);
+  return [...n].map(([name, k]) => (k > 1 ? `${name} ×${k}` : name)).join(', ');
+}
+
+/** A synced machine on a different tracker shows less on both sides: say which, and what fixes it. */
+function skewLines(sync) {
+  const L = [];
+  for (const m of sync?.machines ?? []) {
+    if (m.version === 'older') {
+      L.push(`  ${C.warning}!${C.reset} ${m.name} runs an older claude-tracker: it shows none of the session detail, and sends less of its own.`);
+      L.push(`    ${C.muted}On ${m.name}: git pull in its claude-tracker checkout, then claude-tracker service install${C.reset}`);
+    } else if (m.version === 'newer') {
+      L.push(`  ${C.warning}!${C.reset} ${m.name} runs a newer claude-tracker than this machine.`);
+      L.push(`    ${C.muted}Here: git pull in the claude-tracker checkout, then claude-tracker service install${C.reset}`);
+    }
+  }
+  return L;
+}
+
 /** The machines this one syncs with, for the header: bright while they report, dim once they stop. */
 function syncMark(sync, now) {
   if (!sync) return '';
@@ -294,6 +317,9 @@ export function startTui({ webUrl, onQuit }) {
     scroll: 0,
     windowType: 'five_hour',
     accountIdx: 0,      // 0 = all accounts
+    // Detail: what each session carries, the GPU and CPU pool, re-written caches.
+    // Remembered between runs.
+    detail: getMeta('tui_detail') === '1',
     live: true,
     lastRefresh: Date.now(),
     error: null,
@@ -322,12 +348,68 @@ export function startTui({ webUrl, onQuit }) {
       // Worked out here, not the service's copy: a key pressed here shows at once.
       plan: plan(ov, live),
       boxes: boxes(),
-      cache: slow ? cacheSummary() : data.cache,
+      cache: state.detail && (slow || !data.cache) ? cacheSummary() : data.cache,
       models: slow ? modelBreakdown(7, picked?.accountUuid ?? null) : data.models,
       windows: slow ? (focus ? windowHistory(focus.accountUuid, state.windowType, 24) : []) : data.windows,
       focus,
     };
     if (slow) slowAt = Date.now();
+  }
+
+  /** Running sessions, one line each: account, last activity, recent spend. */
+  function runningCompact(L, inner, now) {
+    const shown = data.live.slice(0, 10);
+    for (const s of shown) {
+      const busy = s.status === 'busy';
+      const dot = busy ? `${C.warning}●${C.reset}` : `${C.muted}○${C.reset}`;
+      const ago = s.lastActivityAt ? duration(now - s.lastActivityAt) : '—';
+      const burn = s.recent.calls ? `${money(s.recent.cost)}/5m` : '';
+      const who = s.account ? `${s.account}${s.background ? ' (bg)' : ''}` : 'unknown account';
+      const name = s.name || s.sessionId.slice(0, 8);
+      const tail = `${C.muted}${padEnd(ago, 6)}${C.reset} ${padEnd(burn, 10)}${s.machine ? `${C.muted}on ${s.machine}${C.reset}` : ''}`;
+      // The account column gives way to the machine name, not the other way round.
+      const whoW = Math.max(12, Math.min(30, inner - 22 - 18 - (s.machine ? s.machine.length + 3 : 0)));
+      L.push(`  ${dot} ${padEnd(truncate(name, 20), 21)}${C.accent}${padEnd(truncate(who, whoW), whoW + 1)}${C.reset}${tail}`);
+    }
+    if (data.live.length > shown.length) L.push(`    ${C.muted}+${data.live.length - shown.length} more${C.reset}`);
+  }
+
+  /**
+   * Running sessions in detail: what each carries into a turn, its subagents
+   * at work, how often its cache lapsed this hour, and its jobs on the GPU or
+   * CPU pool - with room made for them first.
+   */
+  function runningDetail(L, inner, now) {
+    const wide = inner >= 96;
+    const AGENTS = 7, RECACHE = 13;
+    const extraW = wide ? 1 + AGENTS + RECACHE : 1;
+    // The account column gives way to the machine name, not the other way round.
+    const whoWidth = (machine) => Math.max(12, Math.min(30, inner - 22 - 14 - extraW - 18 - (machine ? machine.length + 3 : 0)));
+    if (data.live.some((x) => x.context)) {
+      const w = whoWidth(null);
+      L.push(`  ${C.muted}${' '.repeat(23)}${padEnd('', w + 1)}${padEnd('context', 14)}${wide ? `${padEnd('agents', AGENTS)}${padEnd('↻ last hour', RECACHE)}` : ''}${C.reset}`);
+    }
+    const shown = data.live.slice(0, 10);
+    for (const s of shown) {
+      const busy = s.status === 'busy';
+      const dot = busy ? `${C.warning}●${C.reset}` : `${C.muted}○${C.reset}`;
+      const ago = s.lastActivityAt ? duration(now - s.lastActivityAt) : '—';
+      const burn = s.recent.calls ? `${money(s.recent.cost)}/5m` : '';
+      const who = s.account ? `${s.account}${s.background ? ' (bg)' : ''}` : 'unknown account';
+      const name = s.name || s.sessionId.slice(0, 8);
+      const tail = `${C.muted}${padEnd(ago, 6)}${C.reset} ${padEnd(burn, 10)}${s.machine ? `${C.muted}on ${s.machine}${C.reset}` : ''}`;
+      // Context: the figure, and a bar up to where Claude Code compacts.
+      const c = s.context;
+      const ctx = c ? `${contextColor(c.tokens)}${padEnd(tokens(c.tokens), 5)}${C.reset}${meterBar((c.tokens / c.compactAt) * 100, 8, contextColor(c.tokens))}` : `${C.muted}${padEnd('—', 13)}${C.reset}`;
+      const agents = s.agents?.length ? `${C.muted}+${s.agents.length}${C.reset}` : '';
+      const re = s.recache?.turns ? `${s.recache.cost >= 10 ? C.serious : C.muted}↻${s.recache.turns} ${money(s.recache.cost)}${C.reset}` : '';
+      const extra = wide ? ` ${padEnd(agents, AGENTS)}${padEnd(re, RECACHE)}` : ' ';
+      const whoW = whoWidth(s.machine);
+      L.push(`  ${dot} ${padEnd(truncate(name, 20), 21)}${C.accent}${padEnd(truncate(who, whoW), whoW + 1)}${C.reset}${ctx}${extra}${tail}`);
+      if (s.agents?.length) L.push(truncate(`      ${C.muted}agents: ${agentList(s.agents)}${C.reset}`, inner + 2));
+      for (const l of s.leases ?? []) L.push(`      ${leaseLine(l, now)}`);
+    }
+    if (data.live.length > shown.length) L.push(`    ${C.muted}+${data.live.length - shown.length} more${C.reset}`);
   }
 
   /** Build the frame as an array of lines, each already fitted to `width`. */
@@ -356,6 +438,8 @@ export function startTui({ webUrl, onQuit }) {
     if (wraps) right = `${liveMark} ${C.muted}·${C.reset} ${stamp} ${C.muted}·${C.reset} ${C.accent}${linkedUrl}${C.reset}`;
     L.push(`  ${padEnd(left, Math.max(0, inner - vlen(right)))}${right}`);
     L.push(wraps ? `  ${synced}` : '');
+    const skew = skewLines(ov?.sync);
+    if (skew.length) L.push(...skew, '');
 
     if (!ov || !ov.accounts.length) {
       // Usage with no identifiable account is a real state, not an empty one -
@@ -416,43 +500,26 @@ export function startTui({ webUrl, onQuit }) {
 
     // ---- running now, each with the account it is billing *right now*
     const carried = data.live.reduce((a, x) => a + (x.context?.tokens ?? 0), 0);
-    rule(`RUNNING NOW · ${data.live.length} session${data.live.length === 1 ? '' : 's'}${carried ? ` · ${tokens(carried)} context a turn in all` : ''}`);
-    // What each session carries into a turn, its subagents at work, and how
-    // often its cache lapsed this hour - with room made for them first.
-    const wide = inner >= 96;
-    const AGENTS = 7, RECACHE = 13;
-    const extraW = wide ? 1 + AGENTS + RECACHE : 1;
-    // The account column gives way to the machine name, not the other way round.
-    const whoWidth = (machine) => Math.max(12, Math.min(30, inner - 22 - 14 - extraW - 18 - (machine ? machine.length + 3 : 0)));
-    if (data.live.some((x) => x.context)) {
-      const w = whoWidth(null);
-      L.push(`  ${C.muted}${' '.repeat(23)}${padEnd('', w + 1)}${padEnd('context', 14)}${wide ? `${padEnd('agents', AGENTS)}${padEnd('↻ last hour', RECACHE)}` : ''}${C.reset}`);
-    }
-    const shown = data.live.slice(0, 10);
-    for (const s of shown) {
-      const busy = s.status === 'busy';
-      const dot = busy ? `${C.warning}●${C.reset}` : `${C.muted}○${C.reset}`;
-      const ago = s.lastActivityAt ? duration(now - s.lastActivityAt) : '—';
-      const burn = s.recent.calls ? `${money(s.recent.cost)}/5m` : '';
-      const who = s.account ? `${s.account}${s.background ? ' (bg)' : ''}` : 'unknown account';
-      const name = s.name || s.sessionId.slice(0, 8);
-      const tail = `${C.muted}${padEnd(ago, 6)}${C.reset} ${padEnd(burn, 10)}${s.machine ? `${C.muted}on ${s.machine}${C.reset}` : ''}`;
-      // Context: the figure, and a bar up to where Claude Code compacts.
-      const c = s.context;
-      const ctx = c ? `${contextColor(c.tokens)}${padEnd(tokens(c.tokens), 5)}${C.reset}${meterBar((c.tokens / c.compactAt) * 100, 8, contextColor(c.tokens))}` : `${C.muted}${padEnd('—', 13)}${C.reset}`;
-      const agents = s.agents?.length ? `${C.muted}+${s.agents.length}${C.reset}` : '';
-      const re = s.recache?.turns ? `${s.recache.cost >= 10 ? C.serious : C.muted}↻${s.recache.turns} ${money(s.recache.cost)}${C.reset}` : '';
-      const extra = wide ? ` ${padEnd(agents, AGENTS)}${padEnd(re, RECACHE)}` : ' ';
-      const whoW = whoWidth(s.machine);
-      L.push(`  ${dot} ${padEnd(truncate(name, 20), 21)}${C.accent}${padEnd(truncate(who, whoW), whoW + 1)}${C.reset}${ctx}${extra}${tail}`);
-      for (const l of s.leases ?? []) L.push(`      ${leaseLine(l, now)}`);
-    }
-    if (data.live.length > shown.length) L.push(`    ${C.muted}+${data.live.length - shown.length} more${C.reset}`);
+    const waiting = (data.boxes ?? []).reduce((a, b) => a + (b.gpu?.jobsWaiting ?? 0) + (b.cpu?.jobsWaiting ?? 0), 0);
+    rule(`RUNNING NOW · ${data.live.length} session${data.live.length === 1 ? '' : 's'}` +
+      (state.detail ? (carried ? ` · ${tokens(carried)} context a turn in all` : '')
+        : (waiting ? ` · ${waiting} job${waiting === 1 ? '' : 's'} waiting for the GPU or CPU · d for detail` : '')));
+    if (state.detail) runningDetail(L, inner, now);
+    else runningCompact(L, inner, now);
     if (!data.live.length) L.push(`  ${C.muted}no Claude Code sessions running${C.reset}`);
     L.push('');
 
-    // ---- the shared GPU and CPU pool
-    for (const line of boxLines(data.boxes ?? [], inner, ruleLine, now)) L.push(line);
+    // ---- detail: the shared GPU and CPU pool, and re-written caches
+    if (state.detail) {
+      for (const line of boxLines(data.boxes ?? [], inner, ruleLine, now)) L.push(line);
+      const cache = cacheLines(data.cache, inner);
+      if (cache.length) {
+        rule('CACHE RE-WRITTEN AFTER A PAUSE');
+        L.push('');
+        for (const line of cache) L.push(line);
+        L.push('');
+      }
+    }
 
     // ---- accounts
     rule('ACCOUNTS');
@@ -568,15 +635,6 @@ export function startTui({ webUrl, onQuit }) {
     if (!data.models.length) L.push(`  ${C.muted}no usage in the last 7 days${C.reset}`);
     L.push('');
 
-    // ---- re-caching
-    const cache = cacheLines(data.cache, inner);
-    if (cache.length) {
-      rule('CACHE RE-WRITTEN AFTER A PAUSE');
-      L.push('');
-      for (const line of cache) L.push(line);
-      L.push('');
-    }
-
     if (ov.unattributed.events) {
       L.push(`  ${C.muted}${ov.unattributed.events.toLocaleString()} events (${money(ov.unattributed.cost)}) not tied to an account${C.reset}`);
       L.push('');
@@ -596,7 +654,7 @@ export function startTui({ webUrl, onQuit }) {
       ? `  ${C.critical}refresh failed:${C.reset} ${state.error} ${C.muted}· showing data from ${age}s ago · r to retry${C.reset}`
       : noted ? `  ${state.note}`
         : `  ${C.muted}q${C.reset} quit  ${C.muted}r${C.reset} refresh  ` +
-          `${C.muted}a${C.reset} account  ${C.muted}w${C.reset} window  ${C.muted}↑↓${C.reset} scroll` +
+          `${C.muted}d${C.reset} ${state.detail ? 'less' : 'detail'}  ${C.muted}a${C.reset} account  ${C.muted}w${C.reset} window  ${C.muted}↑↓${C.reset} scroll` +
           (url ? `  ${C.muted}o${C.reset} open web` : '') +
           `  ${C.muted}f${C.reset} failover  ${C.muted}t${C.reset} switch to  ${C.muted}+/-${C.reset} at  ${C.muted}s${C.reset} switch now  ${C.muted}e${C.reset} export` +
           (state.live ? '' : `  ${C.warning}paused${C.reset}`);
@@ -690,6 +748,14 @@ export function startTui({ webUrl, onQuit }) {
       case '[5~': state.scroll = Math.max(0, state.scroll - 10); render(); return;
       case '[6~': state.scroll += 10; render(); return;
       case 'g': state.scroll = 0; render(); return;
+      case 'd':
+        state.detail = !state.detail;
+        try { setMeta('tui_detail', state.detail ? '1' : '0'); } catch { /* remembered for this run only */ }
+        say(state.detail
+          ? `${C.good}detail${C.reset} - context per turn, agents, GPU and CPU pool, re-written caches ${C.muted}· d for less${C.reset}`
+          : `${C.muted}detail off · d for detail${C.reset}`);
+        state.scroll = 0;
+        refreshAndRender(true); return;
       case 'e':
         import('./export.js').then(({ exportAccounts }) => {
           try {

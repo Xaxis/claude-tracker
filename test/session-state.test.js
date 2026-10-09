@@ -222,3 +222,28 @@ test('re-written caches are counted for subagents and the main thread apart, and
   assert.equal(after.ttl.sub, '1h');
   assert.equal(after.hint, null);
 });
+
+test('another machine on an older tracker is named as such, and its sessions’ context is worked out from its synced calls', () => {
+  const root = scratch();
+  const r = inChild(root, `
+    const machine = (id, name, state) => db().prepare('INSERT INTO sync_machines (machine_id, name, last_seen, state, state_at) VALUES (?,?,?,?,?)')
+      .run(id, name, now, JSON.stringify(state), now);
+    const mine = api.build();
+    // A laptop from before session detail: its running session says nothing of
+    // its context, but its calls arrived here by sync.
+    machine('m1', 'laptop', { running: [{ sessionId: 'lap-1', transcriptId: 'lap-1', name: 'notes', lastActivityAt: now }], profiles: [] });
+    call('lap-1', now - MIN, { input: 2, w1: 1_000, read: 700_000 });
+    call('lap-1', now - 20 * MIN, { side: 1, input: 2, w5: 400_000, read: 1_000 });
+    machine('m2', 'same', { running: [], profiles: [], build: mine });
+    machine('m3', 'ahead', { running: [], profiles: [], build: { id: 'f00f00f', at: mine.at + 86400e3 } });
+    machine('m4', 'behind', { running: [], profiles: [], build: { id: 'b00b00b', at: mine.at - 86400e3 } });
+    const lap = api.liveSessions().find((s) => s.sessionId === 'lap-1');
+    return { mine, versions: Object.fromEntries(api.overview().sync.machines.map((m) => [m.name, m.version])),
+      context: lap.context?.tokens, recache: lap.recache?.turns, sent: api.localState().build };
+  `);
+  assert.match(r.mine.id, /^[0-9a-f]{7,}$/, 'this tracker knows its own commit');
+  assert.deepEqual(r.sent, r.mine, 'and tells the machines it syncs with');
+  assert.deepEqual(r.versions, { laptop: 'older', same: null, ahead: 'newer', behind: 'older' });
+  assert.equal(r.context, 701_002);
+  assert.equal(r.recache, 1);
+});

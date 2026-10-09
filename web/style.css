@@ -357,3 +357,10 @@ td { font-variant-numeric: tabular-nums; }
 }
 .callout code { font: 12px ui-monospace, SFMono-Regular, Menlo, monospace; }
 .box-group .empty { margin: 0; padding: 0; }
+
+/* --- detail off: the compact dashboard ------------------------------------ */
+body:not(.detail) #live-sessions .ctx-bar,
+body:not(.detail) #live-sessions .row-note,
+body:not(.detail) #box,
+body:not(.detail) #cache { display: none !important; }
+#skew { margin: 0; }

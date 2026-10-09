@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { exec } from 'node:child_process';
-import { overview, history, sessions, modelBreakdown, liveSessions, windowHistory, localState, boxes } from './api.js';
+import { overview, history, sessions, modelBreakdown, liveSessions, windowHistory, localState, boxes, build } from './api.js';
 import { cacheSummary } from './context.js';
 import { verifyWindowModel } from './calibrate.js';
 import { startWatcher } from './watcher.js';
@@ -133,6 +133,9 @@ export async function serve({ port = 4785, open = false, refresh, fastRefresh, a
   // through this queue, one at a time.
   let chain = Promise.resolve();
   const serial = (fn) => (chain = chain.then(fn, fn));
+
+  // Pin which code this is now, before anything can be pulled over it.
+  build();
 
   // Bring the database current before accepting requests.
   await serial(() => refresh({ quiet: true, reattribute: 'all' }));
