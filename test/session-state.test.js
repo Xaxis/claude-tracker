@@ -247,3 +247,26 @@ test('another machine on an older tracker is named as such, and its sessions’ 
   assert.equal(r.context, 701_002);
   assert.equal(r.recache, 1);
 });
+
+test('the CPU and GPU pools report the settings they publish, not copied defaults', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'tracker-pools-'));
+  const heavy = path.join(root, 'box-heavy'), gpu = path.join(root, 'box-gpu');
+  fs.mkdirSync(heavy); fs.mkdirSync(gpu);
+  fs.writeFileSync(path.join(heavy, 'config.json'), JSON.stringify({ slots: 24, per_project: 8, load: 30, cores: 24 }));
+  fs.writeFileSync(path.join(gpu, 'config.json'), JSON.stringify({ slots: 1, configured_slots: 2 }));
+  const saved = { h: process.env.BOX_HEAVY_DIR, g: process.env.BOX_GPU_DIR, s: process.env.BOX_GPU_STATE };
+  Object.assign(process.env, { BOX_HEAVY_DIR: heavy, BOX_GPU_DIR: gpu, BOX_GPU_STATE: path.join(root, 'state') });
+  try {
+    const { boxState } = await import('../src/box.js');
+    const box = boxState(Date.now() + 86_400_000);  // a time no earlier read was memoised at
+    assert.equal(box.cpu.slots, 24);
+    assert.equal(box.cpu.gate, 30, 'the gate heavy uses, not the core count');
+    assert.equal(box.gpu.slots, 1, 'one slot while gpu backs off after a reset');
+    assert.ok(Number.isFinite(box.cpu.load));
+  } finally {
+    for (const [k, v] of [['BOX_HEAVY_DIR', saved.h], ['BOX_GPU_DIR', saved.g], ['BOX_GPU_STATE', saved.s]]) {
+      if (v === undefined) delete process.env[k]; else process.env[k] = v;
+    }
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});

@@ -223,7 +223,7 @@ function boxLines(list, inner, rule, now) {
       if (!s || (!s.held.length && !s.waiting.length && kind === 'CPU')) continue;
       const head = kind === 'GPU'
         ? `GPU${on} · ${s.held.length ? `${s.held.length} held` : 'free'}${s.jobsWaiting ? ` · ${s.jobsWaiting} waiting` : ''}`
-        : `CPU POOL${on} · ${s.held.length} of ${s.slots} slots${s.jobsWaiting ? ` · ${s.jobsWaiting} waiting` : ''} · load ${Math.round(s.load)} on ${s.cores} cores`;
+        : `CPU POOL${on} · ${s.held.length} of ${s.slots} slots${s.jobsWaiting ? ` · ${s.jobsWaiting} waiting` : ''} · ${Math.round(s.load)} threads want a CPU (gate ${Math.round(s.gate)}, ${s.cores} cores)`;
       L.push(rule(head));
       if (kind === 'GPU' && s.quarantined) L.push(`  ${C.critical}quarantined after a GPU fault${C.reset} ${C.muted}- gpu --enable once it is healthy${C.reset}`);
       const nameW = 20, placeW = 15;
@@ -238,8 +238,8 @@ function boxLines(list, inner, rule, now) {
           `${waitColor(ms)}${padEnd(duration(ms), 8)}${C.reset}${C.muted}${w.jobs > 1 ? `${w.jobs} jobs · ` : ''}${pos}${C.reset}`);
       }
       if (!s.held.length && !s.waiting.length) L.push(`  ${C.muted}nothing on the GPU${C.reset}`);
-      if (kind === 'CPU' && s.waiting.length && s.held.length < s.slots && s.load >= s.cores) {
-        L.push(`    ${C.muted}${s.slots - s.held.length === 1 ? 'a slot is' : 'slots are'} free, but jobs wait until the load drops under ${s.cores}${C.reset}`);
+      if (kind === 'CPU' && s.waiting.length && s.held.length < s.slots && s.load >= s.gate) {
+        L.push(`    ${C.muted}${s.slots - s.held.length === 1 ? 'a slot is' : 'slots are'} free, but jobs wait until fewer than ${Math.round(s.gate)} threads want a CPU${C.reset}`);
       }
       const h = kind === 'GPU' ? s.hour : null;
       if (h?.jobs) {

@@ -239,15 +239,15 @@ function cmdSessions() {
       if (!x || (kind === 'cpu' && !x.held.length && !x.waiting.length)) continue;
       const head = kind === 'gpu'
         ? `GPU${on}${c.reset} ${c.dim}· ${x.held.length ? 'held' : 'free'}${x.jobsWaiting ? ` · ${x.jobsWaiting} waiting` : ''}`
-        : `CPU pool${on}${c.reset} ${c.dim}· ${x.held.length} of ${x.slots} slots${x.jobsWaiting ? ` · ${x.jobsWaiting} waiting` : ''} · load ${Math.round(x.load)} on ${x.cores} cores`;
+        : `CPU pool${on}${c.reset} ${c.dim}· ${x.held.length} of ${x.slots} slots${x.jobsWaiting ? ` · ${x.jobsWaiting} waiting` : ''} · ${Math.round(x.load)} threads want a CPU (gate ${Math.round(x.gate)}, ${x.cores} cores)`;
       console.log(`\n${c.bold}${head}${c.reset}`);
       for (const h of x.held) console.log(`  ${c.blue}■${c.reset} ${pad(h.session ?? h.project ?? '?', 22)} ${c.dim}${pad(cut(h.place ?? '', 16), 16)}${c.reset} ${pad(duration(now - h.since), 8)} ${c.dim}${(h.cmd ?? '').slice(0, 70)}${c.reset}`);
       for (const w of x.waiting) {
         const pos = w.ahead === 0 ? 'next in line' : `${w.ahead} ahead`;
         console.log(`  ${waitColor(now - w.since)}▸${c.reset} ${pad(w.session ?? w.project ?? '?', 22)} ${c.dim}${pad(cut(w.place ?? '', 16), 16)}${c.reset} ${waitColor(now - w.since)}${pad(duration(now - w.since), 8)}${c.reset} ${c.dim}${w.jobs > 1 ? `${w.jobs} jobs · ` : ''}${pos}${c.reset}`);
       }
-      if (kind === 'cpu' && x.waiting.length && x.held.length < x.slots && x.load >= x.cores) {
-        console.log(`  ${c.dim}${x.slots - x.held.length === 1 ? 'a slot is' : 'slots are'} free, but jobs wait until the load drops under ${x.cores}${c.reset}`);
+      if (kind === 'cpu' && x.waiting.length && x.held.length < x.slots && x.load >= x.gate) {
+        console.log(`  ${c.dim}${x.slots - x.held.length === 1 ? 'a slot is' : 'slots are'} free, but jobs wait until fewer than ${Math.round(x.gate)} threads want a CPU${c.reset}`);
       }
       const h = kind === 'gpu' ? x.hour : null;
       if (h?.jobs) {

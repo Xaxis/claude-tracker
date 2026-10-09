@@ -744,7 +744,7 @@ function renderBox(list) {
       const on = many ? ` on ${b.machine ?? 'this machine'}` : '';
       group.append(el('h3', null, kind === 'gpu'
         ? `GPU${on} · ${s.held.length ? 'held' : 'free'}${s.jobsWaiting ? ` · ${s.jobsWaiting} waiting` : ''}`
-        : `CPU pool${on} · ${s.held.length} of ${s.slots} slots${s.jobsWaiting ? ` · ${s.jobsWaiting} waiting` : ''} · load ${Math.round(s.load)} on ${s.cores} cores`));
+        : `CPU pool${on} · ${s.held.length} of ${s.slots} slots${s.jobsWaiting ? ` · ${s.jobsWaiting} waiting` : ''} · ${Math.round(s.load)} threads want a CPU (gate ${Math.round(s.gate)}, ${s.cores} cores)`));
       const rows = el('div', 'session-list');
       for (const h of s.held) rows.append(boxRow(el('span', 'mark is-held', '■'), h, h.cmd, 'holding'));
       for (const w of s.waiting) {
@@ -755,8 +755,8 @@ function renderBox(list) {
       if (!s.held.length && !s.waiting.length) rows.append(el('p', 'empty', 'Nothing on the GPU.'));
       group.append(rows);
       if (kind === 'gpu' && s.quarantined) group.append(el('p', 'panel-note', 'Quarantined after a GPU fault: gpu --enable once it is healthy.'));
-      if (kind === 'cpu' && s.waiting.length && s.held.length < s.slots && s.load >= s.cores) {
-        group.append(el('p', 'panel-note', `${s.slots - s.held.length === 1 ? 'A slot is' : 'Slots are'} free, but jobs wait until the load drops under ${s.cores}.`));
+      if (kind === 'cpu' && s.waiting.length && s.held.length < s.slots && s.load >= s.gate) {
+        group.append(el('p', 'panel-note', `${s.slots - s.held.length === 1 ? 'A slot is' : 'Slots are'} free, but jobs wait until fewer than ${Math.round(s.gate)} threads want a CPU.`));
       }
       const h = kind === 'gpu' ? s.hour : null;
       if (h?.jobs) {

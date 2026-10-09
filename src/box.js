@@ -149,6 +149,21 @@ export function boxState(now = Date.now()) {
   return value;
 }
 
+/** A pool's live settings, which heavy and gpu publish as config.json on every run, or {}. */
+function config(dir) {
+  try { return JSON.parse(fs.readFileSync(path.join(dir, 'config.json'), 'utf8')) ?? {}; } catch { return {}; }
+}
+
+/** Threads that want a CPU right now, the number heavy gates on (/proc/loadavg's runnable
+ *  count); the 1-minute load where there is no /proc. */
+function cpuDemand() {
+  try {
+    const n = Number(fs.readFileSync('/proc/loadavg', 'utf8').split(' ')[3].split('/')[0]);
+    if (Number.isFinite(n)) return n;
+  } catch {}
+  return os.loadavg()[0];
+}
+
 function readBox(now) {
   const gpuDir = GPU_DIR(), heavyDir = HEAVY_DIR();
   const hasGpu = list(gpuDir) != null, hasHeavy = list(heavyDir) != null;
@@ -159,17 +174,19 @@ function readBox(now) {
       held: slotNames(gpuDir).map((n) => holder(gpuDir, n, now)).filter(Boolean),
       waiting: queue(gpuDir, now),
       quarantined: fs.existsSync(path.join(GPU_STATE(), 'quarantine.json')),
+      slots: config(gpuDir).slots ?? 2,
       hour: gpuHour(now),
     };
   }
   if (hasHeavy) {
-    const cores = os.cpus().length || 4;
+    const cores = os.cpus().length || 4, cfg = config(heavyDir);
     out.cpu = {
       held: slotNames(heavyDir).map((n) => holder(heavyDir, n, now)).filter(Boolean),
       waiting: queue(heavyDir, now),
-      // heavy's own defaults; a pool configured otherwise sets these in its environment.
-      slots: Number(process.env.BOX_HEAVY_SLOTS) || Math.max(2, Math.floor(cores / 6)),
-      load: os.loadavg()[0], cores,
+      // heavy publishes what it runs with; before its first run, its defaults.
+      slots: cfg.slots ?? (Number(process.env.BOX_HEAVY_SLOTS) || cores),
+      gate: cfg.load ?? cores * 1.25,
+      load: cpuDemand(), cores,
     };
   }
   return out;
@@ -218,7 +235,7 @@ export function boxView(box, nameOf = () => null, placeName = (_id, place) => pl
   const gpu = view(box.gpu);
   const cpu = view(box.cpu);
   if (gpu) Object.assign(gpu, { quarantined: box.gpu.quarantined, hour: box.gpu.hour });
-  if (cpu) Object.assign(cpu, { slots: box.cpu.slots, load: box.cpu.load, cores: box.cpu.cores });
+  if (cpu) Object.assign(cpu, { slots: box.cpu.slots, gate: box.cpu.gate, load: box.cpu.load, cores: box.cpu.cores });
   return { gpu, cpu };
 }
 
