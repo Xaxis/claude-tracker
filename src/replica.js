@@ -381,6 +381,56 @@ export function welcome({ id, name, epoch, ends }) {
 const clean = (v, max = 300) => (typeof v === 'string' ? v.replace(/[\u0000-\u001f\u007f-\u009f]/g, '').slice(0, max) : null);
 const num = (v) => (typeof v === 'number' && Number.isFinite(v) ? v : null);
 
+const arr = (v) => (Array.isArray(v) ? v : []);
+const obj = (v) => (v && typeof v === 'object' && !Array.isArray(v) ? v : null);
+const oneOf = (v, allowed) => (allowed.includes(v) ? v : null);
+
+/**
+ * A running session's detail, as context.js and box.js shape it. A field the
+ * sender left out stays out: a tracker from before session detail sends none,
+ * and this one then works it out from the synced calls instead.
+ */
+function detailOf(s) {
+  const out = { transcriptId: clean(s?.transcriptId, 64), parkedJobId: clean(s?.parkedJobId, 64) };
+  if (s?.context === null) out.context = null;
+  else if (obj(s?.context) && num(s.context.tokens) != null) {
+    const c = s.context;
+    out.context = { tokens: num(c.tokens), at: num(c.at), model: clean(c.model, 64), compactAt: num(c.compactAt), perTurn: num(c.perTurn) };
+  }
+  if (Array.isArray(s?.agents)) out.agents = s.agents.slice(0, 50).map((a) => ({ name: clean(a?.name, 100), at: num(a?.at) })).filter((a) => a.name);
+  if (obj(s?.recache)) out.recache = { turns: num(s.recache.turns) ?? 0, cost: num(s.recache.cost) ?? 0 };
+  if (Array.isArray(s?.leases)) {
+    out.leases = s.leases.slice(0, 20).map((l) => ({
+      kind: oneOf(l?.kind, ['gpu', 'cpu']), state: oneOf(l?.state, ['holds', 'waits']), since: num(l?.since),
+      place: clean(l?.place), jobs: num(l?.jobs) ?? 1, ahead: num(l?.ahead) ?? 0,
+      behind: arr(l?.behind).slice(0, 4).map((b) => ({ who: clean(b?.who), project: clean(b?.project), since: num(b?.since) })),
+    })).filter((l) => l.kind && l.state && l.since != null);
+  }
+  return out;
+}
+
+/** A machine's GPU lease and CPU pool, as box.js's boxView shapes them. */
+function boxOf(b) {
+  if (!obj(b)) return null;
+  const job = (j) => ({ project: clean(j?.project), session: clean(j?.session), sessionId: clean(j?.sessionId, 64),
+    place: clean(j?.place), since: num(j?.since) });
+  const side = (s, more) => (obj(s) ? {
+    held: arr(s.held).slice(0, 50).map((h) => ({ ...job(h), cmd: clean(h?.cmd, 200) })).filter((h) => h.since != null),
+    waiting: arr(s.waiting).slice(0, 100).map((w) => ({ ...job(w), jobs: num(w?.jobs) ?? 1, ahead: num(w?.ahead) ?? 0 }))
+      .filter((w) => w.since != null),
+    jobsWaiting: num(s.jobsWaiting) ?? 0,
+    ...more(s),
+  } : null);
+  const longest = (x) => (obj(x) ? { ms: num(x.ms) ?? 0, project: clean(x.project) } : null);
+  const gpu = side(b.gpu, (s) => ({
+    quarantined: !!s.quarantined,
+    hour: obj(s.hour) ? { jobs: num(s.hour.jobs) ?? 0, waitedMs: num(s.hour.waitedMs) ?? 0,
+      longestWait: longest(s.hour.longestWait), longestHold: longest(s.hour.longestHold), refused: num(s.hour.refused) ?? 0 } : null,
+  }));
+  const cpu = side(b.cpu, (s) => ({ slots: num(s.slots), gate: num(s.gate), load: num(s.load), cores: num(s.cores) }));
+  return gpu || cpu ? { gpu, cpu } : null;
+}
+
 /** What a machine says is running there and who is signed in, kept to known fields. */
 export function saveState(id, state) {
   const running = (Array.isArray(state?.running) ? state.running : []).slice(0, 200).map((s) => ({
@@ -388,6 +438,7 @@ export function saveState(id, state) {
     background: !!s?.background, lastActivityAt: num(s?.lastActivityAt), profile: clean(s?.profile),
     accountUuid: clean(s?.accountUuid, 64), account: clean(s?.account),
     recent: { calls: num(s?.recent?.calls) ?? 0, cost: num(s?.recent?.cost) ?? 0 },
+    ...detailOf(s),
   })).filter((s) => s.sessionId);
   const profiles = (Array.isArray(state?.profiles) ? state.profiles : []).slice(0, 50).map((p) => ({
     name: clean(p?.name), dir: clean(p?.dir, 1000), isDefault: !!p?.isDefault,
@@ -409,9 +460,16 @@ export function saveState(id, state) {
       ts: num(m?.ts), profile: clean(m?.profile), from: clean(m?.from), to: clean(m?.to), status: clean(m?.status, 10),
     })),
   } : null;
+  // Which tracker it runs. One that sends no build predates builds; one that
+  // sends null runs outside a git checkout, and cannot be compared.
+  const kept = { running, profiles, failover, box: boxOf(state?.box) };
+  if (state && 'build' in state) {
+    const b = obj(state.build);
+    kept.build = b && clean(b.id, 40) && num(b.at) ? { id: clean(b.id, 40), at: num(b.at) } : { id: null, at: null };
+  }
   const now = Date.now();
   stmt('UPDATE sync_machines SET state = ?, state_at = ?, last_seen = ? WHERE machine_id = ?')
-    .run(JSON.stringify({ running, profiles, failover }), now, now, id);
+    .run(JSON.stringify(kept), now, now, id);
 }
 
 export function heardFrom(id) {

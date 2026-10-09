@@ -486,7 +486,7 @@ export function versionOf(peer) {
   const mine = build();
   if (peer === undefined || !mine) return null;
   if (!peer) return 'older';
-  if (peer.id === mine.id) return null;
+  if (!peer.id || !peer.at || peer.id === mine.id) return null;
   return peer.at < mine.at ? 'older' : peer.at > mine.at ? 'newer' : null;
 }
 

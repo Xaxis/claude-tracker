@@ -51,12 +51,21 @@ function machine(name, port, account) {
     pid: process.pid, sessionId: session, cwd: `/work/${name}`, name: `${name}-task`, status: 'busy',
     startedAt: start, updatedAt: Date.now(),
   }));
-  const env = { ...process.env, HOME: home, CLAUDE_TRACKER_DIR: data, CLAUDE_TRACKER_NOTIFY: '0', CLAUDE_TRACKER_SSH: process.env.CT_TEST_SSH || fakeSsh, NO_COLOR: '1' };
+  const env = { ...process.env, HOME: home, CLAUDE_TRACKER_DIR: data, CLAUDE_TRACKER_NOTIFY: '0', CLAUDE_TRACKER_SSH: process.env.CT_TEST_SSH || fakeSsh, NO_COLOR: '1',
+    // Each its own GPU lease and CPU pool, none of them the machine's real ones.
+    BOX_GPU_DIR: path.join(home, 'box-gpu'), BOX_HEAVY_DIR: path.join(home, 'box-heavy'), BOX_GPU_STATE: path.join(home, 'gpu-state') };
   delete env.CLAUDE_CONFIG_DIR;
   delete env.CLAUDE_TRACKER_EXTRA_DIRS;
   const cli = (...args) => spawnSync(process.execPath, [CLI, ...args], { env, encoding: 'utf8', timeout: 60_000 });
   return {
     name, port, home, data, env, account, session, cli,
+    /** A job of `project` waiting for this machine's GPU - this test process, so it is alive. */
+    queueForGpu(project) {
+      const q = path.join(env.BOX_GPU_DIR, 'queue');
+      fs.mkdirSync(q, { recursive: true });
+      const start = fs.readFileSync(`/proc/${process.pid}/stat`, 'utf8').split(')').pop().trim().split(/\s+/)[19];
+      fs.writeFileSync(path.join(q, `${(Date.now() - MIN) * 1e6}-${process.pid}-${start}`), project);
+    },
     append: (i) => fs.appendFileSync(transcript, `${line(i, Date.now())}\n`),
     relay: `CLAUDE_TRACKER_DIR='${data}' '${process.execPath}' '${CLI}' sync serve`,
     start() {
@@ -100,6 +109,7 @@ test.after(async () => {
 });
 
 test('two trackers sync both ways over one connection, live, without echoes piling up', { timeout: 120_000 }, async () => {
+  if (fs.existsSync('/proc/self/stat')) devbox.queueForGpu('render');
   for (const m of [laptop, devbox]) {
     assert.equal(m.cli('sync', 'name', m.name).status, 0);
     m.start();
@@ -119,7 +129,8 @@ test('two trackers sync both ways over one connection, live, without echoes pili
       return o.accounts.find((a) => a.accountUuid === there.account.uuid && a.totalEvents === 5) ? o : null;
     });
     assert.equal(ov.unattributed.events, 0);
-    assert.deepEqual(ov.sync.machines.map((m) => [m.name, m.online]), [[there.name, true]]);
+    // Both run this same code, so neither calls the other older.
+    assert.deepEqual(ov.sync.machines.map((m) => [m.name, m.online, m.version]), [[there.name, true, null]]);
   }
 
   // Running sessions from both machines, the other's marked with its name.
@@ -129,6 +140,21 @@ test('two trackers sync both ways over one connection, live, without echoes pili
   });
   assert.deepEqual(live.map((s) => [s.name, s.machine, s.account]).sort(),
     [['devbox-task', 'devbox', 'devbox@example.com'], ['laptop-task', null, 'laptop@example.com']]);
+
+  // The devbox session's detail arrives as the devbox worked it out - its
+  // context a turn, and its subagents and jobs, none here - not left behind at
+  // the edge.
+  const remote = live.find((s) => s.machine === 'devbox');
+  assert.equal(remote.context?.tokens, 21_000);
+  assert.deepEqual([remote.agents, remote.leases, remote.recache], [[], [], { turns: 0, cost: 0 }]);
+  // ...and so does the devbox's GPU queue.
+  if (fs.existsSync('/proc/self/stat')) {
+    const boxes = await until('the laptop to see the devbox GPU queue', async () => {
+      const b = await laptop.get('/api/box');
+      return b.some((x) => x.machine === 'devbox') ? b : null;
+    });
+    assert.deepEqual(boxes.map((b) => [b.machine, b.gpu?.jobsWaiting, b.gpu?.waiting[0]?.project]), [['devbox', 1, 'render']]);
+  }
 
   // Both indexes hold both accounts.
   const rec = (await devbox.get('/api/overview')).accounts.map((a) => a.accountUuid).sort();
