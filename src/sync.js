@@ -27,6 +27,7 @@ import {
  *   want   where to resume sending me each of your tables
  *   rows   a batch of one table, and how far into it that reaches
  *   state  what is running here, and who is signed into each profile
+ *   ctl    driving sessions from Slack: follow yours, here is what they say, type this (see server.js)
  *   ping   still here
  *   error  why I am hanging up
  */
@@ -45,8 +46,9 @@ const IDLE_MS = 60_000;
  * reason to refuse the machine, if there is one. `onRows(since)` hears that
  * rows arrived, and the earliest time they could change attribution from.
  * `localState()` says what is running here, for the other side's dashboards.
+ * `onControl(link, msg)` hears `ctl` messages; `link.send(msg)` sends one.
  */
-export function openLink({ input, output, serial, admit = () => null, onRows = () => {}, localState = null, probe = false }) {
+export function openLink({ input, output, serial, admit = () => null, onRows = () => {}, localState = null, onControl = () => {}, probe = false }) {
   const me = machine();
   const link = { peer: null, closed: false, error: null, heardAt: Date.now() };
   let wants = null;            // how far the peer has asked for, per table; advanced as rows go
@@ -84,6 +86,7 @@ export function openLink({ input, output, serial, admit = () => null, onRows = (
     close(message);
   };
   link.close = close;
+  link.send = (msg) => write(msg);
 
   async function onHello(msg) {
     if (link.peer) return;
@@ -126,6 +129,11 @@ export function openLink({ input, output, serial, admit = () => null, onRows = (
       }
       case 'state':
         if (link.peer) await serial(() => saveState(link.peer.id, msg));
+        return;
+      case 'ctl':
+        // Not awaited: typing into a session takes a second or two, and rows
+        // must not queue up behind it.
+        if (link.peer) Promise.resolve().then(() => onControl(link, msg)).catch(() => {});
         return;
       case 'error':
         link.error = String(msg.message ?? 'the other side hung up').slice(0, 500);
@@ -317,7 +325,7 @@ function advertised() {
  * Sync with every configured peer, and with any machine that connects here.
  * One connection per machine: a second is refused while the first is healthy.
  */
-export function startSync({ serial, onRows, localState, onChange = () => {} }) {
+export function startSync({ serial, onRows, localState, onControl, onLink = () => {}, onChange = () => {} }) {
   const byMachine = new Map();   // machine id -> link
   const dialing = new Map();     // ssh target -> { link, failures, retryAt, busy }
   let stopped = false;
@@ -331,9 +339,10 @@ export function startSync({ serial, onRows, localState, onChange = () => {} }) {
     byMachine.set(peer.id, link);
     link.done.then(() => { if (byMachine.get(peer.id) === link) byMachine.delete(peer.id); onChange(); });
     onChange();
+    onLink(link);
     return null;
   };
-  const opts = { serial, admit, onRows, localState };
+  const opts = { serial, admit, onRows, localState, onControl };
 
   async function keep(peer, d) {
     d.busy = true;
@@ -403,6 +412,8 @@ export function startSync({ serial, onRows, localState, onChange = () => {} }) {
     },
     /** Something changed here: send it now rather than at the next poll. */
     nudge() { for (const l of byMachine.values()) l.nudge(); },
+    /** The connections up now, one per machine. */
+    links: () => [...byMachine.values()].filter((l) => !l.closed),
     stop() {
       stopped = true;
       clearInterval(timer);

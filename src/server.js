@@ -11,9 +11,12 @@ import { listAccounts } from './accounts.js';
 import { notify } from './notify.js';
 import { PROTOCOL, advertise, startSync } from './sync.js';
 import { plan, runFailover } from './failover.js';
-import { send } from './notify.js';
+import { send, onSend } from './notify.js';
 import { setMeta } from './db.js';
 import { accountsCsv, exportFileName } from './export.js';
+import { startPanes } from './panes.js';
+import { startBridge, bridgeStatus, readConfig as slackConfig } from './bridge.js';
+import { machine } from './replica.js';
 
 const WEB_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'web');
 
@@ -69,7 +72,7 @@ function handleApi(req, res, url) {
   const days = Math.min(365, Math.max(1, Number(q.get('days') ?? 30)));
 
   switch (url.pathname) {
-    case '/api/health': return sendJson(res, { app: 'claude-tracker', pid: process.pid, sync: PROTOCOL });
+    case '/api/health': return sendJson(res, { app: 'claude-tracker', pid: process.pid, sync: PROTOCOL, slack: 1 });
     case '/api/overview': return sendJson(res, overview());
     case '/api/history': return sendJson(res, history(days, account));
     case '/api/sessions': return sendJson(res, sessions(Math.min(200, Number(q.get('limit') ?? 40)), account));
@@ -89,6 +92,7 @@ function handleApi(req, res, url) {
       return res.end(csv);
     }
     case '/api/verify': return sendJson(res, verifyWindowModel());
+    case '/api/slack': return sendJson(res, bridgeStatus() ?? { state: 'off' });
     case '/api/windows':
       if (!account) return sendJson(res, { error: 'account required' }, 400);
       return sendJson(res, windowHistory(account, q.get('type') ?? 'five_hour', Math.min(60, Number(q.get('count') ?? 14))));
@@ -247,6 +251,7 @@ export async function serve({ port = 4785, open = false, refresh, fastRefresh, a
   // Syncing with other machines belongs to whichever process serves the port -
   // the one `sync serve` finds. Rows that arrive are settled a second at a time.
   let advert = null;
+  let control = null, drive = null;
   if (web) {
     advert = advertise(port);
     let since = null, settling = null;
@@ -260,8 +265,17 @@ export async function serve({ port = 4785, open = false, refresh, fastRefresh, a
           .catch((err) => (ui ? ui.reportError(err.message) : console.error('sync failed:', err.message)));
       }, 1000);
     };
-    sync = startSync({ serial, onRows, localState });
+    sync = startSync({ serial, onRows, localState, onControl: (link, msg) => control?.(link, msg), onLink: (link) => drive?.linked(link) });
     server.on('upgrade', (req, socket, head) => sync.accept(req, socket, head, advert.token));
+  }
+
+  // Driving sessions from Slack, also this process's: the bridge, where Slack
+  // is set up here, and following the sessions running here - for that bridge,
+  // or for a synced machine's.
+  if (web) {
+    drive = startDriving({ sync: () => sync, log: (m) => (ui ? ui.reportError(m) : console.error(m)) });
+    control = drive.control;
+    onSend((title, message) => drive.bridge.notice(title, message));
   }
 
   // Failing over is this process's too: every 20s, work out where sessions here
@@ -308,6 +322,7 @@ export async function serve({ port = 4785, open = false, refresh, fastRefresh, a
     closing = true;
     clearInterval(fullTimer);
     clearInterval(failTimer);
+    drive?.stop();
     stopWatching();
     sync?.stop();
     advert?.withdraw();
@@ -329,4 +344,160 @@ export async function serve({ port = 4785, open = false, refresh, fastRefresh, a
   } else if (web) {
     console.log(`\n  claude-tracker  →  ${addr}\n  watching for new usage… (ctrl-c to stop)\n`);
   }
+}
+
+/**
+ * The bridge to Slack, and the sessions here it - or another machine's bridge
+ * - follows and types into. Each synced machine's tracker follows its own
+ * sessions and sends what they say over the sync connection; whichever
+ * machine has Slack set up does the talking to Slack for all of them.
+ */
+function startDriving({ sync, log }) {
+  let panes = null;
+  const watchers = new Set();    // links whose machine's bridge follows the sessions here
+  const hubs = new Set();        // links to machines with Slack set up themselves
+  const asked = new Map();       // request id -> { resolve, reject, timer }
+  let nextId = 1;
+
+  const bridge = startBridge({
+    here: machine().name,
+    log,
+    info: sessionInfo,
+    usage: usageText,
+    // A thread this machine does not know may be one of a machine that runs Slack itself.
+    forward: (type, payload) => {
+      for (const l of hubs) l.send({ t: 'ctl', k: 'event', type, payload });
+      return hubs.size > 0;
+    },
+  });
+
+  const tell = (msg) => { for (const l of watchers) l.send({ t: 'ctl', ...msg }); };
+  function want() {
+    const needed = bridge.active || watchers.size > 0;
+    if (needed && !panes) {
+      panes = startPanes({
+        onSessions: (list) => { bridge.sessions(null, list); tell({ k: 'sessions', list }); },
+        onItems: (id, items) => { bridge.items(null, id, items); tell({ k: 'items', id, items }); },
+      });
+      bridge.machine(null, machine().name, (op) => panes.act(op));
+    } else if (!needed && panes) {
+      panes.stop();
+      panes = null;
+      bridge.machineDown(null);
+    }
+  }
+
+  /** Ask a machine whose sessions come through here to do something to one. */
+  const remoteAct = (link) => (op) => new Promise((resolve, reject) => {
+    const id = nextId++;
+    const timer = setTimeout(() => { asked.delete(id); reject(new Error(`${link.peer.name} did not answer`)); }, 30_000);
+    asked.set(id, { resolve, reject, timer });
+    link.send({ t: 'ctl', k: 'do', id, op });
+  });
+
+  /** A machine just connected: if Slack runs here, ask it for its sessions. */
+  function linked(link) {
+    if (!bridge.active) return;
+    link.send({ t: 'ctl', k: 'watch' });
+    // A tracker from before this says nothing back.
+    const peer = link.peer;
+    link.heardCtl = false;
+    setTimeout(() => {
+      if (!link.heardCtl && !link.closed) { bridge.machine(peer.id, peer.name, remoteAct(link)); bridge.machineDown(peer.id, { old: true }); }
+    }, 15_000).unref?.();
+    link.done.then(() => bridge.machineDown(peer.id));
+  }
+
+  async function control(link, msg) {
+    link.heardCtl = true;
+    const peer = link.peer;
+    switch (msg.k) {
+      case 'watch':
+        // Both have Slack: each carries its own sessions, and passes on what is the other's.
+        if (bridge.active) { link.send({ t: 'ctl', k: 'hub' }); hubs.add(link); link.done.then(() => hubs.delete(link)); return; }
+        // `claude-tracker slack off` here says no machine drives the sessions here.
+        if (slackConfig()?.disabled) { link.send({ t: 'ctl', k: 'refused' }); return; }
+        watchers.add(link);
+        link.done.then(() => { watchers.delete(link); want(); });
+        want();
+        // Before its first look, the list comes with that look.
+        if (panes.sessions()) link.send({ t: 'ctl', k: 'sessions', list: panes.sessions() });
+        return;
+      case 'unwatch': watchers.delete(link); want(); return;
+      case 'hub': hubs.add(link); link.done.then(() => hubs.delete(link)); return;
+      case 'refused': bridge.machine(peer.id, peer.name, remoteAct(link)); bridge.machineDown(peer.id, { refused: true }); return;
+      case 'sessions':
+        bridge.machine(peer.id, peer.name, remoteAct(link));
+        bridge.sessions(peer.id, Array.isArray(msg.list) ? msg.list : []);
+        return;
+      case 'items': if (typeof msg.id === 'string' && Array.isArray(msg.items)) bridge.items(peer.id, msg.id, msg.items); return;
+      case 'event': bridge.foreign(msg.type, msg.payload); return;
+      case 'do': {
+        let reply;
+        try {
+          if (!panes) throw new Error('not following the sessions here');
+          reply = { ok: true, r: await panes.act(msg.op ?? {}) };
+        } catch (err) { reply = { ok: false, error: err.message }; }
+        link.send({ t: 'ctl', k: 'done', id: msg.id, ...reply });
+        return;
+      }
+      case 'done': {
+        const a = asked.get(msg.id);
+        if (!a) return;
+        asked.delete(msg.id);
+        clearTimeout(a.timer);
+        if (msg.ok) a.resolve(msg.r); else a.reject(new Error(msg.error ?? 'failed'));
+        return;
+      }
+      default:
+    }
+  }
+
+  // Slack set up, or taken down, from another process: follow along.
+  let was = false;
+  const timer = setInterval(() => {
+    want();
+    if (bridge.active === was) return;
+    was = bridge.active;
+    for (const l of sync()?.links() ?? []) {
+      if (was) linked(l); else l.send({ t: 'ctl', k: 'unwatch' });
+    }
+  }, 3000);
+  timer.unref?.();
+  want();
+  was = bridge.active;
+
+  return {
+    bridge, control, linked,
+    stop() { clearInterval(timer); panes?.stop(); bridge.stop(); },
+  };
+}
+
+/** What the tracker knows of a running session: its account and context. Read every few seconds at most. */
+let infoCache = { at: 0, by: new Map() };
+function sessionInfo(sessionId) {
+  if (Date.now() - infoCache.at > 5000) {
+    const by = new Map();
+    try { for (const s of liveSessions()) for (const id of [s.sessionId, s.transcriptId]) if (id) by.set(id, s); } catch { /* keep the old */ }
+    infoCache = { at: Date.now(), by };
+  }
+  return infoCache.by.get(sessionId) ?? null;
+}
+
+/** Every account, how full, and which to use: for `usage` in Slack. */
+function usageText() {
+  const ov = overview();
+  const pct = (l) => (l?.percent == null ? '–' : `${Math.round(l.percent)}%`);
+  const rows = ov.accounts
+    .map((a) => ({ a, five: a.limits.find((l) => l.type === 'five_hour'), week: a.limits.find((l) => l.type === 'seven_day') }))
+    .filter(({ a }) => a.sessions || a.isCurrent || (a.limits ?? []).some((l) => l.active))
+    .sort((x, y) => (y.five?.percent ?? 0) - (x.five?.percent ?? 0));
+  const out = rows.map(({ a, five, week }) => {
+    const ends = a.limits.filter((l) => l.blocked).map((l) => l.end).filter(Boolean);
+    const free = ends.length ? ` · out until ${new Date(Math.max(...ends)).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}` : '';
+    return `${a.isCurrent ? ':large_green_circle:' : ':white_circle:'} *${a.label}* · 5h ${pct(five)} · 7d ${pct(week)}${free}`;
+  });
+  const r = ov.recommendation;
+  if (r) out.push(`\n*Use now:* ${r.label} · ${Math.round(r.headroom)}% headroom${r.command ? ` · \`${r.command}\`` : ''}`);
+  return out.join('\n');
 }

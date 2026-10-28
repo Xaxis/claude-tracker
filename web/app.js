@@ -593,6 +593,14 @@ function syncNote(sync) {
     (failing.length && !sync.machines.some((m) => m.online) ? ` ${failing.join('; ')}` : '');
 }
 
+/** Sessions in Slack, in a few words - or nothing, when it is not set up. */
+function slackNote(slack) {
+  if (!slack) return '';
+  if (slack.state === 'off') return ' Slack: off.';
+  if (slack.pairCode) return ` Slack: waiting to be paired - post "pair ${slack.pairCode}" in a channel the app is in.`;
+  return ` Slack: ${slack.channel}, ${slack.state === 'connected' ? 'connected' : slack.state}${slack.paused ? ', paused' : ''}.`;
+}
+
 /** What each profile with sessions running switches to when its account runs low, on every machine. */
 function renderFailover(ov) {
   const f = ov.failover;
@@ -698,6 +706,8 @@ function renderSkew(ov) {
     : m.version === 'newer'
       ? `${m.name} runs a newer claude-tracker than this machine. Here: git pull in the claude-tracker checkout, then claude-tracker service install.`
       : null)).filter(Boolean);
+  // Slack stuck is said the same way: what is wrong, and the command that fixes it.
+  if (ov.slack?.error) notes.push(`Slack: ${ov.slack.error}`);
   $('#skew').hidden = !notes.length;
   $('#skew').textContent = notes.join(' ');
 }
@@ -903,7 +913,7 @@ async function loadFast() {
     renderBox(box);
     renderSkew(ov);
     syncAccountFilter(ov);
-    $('#foot-note').textContent = `Updated ${new Date().toLocaleTimeString()} · ${syncNote(ov.sync)}`;
+    $('#foot-note').textContent = `Updated ${new Date().toLocaleTimeString()} · ${syncNote(ov.sync)}${slackNote(ov.slack)}`;
   } finally {
     fastBusy = false;
     if (fastAgain) { fastAgain = false; loadFast().catch(() => {}); }

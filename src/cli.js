@@ -385,6 +385,182 @@ async function cmdService(action, flags) {
   }
 }
 
+/* --- Slack ------------------------------------------------------------------ */
+
+/** A line typed without being shown, for a token. */
+function askSecret(prompt) {
+  return new Promise((resolve) => {
+    process.stdout.write(prompt);
+    const stdin = process.stdin;
+    let buf = '';
+    const done = (v) => { stdin.setRawMode?.(false); stdin.pause(); stdin.off('data', onData); process.stdout.write('\n'); resolve(v); };
+    const onData = (d) => {
+      for (const ch of d.toString('utf8')) {
+        if (ch === '\r' || ch === '\n') return done(buf.trim());
+        if (ch === '\u0003') { process.stdout.write('\n'); process.exit(130); }
+        if (ch === '\u007f' || ch === '\b') buf = buf.slice(0, -1); else buf += ch;
+      }
+    };
+    stdin.setRawMode?.(true);
+    stdin.resume();
+    stdin.on('data', onData);
+  });
+}
+
+/**
+ * Bridging happens in the tracker that serves this machine's port. Make sure
+ * one runs that can, restarting the login service if it predates Slack.
+ */
+async function slackReady(port) {
+  let h = await localTracker(port);
+  if (h?.slack) return true;
+  if (h) {
+    const { serviceStatus, installService } = await import('./service.js');
+    let installed = false;
+    try { installed = serviceStatus().installed; } catch { /* no service manager here */ }
+    if (!installed) {
+      console.log(`${c.yellow}!${c.reset} The tracker running here predates Slack. Restart it, and it picks this up.`);
+      return false;
+    }
+    console.log(`${c.dim}restarting the login service, which predates Slack…${c.reset}`);
+    await installService({ port });
+    h = null;
+    for (let i = 0; i < 120 && !h?.slack; i++) { await sleep(1000); h = await localTracker(port); }
+    if (h?.slack) return true;
+  }
+  console.log(`${c.yellow}!${c.reset} Nothing is running here to talk to Slack. Start it with ${c.bold}claude-tracker service install${c.reset}, or leave claude-tracker open.`);
+  return false;
+}
+
+/** Wait for the code to be posted in Slack, saying what the bridge reports meanwhile. */
+async function awaitPairing(B, port) {
+  const cfg = B.readConfig();
+  console.log(`\n${c.bold}Last step, in Slack:${c.reset} make a channel for your sessions - a private one is best - add the app to it`);
+  console.log(`(${c.bold}/invite @${cfg.botName ?? 'Claude Sessions'}${c.reset}), and post this there:\n`);
+  console.log(`      ${c.bold}${c.green}pair ${cfg.pair.code}${c.reset}\n`);
+  console.log(`${c.dim}Or send it to the app in a DM, to have the threads there. The code works for 30 minutes.${c.reset}`);
+  if (!(await slackReady(port))) return;
+  let said = '';
+  const until = cfg.pair.until;
+  while (Date.now() < until) {
+    await sleep(1500);
+    const now = B.readConfig();
+    if (now?.owner && !now.pair) {
+      console.log(`${c.green}✓${c.reset} paired - your sessions get a thread each in ${c.bold}${now.channelName ?? 'that channel'}${c.reset}`);
+      return;
+    }
+    const st = B.bridgeStatus();
+    const line = st?.state === 'error' ? `${c.red}✗${c.reset} ${st.error}` : st?.state === 'connected' ? `${c.dim}connected to Slack, waiting for the code…${c.reset}` : '';
+    if (line && line !== said) { console.log(line); said = line; }
+  }
+  console.log(`The code expired. ${c.bold}claude-tracker slack pair${c.reset} makes a new one.`);
+}
+
+async function cmdSlack(action, flags) {
+  const B = await import('./bridge.js');
+  const S = await import('./slack.js');
+  const port = Number(flags.port ?? 4785);
+  const cfg = B.readConfig();
+
+  if (action === 'manifest') { console.log(JSON.stringify(S.manifest(), null, 2)); return; }
+
+  if (action === 'setup') {
+    let bot = flags['bot-token'] ?? process.env.SLACK_BOT_TOKEN;
+    let app = flags['app-token'] ?? process.env.SLACK_APP_TOKEN;
+    if (!bot || !app) {
+      if (!process.stdin.isTTY) { console.error('Pass --bot-token xoxb-… and --app-token xapp-…, or run this in a terminal.'); process.exitCode = 1; return; }
+      const { DATA_DIR } = await import('./paths.js');
+      const file = `${DATA_DIR}/slack-manifest.json`;
+      (await import('node:fs')).writeFileSync(file, `${JSON.stringify(S.manifest(), null, 2)}\n`);
+      console.log(`\n${c.bold}1.${c.reset} Create the Slack app from its manifest - open this, pick your workspace, and press Create:`);
+      console.log(`\n   ${S.createAppUrl()}\n`);
+      console.log(`   ${c.dim}(If that link does not fill it in: Create New App → From a manifest, and paste ${tildePath(file)})${c.reset}`);
+      console.log(`${c.bold}2.${c.reset} Install App → Install to Workspace → Allow. Copy the ${c.bold}Bot User OAuth Token${c.reset} (xoxb-…).`);
+      console.log(`${c.bold}3.${c.reset} Basic Information → App-Level Tokens → Generate Token and Scopes: any name, scope ${c.bold}connections:write${c.reset}. Copy it (xapp-…).\n`);
+      bot ||= await askSecret('Bot User OAuth Token (xoxb-…): ');
+      app ||= await askSecret('App-Level Token (xapp-…): ');
+    }
+    if (!/^xoxb-/.test(bot ?? '')) { console.error(`${c.red}✗${c.reset} The bot token starts with xoxb- (Install App page).`); process.exitCode = 1; return; }
+    if (!/^xapp-/.test(app ?? '')) { console.error(`${c.red}✗${c.reset} The app-level token starts with xapp- (Basic Information → App-Level Tokens).`); process.exitCode = 1; return; }
+    let who;
+    try { who = await S.call(bot, 'auth.test'); } catch (err) {
+      console.error(`${c.red}✗${c.reset} Slack refused the bot token: ${err.code ?? err.message}`); process.exitCode = 1; return;
+    }
+    try { await S.call(app, 'apps.connections.open'); } catch (err) {
+      const why = err.code === 'not_allowed_token_type' ? 'that is not an app-level token'
+        : err.code === 'invalid_auth' ? 'it is not valid' : err.code === 'missing_scope' ? 'it needs the connections:write scope' : err.code;
+      console.error(`${c.red}✗${c.reset} Slack refused the app-level token: ${why}.`);
+      if (err.code !== 'invalid_auth') console.error(`${c.dim}  Socket Mode must be on (Settings → Socket Mode); the manifest turns it on.${c.reset}`);
+      process.exitCode = 1; return;
+    }
+    let botName = null;
+    try { botName = (await S.call(bot, 'bots.info', { bot: who.bot_id })).bot?.name ?? null; } catch { /* only for the instructions */ }
+    // The same workspace keeps its channel and owner; a new one pairs again.
+    const keep = cfg?.team === who.team_id && cfg.owner && cfg.channel && !flags.pair;
+    B.writeConfig({
+      botToken: bot, appToken: app, team: who.team_id, teamName: who.team, url: who.url, botUser: who.user_id, botName,
+      owner: keep ? cfg.owner : null, channel: keep ? cfg.channel : null, channelName: keep ? cfg.channelName : null,
+      pair: keep ? null : { code: B.newPairCode(), until: Date.now() + 30 * 60_000 }, paused: false,
+    });
+    console.log(`${c.green}✓${c.reset} connected to ${c.bold}${who.team}${c.reset} as ${c.bold}${botName ?? who.user}${c.reset}`);
+    if (keep) {
+      if (await slackReady(port)) console.log(`${c.green}✓${c.reset} sessions carry on in ${c.bold}${cfg.channelName ?? 'the same channel'}${c.reset}`);
+      return;
+    }
+    await awaitPairing(B, port);
+    return;
+  }
+
+  // Off works without Slack set up here: it stops a synced machine's Slack driving the sessions here.
+  if (action === 'off' || action === 'on') {
+    B.writeConfig({ ...(cfg ?? {}), disabled: action === 'off' });
+    if (!cfg?.botToken) {
+      console.log(action === 'off'
+        ? `${c.green}✓${c.reset} No machine's Slack can drive the sessions here now. ${c.dim}claude-tracker slack on allows it again.${c.reset}`
+        : `${c.green}✓${c.reset} A synced machine with Slack set up can drive the sessions here.`);
+      return;
+    }
+    console.log(action === 'off'
+      ? `${c.green}✓${c.reset} Slack is off here - sessions are not shown or driven from it. ${c.dim}claude-tracker slack on starts it again.${c.reset}`
+      : `${c.green}✓${c.reset} Slack is on again.`);
+    return;
+  }
+  if (!cfg?.botToken) {
+    console.log(`Slack is not set up here. ${c.bold}claude-tracker slack setup${c.reset} walks through it - a few minutes, once.`);
+    if (cfg?.disabled) console.log(`${c.dim}Synced machines' Slack may not drive the sessions here (claude-tracker slack on allows it).${c.reset}`);
+    return;
+  }
+
+  if (action === 'pair') {
+    B.writeConfig({ ...cfg, pair: { code: B.newPairCode(), until: Date.now() + 30 * 60_000 } });
+    await awaitPairing(B, port);
+    return;
+  }
+  if (action === 'remove') {
+    (await import('node:fs')).rmSync(B.CONFIG_FILE, { force: true });
+    console.log(`${c.green}✓${c.reset} removed the tokens - the app is still in Slack; delete it there at api.slack.com/apps if you are done with it`);
+    return;
+  }
+
+  const st = B.bridgeStatus() ?? {};
+  const h = await localTracker(port);
+  const mark = cfg.disabled ? `${c.gray}○${c.reset}` : st.state === 'connected' ? `${c.green}●${c.reset}` : st.state === 'error' ? `${c.red}●${c.reset}` : `${c.yellow}●${c.reset}`;
+  console.log(`\n${mark} ${c.bold}Slack${c.reset}  ${cfg.teamName ?? cfg.team ?? ''} · ${cfg.disabled ? 'off' : st.state ?? 'not running'}${st.at ? ` ${c.dim}${ago(st.at)}${c.reset}` : ''}`);
+  if (st.state === 'error' && st.error && !cfg.disabled) console.log(`  ${c.red}${st.error}${c.reset}`);
+  if (!h) console.log(`  ${c.yellow}Nothing is running here to talk to Slack: claude-tracker service install${c.reset}`);
+  else if (!h.slack) console.log(`  ${c.yellow}The tracker running here predates Slack: claude-tracker service install${c.reset}`);
+  if (cfg.owner) {
+    console.log(`  channel  ${cfg.channelName ?? cfg.channel}${cfg.paused ? ` ${c.dim}(paused: only prompts that need you come through)${c.reset}` : ''}`);
+    console.log(`  owner    ${cfg.owner} ${c.dim}- the only one it listens to${c.reset}`);
+  }
+  if (cfg.pair) {
+    console.log(Date.now() < cfg.pair.until
+      ? `  ${c.yellow}waiting to be paired:${c.reset} post ${c.bold}pair ${cfg.pair.code}${c.reset} in a channel the app is in`
+      : `  ${c.yellow}not paired - the code expired:${c.reset} claude-tracker slack pair`);
+  }
+  console.log();
+}
+
 /* --- failing over ---------------------------------------------------------- */
 
 const pct = (n) => `${Math.round(n)}%`;
@@ -665,13 +841,15 @@ ${c.bold}claude-tracker${c.reset} — local usage and rate-limit tracking for Cl
         ${c.dim}switch [--to <email>]${c.reset}     switch now
         ${c.dim}prefer <email>|auto${c.reset}       which account it switches to
   ${c.bold}pool${c.reset} [list]|add <email>        spare sign-ins on this machine, to switch to
+  ${c.bold}slack${c.reset} setup                   drive every session from Slack: a thread each
+  ${c.bold}slack${c.reset} [status]|pair|on|off|remove|manifest
 
 ${c.dim}In the terminal dashboard: q quit · r refresh · d detail on/off (context per turn,
 agents, GPU and CPU pool, re-written caches) · a cycle account · w switch window ·
 space pause · ↑↓/jk scroll · f failover on/off · t account to switch to ·
 +/- threshold · s switch now (press twice) · e export accounts${c.reset}
 
-${c.dim}Data is read from your local Claude transcripts. Nothing leaves this machine except\nto machines you sync with, over ssh.${c.reset}
+${c.dim}Data is read from your local Claude transcripts. Nothing leaves this machine except\nto machines you sync with, over ssh - and to Slack, if you set it up.${c.reset}
 `);
 }
 
@@ -719,6 +897,7 @@ export async function runCli(argv) {
       case 'sync': await cmdSync(rest[1] ?? 'status', rest.slice(2), flags); break;
       case 'failover': await refresh({ quiet: true }); await cmdFailover(rest[1] ?? 'status', rest.slice(2), flags); break;
       case 'pool': await cmdPool(rest[1] ?? 'list', rest.slice(2), flags); break;
+      case 'slack': await cmdSlack(rest[1] ?? 'status', flags); break;
       case 'models': await refresh({ quiet: true }); cmdModels(Number(flags.days ?? 30)); break;
       case 'sessions': await refresh({ quiet: true }); cmdSessions(); break;
       case 'verify': await refresh({ quiet: true }); cmdVerify(); break;

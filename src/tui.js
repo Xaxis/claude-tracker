@@ -295,6 +295,20 @@ function skewLines(sync) {
   return L;
 }
 
+/** Slack stuck, and the command that fixes it. */
+function slackLines(slack) {
+  if (!slack?.error) return [];
+  return [`  ${C.warning}!${C.reset} Slack: ${slack.error}`];
+}
+
+/** Slack in the header: green while connected, red when stuck, grey when off. */
+function slackMark(slack) {
+  if (!slack) return '';
+  if (slack.pairCode) return `${C.warning}#${C.reset} ${C.muted}pair ${slack.pairCode}${C.reset}`;
+  const color = slack.state === 'connected' ? C.good : slack.state === 'error' ? C.critical : C.muted;
+  return `${color}#${C.reset} ${C.muted}${slack.state === 'off' ? 'slack off' : slack.channel ?? 'slack'}${slack.paused ? ' paused' : ''}${C.reset}`;
+}
+
 /** The machines this one syncs with, for the header: bright while they report, dim once they stop. */
 function syncMark(sync, now) {
   if (!sync) return '';
@@ -431,14 +445,14 @@ export function startTui({ webUrl, onQuit }) {
     // When the numbers below were read - proof at a glance that they are moving.
     const stamp = `${C.muted}updated ${new Date(state.lastRefresh).toTimeString().slice(0, 8)}${C.reset}`;
     const left = `${A.bold}Claude Tracker${A.reset}`;
-    const synced = syncMark(ov?.sync, now);
+    const synced = [syncMark(ov?.sync, now), slackMark(ov?.slack)].filter(Boolean).join(' ');
     let right = `${liveMark} ${C.muted}·${C.reset} ${stamp}${synced ? ` ${C.muted}·${C.reset} ${synced}` : ''} ${C.muted}·${C.reset} ${C.accent}${linkedUrl}${C.reset}`;
     // Too narrow for everything on one line: the machines go on the next.
     const wraps = synced && vlen(left) + 2 + vlen(right) > inner;
     if (wraps) right = `${liveMark} ${C.muted}·${C.reset} ${stamp} ${C.muted}·${C.reset} ${C.accent}${linkedUrl}${C.reset}`;
     L.push(`  ${padEnd(left, Math.max(0, inner - vlen(right)))}${right}`);
     L.push(wraps ? `  ${synced}` : '');
-    const skew = skewLines(ov?.sync);
+    const skew = [...skewLines(ov?.sync), ...slackLines(ov?.slack)];
     if (skew.length) L.push(...skew, '');
 
     if (!ov || !ov.accounts.length) {

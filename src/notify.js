@@ -22,7 +22,12 @@ function claim(key) {
   catch { return false; }
 }
 
+// Elsewhere an alert should also reach - Slack, when it is set up.
+const sinks = [];
+export const onSend = (fn) => { sinks.push(fn); };
+
 export function send(title, message) {
+  for (const fn of sinks) { try { fn(title, message); } catch { /* one sink failing must not stop the rest */ } }
   if (process.platform !== 'darwin' || process.env.CLAUDE_TRACKER_NOTIFY === '0') return;
   const q = (s) => String(s).replace(/\\/g, '\\\\').replace(/"/g, '\\"');
   execFile('osascript', ['-e', `display notification "${q(message)}" with title "${q(title)}"`], () => {});

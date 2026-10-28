@@ -272,6 +272,29 @@ CREATE TABLE IF NOT EXISTS sync_peers (
   error      TEXT,
   status_at  INTEGER
 );
+
+-- How far each running session's transcript has been followed (see panes.js),
+-- so a restart carries on where it left off instead of repeating or skipping.
+CREATE TABLE IF NOT EXISTS pane_reads (
+  session_id TEXT PRIMARY KEY,
+  path       TEXT NOT NULL,
+  offset     INTEGER NOT NULL,
+  at         INTEGER
+);
+
+-- The Slack thread each session is carried in (see bridge.js). A /clear starts
+-- a new conversation in the same pane, which keeps its thread.
+CREATE TABLE IF NOT EXISTS slack_threads (
+  session_id TEXT PRIMARY KEY,
+  machine_id TEXT,                 -- null: this machine
+  channel    TEXT NOT NULL,
+  ts         TEXT NOT NULL,        -- the thread's first message, which shows the session
+  name       TEXT,                 -- what the thread calls it, for when it is gone
+  muted      INTEGER NOT NULL DEFAULT 0,
+  created_at INTEGER NOT NULL,
+  ended_at   INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_slack_threads_ts ON slack_threads(channel, ts);
 `;
 
 /**

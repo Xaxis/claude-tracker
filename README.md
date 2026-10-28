@@ -15,7 +15,7 @@ goes to re-writing prompt caches that lapsed.
 
 Everything stays on your machine unless you sync it with another of yours,
 over ssh. There are no dependencies, no API calls, and no network access beyond
-a loopback HTTP server you start yourself.
+a loopback HTTP server you start yourself - and Slack, if you set it up.
 
 ```
   Claude Tracker                     ● live · updated 09:32:16 · 127.0.0.1:4785
@@ -88,6 +88,7 @@ Run it from any directory once linked:
 | `claude-tracker failover` | where sessions go when their account runs low |
 | `claude-tracker failover on` | switch accounts automatically when one runs low |
 | `claude-tracker pool add me@example.com` | sign an account into a spare, to switch to |
+| `claude-tracker slack setup` | every session in Slack, a thread each: read it, answer it, drive it |
 
 Or from inside the repo, without linking — `yarn` and `npm run` both work:
 
@@ -415,6 +416,86 @@ turns failover on or off, `t` steps through the accounts it can switch to, `+`
 and `-` move the threshold by 5 points, and `s` pressed twice switches now.
 Settings are per machine.
 
+### Driving sessions from Slack
+
+Every Claude Code session running in a tmux pane - on this machine and on the
+machines it syncs with - gets a thread in one Slack channel. You can read it,
+answer it and drive it from your phone, as if you were at its keyboard.
+
+The thread's first message shows the session: its tmux session and title, whether
+it is working, idle or waiting on you, and its folder, account, context and machine.
+It stays current. Below it is the conversation as it happens: what was typed at the
+terminal, everything Claude writes, and a line for what it did in between
+(`ran npm test · edited 2 files`).
+
+- **A reply is typed into the session** and sent, exactly as at its keyboard. A
+  message sent while Claude works is queued, as typing it in would queue it.
+  `!cmd` runs a shell command there, as it does in Claude Code.
+- **`;compact`, `;model opus`, `;clear`** run Claude Code's slash commands. Slack
+  keeps a leading `/` for its own commands.
+- **`;esc`** interrupts. **`;screen`** shows the terminal. **`;keys 2`**,
+  **`;keys down enter`** and **`;keys shift-tab`** press keys.
+- **When a session waits on you** - a permission prompt, a question, a dialog -
+  the thread shows its screen with a button for each choice, and mentions you,
+  so your phone tells you. A reply instead of a button answers the prompt with
+  Esc, then sends what you wrote. When a long turn you started from Slack
+  finishes, it mentions you again.
+- **Files you attach** are saved on the session's machine, and their paths are
+  added to the message, so Claude can open them.
+- **In the channel itself** (or a DM with the app): `list` shows every session
+  with a link to its thread. `new <folder> [what to do]` starts Claude there in
+  a new tmux session, and `new Mac:~/Projects/app …` starts it on another machine.
+  `usage` shows how full each account is. `pause` and `resume` stop and restart
+  the conversations, while prompts that need you still come through.
+- **`;mute`** in a busy session's thread stops showing its conversation, and only
+  prompts that need you come through. `;unmute` turns it back on.
+- The tracker's own alerts land in the channel too: a limit nearly hit, a failover
+  switch, and "add another account".
+
+A thread lasts as long as its conversation. A session restored after a reboot,
+by `claude --resume`, carries on in its thread. A `/clear` starts a new
+conversation in the same thread.
+
+Setting it up takes a few minutes, once:
+
+```sh
+claude-tracker slack setup
+```
+
+It gives you a link that creates the Slack app with everything it needs already
+filled in, including Socket Mode. You install the app to your workspace and paste
+its two tokens. Then you post a pairing code in the channel you want, after inviting
+the app there. A private channel is best. Whoever posts the code is the only person
+the app listens to, and that channel is where the threads go. Set it up on one machine,
+the one that is always on. Synced machines' sessions come through it over the sync
+connection, and their trackers follow and type into them.
+
+How it works, and what keeps it safe:
+
+- **Socket Mode.** The tracker opens a connection out to Slack, and events come
+  back down it. Nothing new listens on the network, so no public address or
+  tunnel is needed.
+- **Keys go into the pane, nowhere else.** Claude Code records each running
+  process's tmux pane and whether it waits on you (`~/.claude/sessions/`), so
+  the tracker knows where to type and when a prompt is open, without hooks.
+  It types only into a pane where the Claude process it expects is running in
+  the foreground, and it checks that just before each message. If Claude has
+  exited, the pane is a shell, and anything typed there would run as a command.
+  Ctrl-C is never sent, because twice closes Claude Code. Leftover text in the
+  input box, such as a prompt an interrupt put back, is cleared with keys that
+  can neither interrupt nor exit, and the thread says what was cleared.
+- **What it says comes from the transcript**, read as it is written, from where
+  it left off after a restart. Messages typed from Slack are not echoed back.
+  Another session's messages, subagents' turns and injected context are left out.
+- **Only what fits** is checked: a session not in tmux shows in Slack read-only,
+  and says why.
+
+`claude-tracker slack` shows how it is going, and both dashboards show it
+too. When something is wrong, they say what fixes it. `slack pair` moves it to
+another channel. `slack off` and `slack on` turn it off and back on, and `slack remove`
+forgets the tokens. On a machine without Slack set up, `slack off` stops a synced
+machine's Slack from driving its sessions.
+
 ### Exporting accounts
 
 `claude-tracker accounts export` writes every account to a spreadsheet in
@@ -664,7 +745,12 @@ Claude Code's transcripts and config files. It reads and moves sign-ins only to 
 From the jobs holding or waiting for the GPU and CPU pool, it reads
 `/proc/<pid>/environ` - your own processes only - for two variables,
 `CLAUDE_CODE_SESSION_ID` and `PWD`, and keeps nothing else from it.
-Notifications go through macOS's own notification centre. The web server binds
+Notifications go through macOS's own notification centre, and into Slack when it
+is set up. With Slack set up, what your sessions say is posted to the channel you
+paired it with, and nowhere else. Its tokens are kept in
+`~/.claude/tracker/slack.json`, readable only by you. A synced machine with Slack
+set up can type into the sessions on this one. `claude-tracker slack off` here
+stops that. The web server binds
 to `127.0.0.1` only, and the index lives in `~/.claude/tracker/`. A sync
 connection reaches it only through `sync serve`, which has to show a token kept
 in a file only you can read.
@@ -672,7 +758,7 @@ in a file only you can read.
 ## Development
 
 ```sh
-node --test                     # unit tests, and two trackers syncing end to end
+node --test                     # unit tests, two trackers syncing, and sessions driven from Slack, end to end
 CT_TEST_SSH=ssh CT_TEST_HOST=me@localhost node --test test/sync.test.js   # the same, over real ssh
 python3 bench/run_load.py   # end-to-end realtime test (needs Chrome)
 ```
@@ -698,6 +784,9 @@ depend on your own usage history.
 | `src/replica.js` | what syncing copies between machines, and how it merges |
 | `src/sync.js` | the sync connection: ssh, the relay, the protocol |
 | `src/failover.js` | which account a profile switches to when its own runs low, and when |
+| `src/panes.js` | the sessions in tmux panes: what each says, and typing into it safely |
+| `src/slack.js` | Slack's Web API and Socket Mode, and Markdown as Slack shows it |
+| `src/bridge.js` | a thread per session in Slack, and replies typed back in |
 | `src/signin.js` | a profile's sign-in, read and moved the way Claude Code keeps it |
 | `src/billing.js` | projects the subscription cycle from its start date |
 | `src/api.js` | aggregation for both dashboards |
@@ -706,6 +795,7 @@ depend on your own usage history.
 | `src/tui.js` | terminal dashboard |
 | `src/server.js` | HTTP API, static files, live updates |
 | `web/` | browser dashboard |
+| `fakes/` | stand-ins for Slack and Claude Code's terminal, for the tests |
 
 ## License
 

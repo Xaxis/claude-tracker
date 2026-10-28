@@ -14,6 +14,7 @@ import { failoverSettings, recentSwitches, spares, SPARE_PREFIX } from './failov
 import { getMeta } from './db.js';
 import { boxState, boxView, sessionLeases } from './box.js';
 import { mainContext, activeAgents, sessionRecaches, placeName } from './context.js';
+import { readConfig as slackConfig, bridgeStatus } from './bridge.js';
 
 const UNATTRIBUTED = '__unattributed__';
 
@@ -240,6 +241,21 @@ export function overview(now = Date.now()) {
     recommendation: recommend(rows, now),
     sync: syncSummary(now),
     failover: failoverSummary(now),
+    slack: slackSummary(now),
+  };
+}
+
+/** Sessions in Slack, for the dashboards: where, how that is going, and what fixes it if stuck. Null when not set up. */
+function slackSummary(now) {
+  const cfg = slackConfig();
+  if (!cfg?.botToken) return null;
+  const st = bridgeStatus() ?? {};
+  return {
+    state: cfg.disabled ? 'off' : st.state ?? 'starting',
+    channel: cfg.owner ? cfg.channelName ?? 'its channel' : null,
+    paused: !!cfg.paused,
+    error: !cfg.disabled && st.state === 'error' ? st.error : null,
+    pairCode: !cfg.owner && cfg.pair && now < cfg.pair.until ? cfg.pair.code : null,
   };
 }
 
