@@ -10,6 +10,8 @@ import path from 'node:path';
  *
  *   ASK …   asks permission, with a numbered menu, before it answers
  *   SLOW …  works for 30s (Esc interrupts)
+ *   SHELLS … answers, then stays "shell": idle with shells left running
+ *   STEPS …  a turn of several remarks and tool calls, a long write-up, and an answer
  *   /exit   quits
  *
  * Ctrl-C quits at once, so a test can tell if the tracker ever sends one.
@@ -22,6 +24,7 @@ fs.mkdirSync(path.dirname(transcript), { recursive: true });
 fs.mkdirSync(path.dirname(registry), { recursive: true });
 
 let input = '', status = 'idle', waitingFor = null, menu = null, timer = null, log = [];
+const queued = [];   // typed while it works: taken once the turn is over, as Claude Code does
 const pane = process.env.TMUX_PANE;
 
 function register() {
@@ -50,25 +53,52 @@ function draw() {
   process.stdout.write(out);
 }
 
-function setStatus(s, w = null) { status = s; waitingFor = w; register(); draw(); }
+function setStatus(s, w = null) {
+  status = s; waitingFor = w; register(); draw();
+  if (s !== 'busy' && s !== 'waiting' && queued.length) setTimeout(() => submit(queued.shift()), 50);
+}
 
 function submit(text) {
+  if (status === 'busy') { queued.push(text); draw(); return; }
   if (text === '/exit') { cleanup(); process.exit(0); }
   const command = text.match(/^\/(\S+)\s*(.*)$/);
   write({ type: 'user', origin: { kind: 'human' }, promptSource: 'typed', message: {
     content: command ? `<command-name>/${command[1]}</command-name>\n<command-message>${command[1]}</command-message>\n<command-args>${command[2]}</command-args>` : text,
   } });
   log.push(`> ${text.split('\n')[0]}`);
+  // A slash command prints what it did, as Claude Code's do, and Claude says nothing.
+  if (command) {
+    write({ type: 'user', message: { content: `<local-command-stdout>ran /${command[1]}</local-command-stdout>` } });
+    draw();
+    return;
+  }
   setStatus('busy');
   if (text.startsWith('ASK')) {
-    timer = setTimeout(() => { menu = ['Yes', 'No']; setStatus('waiting', 'permission prompt'); }, 200);
+    // A tool call, then a prompt for the next one - as Claude stops mid-turn to ask.
+    timer = setTimeout(() => {
+      write({ type: 'assistant', message: { content: [{ type: 'tool_use', name: 'Bash', input: { command: 'ls' } }] } });
+      menu = ['Yes', 'No'];
+      setStatus('waiting', 'permission prompt');
+    }, 200);
+  } else if (text.startsWith('STEPS')) {
+    // A turn as Claude writes one: remarks between tool calls, a long write-up, then the answer.
+    timer = setTimeout(() => {
+      const bash = (c) => [{ type: 'tool_use', name: 'Bash', input: { command: c } }];
+      say('Looking at it.', bash('ls'));
+      say('Found it.', bash('grep -n bug src/x.js'));
+      say(`Here is the plan in full. ${'It has many parts. '.repeat(45)}`, bash('npm test'));
+      write({ type: 'assistant', message: { content: [{ type: 'tool_use', name: 'Edit', input: { file_path: `${cwd}/src/x.js` } }] } });
+      say('All done.');
+      setStatus('idle');
+    }, 300);
   } else if (text.startsWith('SLOW')) {
     timer = setTimeout(() => { say('slow done'); setStatus('idle'); }, 30_000);
   } else {
     timer = setTimeout(() => {
       say(`echo: ${text}`, [{ type: 'tool_use', name: 'Bash', input: { command: 'echo hi' } }]);
       log.push(`echo: ${text.split('\n')[0]}`);
-      setStatus('idle');
+      // Claude Code says "shell" for idle with shells left running in the background.
+      setStatus(text.startsWith('SHELLS') ? 'shell' : 'idle');
     }, 300);
   }
 }

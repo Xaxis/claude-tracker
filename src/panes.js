@@ -190,6 +190,8 @@ function userText(content) {
 export function readEntry(e, state) {
   const out = [];
   if (!e || e.isSidechain) return out;
+  // Where it works now: sessions restored from a shell in ~ carry on wherever they cd'd.
+  if (e.cwd) state.cwd = e.cwd;
   // A title the person gave it outranks the one Claude Code made up.
   if (e.type === 'ai-title' && e.aiTitle) { if (!state.named) state.title = e.aiTitle; return out; }
   if (e.type === 'custom-title' && e.customTitle) { state.title = e.customTitle; state.named = true; return out; }
@@ -224,6 +226,7 @@ export function readEntry(e, state) {
     state.tools = [];
     state.turnTools = 0;
     state.lastTool = null;
+    state.said = null;
     out.push({ kind: 'prompt', text, at, uuid: e.uuid, queued: e.promptSource === 'queued' });
     return out;
   }
@@ -232,6 +235,7 @@ export function readEntry(e, state) {
       if (b?.type === 'text' && b.text?.trim()) {
         out.push({ kind: 'text', text: b.text, tools: state.tools ?? [], at, uuid: e.uuid, error: !!e.isApiErrorMessage });
         state.tools = [];
+        state.said = short(b.text.split('\n').find((l) => l.trim()) ?? '', 160);
       } else if (b?.type === 'tool_use') {
         const t = toolSummary(b, e.cwd);
         state.turnTools = (state.turnTools ?? 0) + 1;
@@ -287,6 +291,36 @@ export function screenOptions(screen) {
     out.push({ label: short(region[i].slice(col), 70), keys: [...Array(Math.abs(d)).fill(d > 0 ? 'Down' : 'Up'), 'Enter'] });
   }
   return out;
+}
+
+const SOLID = /^\s*[─━▔═]{8,}\s*$/;
+const DASHED = /^\s*[╌┄-]{8,}\s*$/;
+const HINT = /(Esc to |Enter to |Tab to |to navigate|to adjust|this session only|ctrl\+\w to|^Tip: )/i;
+
+/**
+ * The dialog on screen as a person would read it out: its title, what it is
+ * about, and the question - without its choices (they are buttons), the key
+ * hints, or the conversation above it. Lines between dashed rules, where Claude
+ * Code shows the command or file in question, are marked as code.
+ */
+export function screenDialog(screen) {
+  const lines = screen.split('\n');
+  let start = -1;
+  for (let i = lines.length - 1; i >= 0; i--) if (SOLID.test(lines[i])) { start = i + 1; break; }
+  if (start < 0) return null;
+  const labels = screenOptions(screen).map((o) => o.label.replace(/…$/, ''));
+  const isOption = (l) => /^[❯›>↓↑]?\s*\d{1,2}\.\s/.test(l) || /^❯\s/.test(l)
+    || labels.some((x) => x && l.replace(/\s{2,}/g, ' · ').startsWith(x));
+  const out = [];
+  let code = false;
+  for (const raw of lines.slice(start)) {
+    if (DASHED.test(raw)) { code = !code; continue; }
+    const l = raw.trim();
+    if (!l || isOption(l) || HINT.test(l)) continue;
+    out.push({ text: short(l, 300), code });
+  }
+  if (!out.length) return null;
+  return { title: out[0].text, body: out.slice(1, 12) };
 }
 
 /**
@@ -366,6 +400,8 @@ export function startPanes({ onSessions = () => {}, onItems = () => {} } = {}) {
   const live = new Map();       // pid -> session as last seen
   const reads = new Map();      // session id -> { path, offset, partial, state }
   const launched = new Map();   // pane id -> { prompt, at }: to type once Claude is up there
+  const unseen = new Set();     // sessions first seen before they had a transcript
+  const watching = Date.now();
   let placedAt = 0, placing = null, places = new Map();
   let last = '', stopped = false, ticking = false, looked = false;
 
@@ -407,14 +443,36 @@ export function startPanes({ onSessions = () => {}, onItems = () => {} } = {}) {
   function session(e, where) {
     const r = reads.get(e.s.sessionId);
     return {
-      sessionId: e.s.sessionId, pid: e.s.pid, cwd: e.s.cwd ?? null, name: e.s.name ?? null,
+      sessionId: e.s.sessionId, pid: e.s.pid, cwd: r?.state.cwd ?? e.s.cwd ?? null, name: e.s.name ?? null,
       title: r?.state.title ?? null, profile: e.profile.name,
       status: e.s.status ?? null, waitingFor: e.s.status === 'waiting' ? e.s.waitingFor ?? 'input' : null,
       statusAt: e.s.statusUpdatedAt ?? e.s.updatedAt ?? null, startedAt: e.s.startedAt ?? null, version: e.s.version ?? null,
       tmux: where.tmux ?? null, target: where.target ?? null, pane: where.pane ?? null, socket: where.socket ?? null,
       controllable: where.controllable, why: where.why,
-      turnTools: r?.state.turnTools ?? 0, lastTool: r?.state.lastTool ?? null,
+      turnTools: r?.state.turnTools ?? 0, lastTool: r?.state.lastTool ?? null, said: r?.state.said ?? null,
     };
+  }
+
+  /**
+   * Is this transcript the session's own, begun while it ran - rather than a
+   * conversation it resumed? A new one is read from its start; an old one
+   * shows only its last exchange, for context.
+   */
+  function begunNow(p, s) {
+    if (unseen.has(s.sessionId)) return true;   // it had none when the session was first seen
+    let head = '';
+    try {
+      const fd = fs.openSync(p, 'r');
+      try { const b = Buffer.alloc(16384); head = b.subarray(0, fs.readSync(fd, b, 0, b.length, 0)).toString('utf8'); } finally { fs.closeSync(fd); }
+    } catch { return false; }
+    // Begun since this started watching, by this process: anything older is
+    // history, however recently the process itself started.
+    for (const line of head.split('\n').slice(0, 20)) {
+      let t;
+      try { t = Date.parse(JSON.parse(line).timestamp); } catch { continue; }
+      if (t) return t >= watching && t >= (s.startedAt ?? Infinity) - 60_000;
+    }
+    return false;
   }
 
   /** Read what a session's transcript gained, as conversation items. */
@@ -422,13 +480,14 @@ export function startPanes({ onSessions = () => {}, onItems = () => {} } = {}) {
     let r = reads.get(s.sessionId);
     if (!r) {
       const p = transcriptOf(profile, s.sessionId, s.cwd);
-      if (!p) return [];
+      if (!p) { unseen.add(s.sessionId); return []; }
       const saved = getRead.get(s.sessionId);
       r = { path: p, offset: 0, partial: '', state: { tools: [], turnTools: 0, title: null }, backfill: false };
       let size = 0;
       try { size = fs.statSync(p).size; } catch { return []; }
       if (saved?.path === p && saved.offset <= size) r.offset = saved.offset;
-      else { r.offset = Math.max(0, size - BACKFILL_BYTES); r.backfill = true; }
+      else if (!begunNow(p, s)) { r.offset = Math.max(0, size - BACKFILL_BYTES); r.backfill = true; }
+      unseen.delete(s.sessionId);
       if (size - r.offset > CATCH_UP_BYTES) { r.offset = size - BACKFILL_BYTES; r.skipped = true; }
       // Start on a line boundary, and know the title from before it.
       if (r.offset > 0) r.partial = null;
@@ -638,7 +697,8 @@ export function startPanes({ onSessions = () => {}, onItems = () => {} } = {}) {
 
   async function screen(s) {
     const text = (await capture(s)).replace(/[ \t]+$/gm, '').replace(/\n{3,}/g, '\n\n').trimEnd();
-    return { text, options: s.status === 'waiting' || !s.status ? screenOptions(text) : [] };
+    const waiting = s.status === 'waiting' || !s.status;
+    return { text, options: waiting ? screenOptions(text) : [], dialog: waiting ? screenDialog(text) : null };
   }
 
   return {
@@ -649,7 +709,7 @@ export function startPanes({ onSessions = () => {}, onItems = () => {} } = {}) {
       if (op.op === 'launch') return launch(op);
       if (op.op === 'early') {
         const text = (await earlyPane(op, op.keys ? parseKeys(op.keys) : null)).replace(/[ \t]+$/gm, '').trimEnd();
-        return { screen: { text, options: screenOptions(text) } };
+        return { screen: { text, options: screenOptions(text), dialog: screenDialog(text) } };
       }
       const s = await check(op.sessionId);
       switch (op.op) {

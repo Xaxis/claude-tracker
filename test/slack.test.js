@@ -5,8 +5,9 @@ import os from 'node:os';
 import path from 'node:path';
 
 process.env.CLAUDE_TRACKER_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'ct-slack-unit-'));
+test.after(() => fs.rmSync(process.env.CLAUDE_TRACKER_DIR, { recursive: true, force: true }));
 const { toMrkdwn, split, fromSlack, escape } = await import('../src/slack.js');
-const { screenOptions, inputBox, parseKeys, readEntry, toolSummary } = await import('../src/panes.js');
+const { screenOptions, screenDialog, inputBox, parseKeys, readEntry, toolSummary } = await import('../src/panes.js');
 const { toolsLine, parseControl } = await import('../src/bridge.js');
 
 /* Screens as Claude Code 2.1.312 drew them, captured from a real session. */
@@ -75,6 +76,20 @@ test('past nine, a numbered choice is reached with the arrows from where the cur
   assert.deepEqual(o[4].keys, ['5']);
   assert.deepEqual(o[9].keys, ['Down', 'Down', 'Down', 'Down', 'Down', 'Enter']);
   assert.match(o[0].label, /^Default \(recommended\) · Opus 5\.5/);
+});
+
+test('a dialog reads as its question: title, what it is about, the command as code, no choices or hints', () => {
+  const tip = PERMISSION.replace(' Bash command\n', ' Bash command\n Tip: auto mode handles these prompts for you\n');
+  assert.deepEqual(screenDialog(tip), {
+    title: 'Bash command',
+    body: [
+      { text: 'Write current date into stamp.txt', code: false },
+      { text: 'date > stamp.txt', code: true },
+      { text: 'Do you want to proceed?', code: false },
+    ],
+  });
+  assert.deepEqual(screenDialog(TRUST).body.map((l) => l.text), ['/tmp/probe', 'Quick safety check: Is this a project you created or one you trust?', 'Claude Code\'ll be able to read, edit, and execute files here.', 'Security guide']);
+  assert.deepEqual(screenDialog(PICKER), { title: 'Select model', body: [] });
 });
 
 test('a screen with nothing to choose offers nothing', () => {

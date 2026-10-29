@@ -43,6 +43,9 @@ export function bridgeStatus() {
 export const newPairCode = () => String(crypto.randomInt(100000, 1000000));
 
 const HELP = [
+  '*How a thread reads*',
+  '• Its first message shows the session, and what it is doing right now - it changes in place, so it never pings you.',
+  '• Each turn ends in one message: what Claude did, in grey, then its answer. A prompt that needs you comes up as buttons, and mentions you.',
   '*In a session\'s thread*',
   '• Anything you write is typed into the session and sent, as at its keyboard - `!cmd` runs a shell command there, as it would.',
   '• `;compact`, `;model opus`, `;clear` … run Claude Code\'s slash commands (Slack keeps `/` for its own).',
@@ -57,7 +60,19 @@ const HELP = [
   '• `pause` / `resume` - stop and start showing conversations here. Prompts that need you still come through.',
 ].join('\n');
 
-const EMOJI = { busy: ':large_green_circle:', idle: ':white_circle:', waiting: ':large_orange_circle:', ended: ':black_circle:' };
+const EMOJI = { busy: ':large_green_circle:', idle: ':white_circle:', shell: ':white_circle:', waiting: ':large_orange_circle:', ended: ':black_circle:' };
+// A text this long, with more work after it, is worth seeing when it is written, not at the end of the turn.
+const LONG = 700;
+/** Text for a notification, which shows no formatting: emoji codes and markup taken out. */
+/** Is the turn over? Busy is working; waiting is a pause in the turn, for a prompt. */
+const over = (status) => status !== 'busy' && status !== 'waiting';
+const plain = (s) => String(s).replace(/:[a-z0-9_+-]+:/g, '').replace(/[*_~`]/g, '').replace(/\s+/g, ' ').trim();
+const clip = (s, n) => { s = String(s ?? '').replace(/\s+/g, ' ').trim(); return s.length > n ? `${s.slice(0, n - 1)}…` : s; };
+const when = (ts) => `<!date^${Math.floor(ts / 1000)}^{date_short_pretty} {time}|${new Date(ts).toISOString().slice(0, 16).replace('T', ' ')} UTC>`;
+/** Grey small print: what something did, rather than what it said. */
+const context = (text) => ({ type: 'context', elements: [{ type: 'mrkdwn', text: String(text).slice(0, 2990) }] });
+/** Markdown as section blocks, each within Slack's limit. */
+const sections = (md) => split(toMrkdwn(md), 2900).map((t) => ({ type: 'section', text: { type: 'mrkdwn', text: t } }));
 const norm = (s) => String(s).replace(/\s+/g, ' ').trim();
 const tilde = (p) => (p ? String(p).replace(/^\/(?:home|Users)\/[^/]+(?=\/|$)/, '~') : p);
 const shortNum = (n) => (n >= 999_500 ? `${(n / 1e6).toFixed(1)}M` : `${Math.round(n / 1e3)}k`);
@@ -158,9 +173,16 @@ export function startBridge({ info = () => null, usage = () => '', here = 'this 
     if (x.ended) state = `${EMOJI.ended} ended`;
     else if (s.status === 'waiting') state = `${EMOJI.waiting} *waiting on you* · ${escape(s.waitingFor ?? 'input')}`;
     else if (s.status === 'busy') {
-      state = `${EMOJI.busy} working${s.turnTools ? ` · ${s.turnTools} tool call${s.turnTools === 1 ? '' : 's'}` : ''}`;
-      if (s.lastTool) state += ` · last: ${toolsLine([s.lastTool]).replace(/^:hammer_and_wrench: /, '')}`;
-    } else state = `${EMOJI.idle} idle${s.statusAt ? ` since <!date^${Math.floor(s.statusAt / 1000)}^{time}|${new Date(s.statusAt).toISOString().slice(11, 16)} UTC>` : ''}`;
+      // What it is doing, as it does it: the last thing it said and did.
+      const since = x.work?.at ?? s.statusAt;
+      state = `${EMOJI.busy} *working*${since ? ` · ${ago(Date.now() - since)}` : ''}${s.turnTools ? ` · ${s.turnTools} tool call${s.turnTools === 1 ? '' : 's'}` : ''}`;
+      const said = x.work?.texts.at(-1)?.text ?? s.said;
+      if (said) state += `\n> ${escape(clip(said.split('\n').find((l) => l.trim()) ?? '', 160))}`;
+      if (s.lastTool) state += `\n${toolsLine([s.lastTool]).replace(/^:hammer_and_wrench: /, '_now:_ ')}`;
+    } else {
+      const idle = s.status === 'shell' ? 'idle · shells running in the background' : s.status && s.status !== 'idle' ? escape(s.status) : 'idle';
+      state = `${EMOJI.idle} ${idle}${s.statusAt ? ` since ${when(s.statusAt)}` : ''}`;
+    }
     const machine = machines.get(x.machine ?? '');
     if (!x.ended && x.machine && !machine?.online) state = `${EMOJI.ended} ${escape(machine?.name ?? 'its machine')} is not connected · last ${state}`;
     const facts = [
@@ -183,11 +205,12 @@ export function startBridge({ info = () => null, usage = () => '', here = 'this 
         ...(x.muted ? [button('Unmute', 'ct:unmute', x)] : []),
       ] });
     }
-    return { text: `${name}: ${x.ended ? 'ended' : s.status === 'waiting' ? `waiting on you (${s.waitingFor})` : s.status ?? ''}`, blocks };
+    const word = x.ended ? 'ended' : s.status === 'waiting' ? `waiting on you (${s.waitingFor})` : s.status === 'busy' ? 'working' : 'idle';
+    return { text: `${name}: ${word}`, blocks };
   }
 
-  function button(text, action, x, keys = null, style = null) {
-    const value = JSON.stringify({ m: x.machine ?? null, s: x.s.sessionId, ...(keys ? { k: keys } : {}) });
+  function button(text, action, x, keys = null, style = null, extra = {}) {
+    const value = JSON.stringify({ m: x.machine ?? null, s: x.s.sessionId, ...(keys ? { k: keys } : {}), ...extra });
     return { type: 'button', text: { type: 'plain_text', text: text.slice(0, 75), emoji: true }, action_id: `${action}:${crypto.randomBytes(3).toString('hex')}`, value, ...(style ? { style } : {}) };
   }
 
@@ -197,9 +220,12 @@ export function startBridge({ info = () => null, usage = () => '', here = 'this 
     const c = card(x);
     const sig = JSON.stringify(c.blocks);
     if (sig === x.cardSig) return;
-    const important = c.text !== x.cardText;
-    if (!force && !important && Date.now() - (x.cardAt ?? 0) < 30_000) return;
-    x.cardSig = sig; x.cardText = c.text; x.cardAt = Date.now();
+    // A change of state shows at once; what changes while it works, every 20s at most.
+    const state = [x.ended, x.s.status, x.s.waitingFor, x.s.controllable, x.muted, machines.get(x.machine ?? '')?.online].join('|');
+    const important = state !== x.cardState;
+    x.cardState = state;
+    if (!force && !important && Date.now() - (x.cardAt ?? 0) < 20_000) return;
+    x.cardSig = sig; x.cardAt = Date.now();
     send('chat.update', { channel: x.thread.channel, ts: x.thread.ts, text: c.text, blocks: c.blocks }, { priority: 2, key: `card:${x.key}` })
       .catch((err) => slackFailed(err, 'chat.update'));
   }
@@ -213,13 +239,14 @@ export function startBridge({ info = () => null, usage = () => '', here = 'this 
       x.muted = !!row.muted;
       if (row.ended_at) {
         q.put.run(x.s.sessionId, x.machine, row.channel, row.ts, nameOf(x.s), row.muted, row.created_at);
-        post(row.channel, row.ts, ':arrow_forward: _resumed_').catch(() => {});
+        meta(x, ':arrow_forward: resumed').catch(() => {});
       }
     } else {
       const c = card(x);
       const r = await send('chat.postMessage', { channel: cfg.channel, text: c.text, blocks: c.blocks, unfurl_links: false }, { priority: 1 });
       x.thread = { channel: r.channel, ts: r.ts };
-      x.cardSig = JSON.stringify(c.blocks); x.cardText = c.text; x.cardAt = Date.now();
+      x.cardSig = JSON.stringify(c.blocks); x.cardAt = Date.now();
+      x.cardState = [x.ended, x.s.status, x.s.waitingFor, x.s.controllable, x.muted, machines.get(x.machine ?? '')?.online].join('|');
       q.put.run(x.s.sessionId, x.machine, r.channel, r.ts, nameOf(x.s), 0, Date.now());
     }
     byThread.set(`${x.thread.channel}/${x.thread.ts}`, x.key);
@@ -273,7 +300,7 @@ export function startBridge({ info = () => null, usage = () => '', here = 'this 
           try { q.move.run(s.sessionId, before.s.sessionId); } catch { /* the new one has a row already */ }
           x.thread = before.thread; x.muted = before.muted; x.chain = before.chain;
           byThread.set(`${x.thread.channel}/${x.thread.ts}`, key);
-          if (ready()) chain(x, () => post(x.thread.channel, x.thread.ts, ':new: _a new conversation in this session_'));
+          if (ready()) chain(x, () => meta(x, ':new: a new conversation in this session'));
         }
         if (ready()) chain(x, () => ensureThread(x));
       }
@@ -283,9 +310,11 @@ export function startBridge({ info = () => null, usage = () => '', here = 'this 
       if (!ready()) continue;
       chain(x, async () => {
         await ensureThread(x);
-        if (s.status === 'waiting' && (prev.status !== 'waiting' || prev.waitingFor !== s.waitingFor || !x.alert)) await waiting(x);
+        if (s.status === 'waiting' && (prev.status !== 'waiting' || prev.waitingFor !== s.waitingFor || !x.alert)) soonWaiting(x);
         else if (s.status !== 'waiting' && x.alert) answered(x);
-        if (prev.status === 'busy' && s.status === 'idle' && x.turn) finished(x);
+        // Idle, or idle with shells left running: the turn is over. A prompt only
+        // pauses it - what was said before it is posted with the prompt.
+        if (prev.status !== s.status && over(s.status) && x.work) soonFlush(x);
         refreshCard(x);
       });
     }
@@ -298,72 +327,176 @@ export function startBridge({ info = () => null, usage = () => '', here = 'this 
     }
   }
 
+  /** A grey line in a session's thread: something that happened, not something said. */
+  const meta = (x, text, priority = 1) => post(x.thread.channel, x.thread.ts, plain(text), { blocks: [context(text)] }, priority);
+
+  /** Was this prompt typed from Slack? Then it is already in the thread. */
+  function fromHere(x, text) {
+    const i = x.sent.findIndex((m) => m.norm === norm(text));
+    if (i >= 0) x.sent.splice(i, 1);
+    return i >= 0;
+  }
+
+  /**
+   * What sessions say, a turn at a time. Claude's texts and tool calls are
+   * held while it works - the thread's first message shows them as they
+   * happen, in place - and the turn ends in one message: what it did, then
+   * what it said last. So a thread you follow pings once a turn, not once a
+   * paragraph. A long text with more work after it is posted as it comes.
+   */
   function items(machine, sessionId, list) {
     const x = live.get(keyOf(machine ?? null, sessionId));
     if (!x || !ready()) return;
     chain(x, async () => {
-      const t = await ensureThread(x);
-      for (const it of list) {
+      await ensureThread(x);
+      const quiet = x.muted || cfg.paused;
+      const back = list.filter((i) => i.backfill);
+      if (back.length && !quiet) await backfill(x, back);
+      for (const it of list.filter((i) => !i.backfill)) {
         if (it.kind === 'prompt') {
-          const n = norm(it.text);
-          const mine = x.sent.findIndex((m) => m.norm === n);
-          if (mine >= 0) { x.sent.splice(mine, 1); continue; }   // typed from here
-          if (x.muted || cfg.paused) continue;
-          const quoted = escape(it.text.length > 1500 ? `${it.text.slice(0, 1500)}…` : it.text).replace(/^/gm, '> ');
-          const lead = it.backfill ? '_asked last, before this thread:_' : it.command ? ':keyboard: _at the terminal:_' : ':keyboard: _typed at the terminal:_';
-          await post(t.channel, t.ts, `${lead}\n${quoted}`);
+          // Anything typed ends the turn before it - a slash command too.
+          if (x.work?.texts.length || x.work?.tools.length) await flush(x);
+          if (it.command) { x.command = { text: it.text, at: Date.now(), mine: fromHere(x, it.text) }; continue; }
+          const mine = fromHere(x, it.text);
+          x.work = { at: it.at ?? Date.now(), prompt: it.text, terminal: !mine, asked: mine ? x.asked : null, texts: [], tools: [] };
         } else if (it.kind === 'text') {
-          if (x.muted || cfg.paused) continue;
-          const tools = toolsLine(it.tools);
-          const body = toMrkdwn(it.text);
-          const parts = split(`${it.backfill ? '_its last reply:_\n' : ''}${it.error ? ':warning: ' : ''}${body}`);
-          for (let n = 0; n < parts.length; n++) await post(t.channel, t.ts, n === 0 && tools ? `${tools}\n${parts[n]}` : parts[n]);
+          x.work ??= { at: it.at ?? Date.now(), texts: [], tools: [] };
+          for (const t of x.work.texts) if (!t.posted && t.text.length >= LONG && !quiet) { await saying(x, t); t.posted = true; }
+          x.work.texts.push({ text: it.text, error: it.error });
+          x.work.tools.push(...(it.tools ?? []));
         } else if (it.kind === 'tools') {
-          if (x.muted || cfg.paused) continue;
-          await post(t.channel, t.ts, toolsLine(it.tools));
+          x.work ??= { at: it.at ?? Date.now(), texts: [], tools: [] };
+          x.work.tools.push(...(it.tools ?? []));
         } else if (it.kind === 'note') {
-          if (x.muted || cfg.paused) continue;
-          await post(t.channel, t.ts, `_${escape(it.text).replace(/_/g, '\u2009_\u2009').replace(/\n/g, '_\n_')}_`);
+          if (it.text === 'interrupted') {
+            if (x.work) x.work.interrupted = true; else if (!quiet) await meta(x, ':octagonal_sign: interrupted');
+            continue;
+          }
+          // What a slash command printed, with the command it answers.
+          const cmd = x.command && Date.now() - x.command.at < 120_000 ? x.command : null;
+          if (!quiet || cmd?.mine) await meta(x, `${cmd ? `\`${escape(cmd.text)}\` → ` : ''}${escape(it.text)}`);
         }
       }
+      // What arrives after it went idle finishes the turn.
+      if (x.work && over(x.s.status)) soonFlush(x);
+      refreshCard(x);
     });
   }
 
-  /** The session waits on a prompt: show the screen, with the choices as buttons, and say so. */
+  /** A long text from the middle of a turn, as it stands. */
+  async function saying(x, t) {
+    const blocks = sections(`${t.error ? ':warning: ' : ''}${t.text}`);
+    for (let i = 0; i < blocks.length; i += 40) {
+      await post(x.thread.channel, x.thread.ts, escape(clip(t.text, 150)), { blocks: blocks.slice(i, i + 40) });
+    }
+  }
+
+  /** The turn is over, a moment from now: its last words may still be on their way to the transcript. */
+  function soonFlush(x) {
+    clearTimeout(x.flushTimer);
+    x.flushTimer = setTimeout(() => chain(x, () => (over(x.s.status) ? flush(x) : null)), 1800);
+    x.flushTimer.unref?.();
+  }
+
+  /** One message for the turn: what was asked at the terminal, what it did, and what it said last. */
+  async function flush(x) {
+    const w = x.work;
+    x.work = null;
+    clearTimeout(x.flushTimer);
+    if (!w || x.muted || cfg.paused) return;
+    const texts = w.texts.filter((t) => !t.posted);
+    const answer = texts.at(-1) ?? null;
+    if (!answer && !w.tools.length && !w.interrupted && !w.terminal) return;
+    const took = Date.now() - (w.at ?? Date.now());
+    // A long turn asked for from Slack says so to you by name, so your phone tells you.
+    const ping = w.asked && Date.now() - w.asked.at > 90_000 ? `${mention()} ` : '';
+    const did = toolsLine(w.tools).replace(/^:hammer_and_wrench: /, '');
+    const lines = [
+      w.terminal && w.prompt && `:keyboard: at the terminal: “${escape(clip(w.prompt, 300))}”`,
+      `${ping}${w.interrupted ? ':octagonal_sign: interrupted after' : ':hammer_and_wrench: worked'} ${ago(took)}${did ? ` · ${did}` : ''}`,
+      ...texts.slice(0, -1).slice(-4).map((t) => `› ${escape(clip(t.text, 160))}`),
+    ].filter(Boolean);
+    const body = answer ? sections(`${answer.error ? ':warning: ' : ''}${answer.text}`) : [];
+    const fallback = `${ping}${answer ? escape(clip(answer.text, 180)) : plain(lines.at(-1))}`;
+    const blocks = [context(lines.join('\n')), ...body];
+    for (let i = 0; i < blocks.length; i += 40) {
+      await post(x.thread.channel, x.thread.ts, i === 0 ? fallback : escape(clip(answer?.text, 150)), { blocks: blocks.slice(i, i + 40) });
+    }
+  }
+
+  /** A session first seen: its last exchange, so the thread does not start blank. */
+  async function backfill(x, items) {
+    const asked = items.find((i) => i.kind === 'prompt');
+    const said = items.find((i) => i.kind === 'text');
+    const blocks = [context(`:rewind: before this thread${asked ? ` · asked: “${escape(clip(asked.text, 300))}”` : ''}`)];
+    if (said) blocks.push(...sections(said.text.length > 2500 ? `${said.text.slice(0, 2500)}…` : said.text).slice(0, 10));
+    await post(x.thread.channel, x.thread.ts, said ? escape(clip(said.text, 150)) : 'before this thread', { blocks });
+  }
+
+  /** Waiting on you, a moment from now: what it said first, then the prompt. */
+  function soonWaiting(x) {
+    clearTimeout(x.waitTimer);
+    x.waitTimer = setTimeout(() => chain(x, async () => {
+      if (x.s.status !== 'waiting') return;
+      if (x.alert) answered(x);   // a prompt replaced by another
+      if (x.work?.texts.length) await flush(x);
+      await waiting(x);
+    }), 700);
+    x.waitTimer.unref?.();
+  }
+
+  /** The session waits on a prompt: the question, a button per choice, and a mention. */
   async function waiting(x) {
-    await new Promise((r) => setTimeout(r, 500));   // let the dialog finish drawing
+    // Some dialogs take a moment to draw after Claude Code says one is open.
     let screen = null;
-    try { screen = (await act(x, { op: 'screen', sessionId: x.s.sessionId })).screen; } catch { /* shown without it */ }
-    const shown = (screen?.text ?? '').split('\n').slice(-24).join('\n').trim();
+    for (let i = 0; i < 3 && !screen?.dialog; i++) {
+      if (i) await new Promise((r) => setTimeout(r, 700));
+      try { screen = (await act(x, { op: 'screen', sessionId: x.s.sessionId })).screen; } catch { /* shown without it */ }
+    }
     const opts = (screen?.options ?? []).slice(0, 9);
-    const blocks = [
-      { type: 'section', text: { type: 'mrkdwn', text: `:raising_hand: ${mention()} *needs you* · ${escape(x.s.waitingFor ?? 'input')}` } },
-      ...(shown ? [{ type: 'section', text: { type: 'mrkdwn', text: `\`\`\`${escape(shown).slice(-2900)}\`\`\`` } }] : []),
-    ];
+    const d = screen?.dialog;
+    const title = d?.title ?? x.s.waitingFor ?? 'input';
+    const name = x.s.tmux ?? x.s.name ?? 'A session';
+    // Claude Code's own word for it - permission prompt, input needed - only when the dialog has no title.
+    const blocks = [{ type: 'section', text: { type: 'mrkdwn', text: `:raising_hand: ${mention()} *${escape(name)} needs you*${d ? '' : ` · ${escape(x.s.waitingFor ?? 'input')}`}` } }];
+    if (d) {
+      // Lines between dashed rules - the command or file it is about - read as code.
+      const parts = [];
+      for (const l of d.body) {
+        const last = parts.at(-1);
+        if (l.code && last?.code) last.lines.push(l.text); else parts.push({ code: l.code, lines: [l.text] });
+      }
+      const text = [`*${escape(title)}*`, ...parts.map((p) => (p.code ? `\`\`\`${escape(p.lines.join('\n'))}\`\`\`` : escape(p.lines.join('\n'))))].join('\n');
+      blocks.push({ type: 'section', text: { type: 'mrkdwn', text: text.slice(0, 2900) } });
+    } else if (screen?.text) {
+      blocks.push({ type: 'section', text: { type: 'mrkdwn', text: `\`\`\`${escape(screen.text.split('\n').slice(-16).join('\n').trim()).slice(-2800)}\`\`\`` } });
+    }
     if (x.s.controllable) {
       blocks.push({ type: 'actions', elements: [
-        ...opts.map((o, n) => button(`${n + 1}. ${o.label}`, 'ct:keys', x, o.keys.map((k) => k.toLowerCase()), n === 0 ? 'primary' : null)),
-        button('Esc', 'ct:keys', x, ['esc']), button('Screen', 'ct:screen', x),
+        ...opts.map((o, n) => button(`${n + 1}. ${o.label}`, 'ct:keys', x, o.keys.map((k) => k.toLowerCase()), n === 0 ? 'primary' : null, { a: 1, l: `${n + 1}. ${o.label}` })),
+        button('Esc', 'ct:keys', x, ['esc'], null, { a: 1, l: 'Esc' }), button('Full screen', 'ct:screen', x),
       ].slice(0, 25) });
     }
-    const r = await post(x.thread.channel, x.thread.ts, `${x.s.tmux ?? x.s.name} needs you: ${x.s.waitingFor}`, { blocks }, 0);
-    x.alert = { ts: r.ts, waitingFor: x.s.waitingFor };
+    const r = await post(x.thread.channel, x.thread.ts, `${mention()} ${name} needs you: ${title}`, { blocks }, 0);
+    x.alert = { ts: r.ts, waitingFor: x.s.waitingFor, title };
   }
 
-  function answered(x) {
+  /**
+   * The alert becomes a line saying how the prompt was answered: with a
+   * choice from here (said at once), or otherwise once it is gone.
+   */
+  function answered(x, chose = null) {
     const a = x.alert;
-    x.alert = null;
+    if (!a) return;
+    if (chose) a.chose = chose; else x.alert = null;
+    if (!chose && a.chose) return;   // it says so already
+    // A choice made here is known before the prompt goes, whichever comes first.
+    const label = chose ?? a.pending;
+    const how = label ? `you chose *${escape(label)}*` : 'answered at the terminal';
     send('chat.update', {
-      channel: x.thread.channel, ts: a.ts, text: `${a.waitingFor}: answered`,
-      blocks: [{ type: 'context', elements: [{ type: 'mrkdwn', text: `:ballot_box_with_check: ~needed you~ · ${escape(a.waitingFor)} · answered` }] }],
-    }, { priority: 2, key: `alert:${a.ts}` }).catch(() => {});
-  }
-
-  /** A turn asked for from Slack has ended: a long one gets a mention, so it is noticed. */
-  function finished(x) {
-    const t = x.turn;
-    x.turn = null;
-    if (Date.now() - t.at > 90_000) post(x.thread.channel, x.thread.ts, `:white_check_mark: ${mention()} finished after ${ago(Date.now() - t.at)}`).catch(() => {});
+      channel: x.thread.channel, ts: a.ts, text: `${a.title}: ${plain(how)}`,
+      blocks: [context(`:ballot_box_with_check: ${escape(a.title)} · ${how}`)],
+    }, { priority: chose ? 0 : 2, key: `alert:${a.ts}` }).catch(() => {});
   }
 
   /* --- acting on a session -------------------------------------------------- */
@@ -400,7 +533,7 @@ export function startBridge({ info = () => null, usage = () => '', here = 'this 
           x.muted = cmd === 'mute';
           q.mute.run(x.muted ? 1 : 0, x.s.sessionId);
           refreshCard(x, true);
-          return say(x.muted ? ':mute: _muted - only prompts that need you come through_' : ':sound: _unmuted_');
+          return meta(x, x.muted ? ':mute: muted - only prompts that need you come through' : ':sound: unmuted', 0);
         }
         if (cmd === 'screen' || cmd === 's') return showScreen(x, await act(x, { op: 'screen', sessionId: x.s.sessionId }));
         if (cmd === 'esc' || cmd === 'stop' || cmd === 'interrupt') {
@@ -414,22 +547,24 @@ export function startBridge({ info = () => null, usage = () => '', here = 'this 
         }
       }
       const typed = ctl ? `/${ctl[0]}${ctl[1] ? ` ${ctl[1]}` : ''}` : text;
+      if (x.s.status === 'waiting' && x.alert) x.alert.pending = 'Esc, then your reply';
       const files = await filesOf(ev);
       if (!typed && !files.length) return;
       x.sent.push({ norm: norm(typed), at: Date.now() });
       x.sent = x.sent.filter((m) => Date.now() - m.at < 15 * 60_000).slice(-20);
       const r = await act(x, { op: 'type', sessionId: x.s.sessionId, text: typed, files });
       if (r.typed && norm(r.typed) !== norm(typed)) x.sent.push({ norm: norm(r.typed), at: Date.now() });
-      x.turn = { at: Date.now(), ts: ev.ts };
+      x.asked = { at: Date.now(), ts: ev.ts };
       react(ev.channel, ev.ts, r.sent === false ? 'warning' : 'white_check_mark');
+      if (r.dismissed && x.alert?.pending) answered(x, x.alert.pending);
       const notes = [
-        r.dismissed && `_answered the open ${escape(r.dismissed)} with Esc first_`,
-        r.cleared && `_cleared what was in its input box first:_\n${escape(r.cleared).replace(/^/gm, '> ')}`,
-        ...(r.skipped ?? []).map((f) => `_${escape(f.name)} not attached: ${escape(f.skipped)}_`),
-        r.sent === false && '_typed, but it does not look sent - `;screen` to see_',
+        r.cleared && `cleared what was in its input box first: “${escape(clip(r.cleared, 300))}”`,
+        ...(r.skipped ?? []).map((f) => `${escape(f.name)} not attached: ${escape(f.skipped)}`),
+        r.sent === false && 'typed, but it does not look sent - `;screen` to see',
       ].filter(Boolean);
-      if (notes.length) await say(notes.join('\n'));
+      if (notes.length) await meta(x, notes.join('\n'), 0);
     } catch (err) {
+      if (x.alert) delete x.alert.pending;
       await fail(err);
     }
   }
@@ -442,7 +577,7 @@ export function startBridge({ info = () => null, usage = () => '', here = 'this 
     if (opts.length && x.s.controllable) {
       blocks.push({ type: 'actions', elements: opts.map((o, n) => button(`${n + 1}. ${o.label}`, 'ct:keys', x, o.keys.map((k) => k.toLowerCase()))) });
     }
-    return post(x.thread.channel, x.thread.ts, 'screen', { blocks }, 0);
+    return post(x.thread.channel, x.thread.ts, `Screen of ${x.s.tmux ?? x.s.name ?? 'the session'}`, { blocks }, 0);
   }
 
   /* --- commands outside threads ------------------------------------------ */
@@ -575,8 +710,17 @@ export function startBridge({ info = () => null, usage = () => '', here = 'this 
       if (kind === 'ct:screen') return await showScreen(x, await act(x, { op: 'screen', sessionId: x.s.sessionId }));
       if (kind === 'ct:unmute') { x.muted = false; q.mute.run(0, x.s.sessionId); refreshCard(x, true); return; }
       if (kind === 'ct:keys') {
-        await act(x, { op: 'keys', sessionId: x.s.sessionId, keys: v.k });
-        await post(x.thread.channel, x.thread.ts, `:ballot_box_with_check: pressed ${v.k.map((k) => `\`${escape(k)}\``).join(' ')}`, {}, 0);
+        // A choice on the prompt: the prompt says what you chose, in place.
+        const label = v.l ?? v.k.join(' ');
+        const onAlert = v.a && x.alert && payload.message?.ts === x.alert.ts;
+        if (onAlert) x.alert.pending = label;
+        try {
+          await act(x, { op: 'keys', sessionId: x.s.sessionId, keys: v.k });
+        } catch (err) {
+          if (onAlert && x.alert) delete x.alert.pending;
+          throw err;
+        }
+        if (onAlert && x.alert?.pending === label) answered(x, label);
       }
     } catch (err) {
       await post(x.thread.channel, x.thread.ts, `:x: ${escape(err.message)}`, {}, 0);

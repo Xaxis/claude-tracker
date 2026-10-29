@@ -422,11 +422,17 @@ Every Claude Code session running in a tmux pane - on this machine and on the
 machines it syncs with - gets a thread in one Slack channel. You can read it,
 answer it and drive it from your phone, as if you were at its keyboard.
 
-The thread's first message shows the session: its tmux session and title, whether
-it is working, idle or waiting on you, and its folder, account, context and machine.
-It stays current. Below it is the conversation as it happens: what was typed at the
-terminal, everything Claude writes, and a line for what it did in between
-(`ran npm test · edited 2 files`).
+The thread's first message shows the session: its tmux session and title, its folder,
+account, context and machine, and whether it is idle, working or waiting on you.
+While it works, that message shows what it last said and is doing now. It changes in
+place, and Slack never notifies anyone of an edit.
+
+Below it, each turn ends in **one message**. A grey line says what it did: `worked 4m
+· ran 12 commands, the last npm test · edited 3 files`, the prompt when it was typed
+at the terminal, and its shorter remarks along the way. Then comes Claude's answer.
+So a thread you follow pings your phone once a turn, not once a paragraph. A long
+write-up from the middle of a turn is posted when it is written, rather than held
+back. A long turn you asked for from Slack mentions you when it ends.
 
 - **A reply is typed into the session** and sent, exactly as at its keyboard. A
   message sent while Claude works is queued, as typing it in would queue it.
@@ -436,10 +442,11 @@ terminal, everything Claude writes, and a line for what it did in between
 - **`;esc`** interrupts. **`;screen`** shows the terminal. **`;keys 2`**,
   **`;keys down enter`** and **`;keys shift-tab`** press keys.
 - **When a session waits on you** - a permission prompt, a question, a dialog -
-  the thread shows its screen with a button for each choice, and mentions you,
-  so your phone tells you. A reply instead of a button answers the prompt with
-  Esc, then sends what you wrote. When a long turn you started from Slack
-  finishes, it mentions you again.
+  the thread mentions you and shows the question itself. That means the dialog's title, what
+  it is about, and the command in question as code, with a button for each
+  choice. The rest of the screen is one tap away, under *Full screen*. A choice
+  changes the alert in place, to `you chose 1. Yes`. A reply instead of a button
+  answers the prompt with Esc, then sends what you wrote.
 - **Files you attach** are saved on the session's machine, and their paths are
   added to the message, so Claude can open them.
 - **In the channel itself** (or a DM with the app): `list` shows every session
