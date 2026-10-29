@@ -422,6 +422,12 @@ Every Claude Code session running in a tmux pane - on this machine and on the
 machines it syncs with - gets a thread in one Slack channel. You can read it,
 answer it and drive it from your phone, as if you were at its keyboard.
 
+The newest message in the channel is always an **overview** of every session.
+What needs you comes first, then what is working, then what is idle, each a link to its
+thread, with each other machine's sessions under its name. It changes in place as
+sessions do. When something else is posted in the channel, the overview moves back to
+the bottom, so opening the channel always shows it.
+
 The thread's first message shows the session: its tmux session and title, its folder,
 account, context and machine, and whether it is idle, working or waiting on you.
 While it works, that message shows what it last said and is doing now. It changes in
@@ -439,6 +445,10 @@ back. A long turn you asked for from Slack mentions you when it ends.
   `!cmd` runs a shell command there, as it does in Claude Code.
 - **`;compact`, `;model opus`, `;clear`** run Claude Code's slash commands. Slack
   keeps a leading `/` for its own commands.
+- **More…** on a thread's first message is a menu with *Compact the conversation*,
+  *Switch model…*, *Change permission mode*, *Show context use*, and
+  *Mute this thread*. *Start over* asks first, and only you see the question.
+  Beside it, *Screen* shows the terminal and *Esc* interrupts.
 - **`;esc`** interrupts. **`;screen`** shows the terminal. **`;keys 2`**,
   **`;keys down enter`** and **`;keys shift-tab`** press keys.
 - **When a session waits on you** - a permission prompt, a question, a dialog -

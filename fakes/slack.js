@@ -54,6 +54,16 @@ export async function fakeSlack() {
           return ok({ channel: args.channel, ts: args.ts });
         }
         case 'reactions.add': return ok();
+        case 'chat.delete': {
+          if (!messages.has(args.ts)) return fail('message_not_found');
+          messages.delete(args.ts);
+          return ok({ channel: args.channel, ts: args.ts });
+        }
+        case 'chat.postEphemeral': return ok({ message_ts: `1700000000.${String(seq++).padStart(6, '0')}` });
+        case 'conversations.history': {
+          const top = [...messages.values()].filter((m) => m.channel === args.channel && !m.thread_ts).sort((a, b) => Number(b.ts) - Number(a.ts));
+          return ok({ messages: top.slice(0, Number(args.limit ?? 100)) });
+        }
         default: return fail('unknown_method');
       }
     });
@@ -113,6 +123,8 @@ export async function fakeSlack() {
     message(event) {
       return this.push('events_api', { event_id: `Ev${crypto.randomUUID()}`, event: { type: 'message', ts: `1800000000.${String(seq++).padStart(6, '0')}`, ...event } });
     },
+    /** The channel as it stands, newest last: what is there now, not everything ever posted. */
+    top: (channel) => [...messages.values()].filter((m) => m.channel === channel && !m.thread_ts).sort((a, b) => Number(a.ts) - Number(b.ts)),
     posts: (channel = null) => calls.filter((c) => c.method === 'chat.postMessage' && (!channel || c.args.channel === channel)).map((c) => c.args),
     close() { for (const s of sockets) s.destroy(); server.close(); },
   };

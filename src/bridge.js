@@ -43,6 +43,8 @@ export function bridgeStatus() {
 export const newPairCode = () => String(crypto.randomInt(100000, 1000000));
 
 const HELP = [
+  '*The channel*',
+  '• Its newest message is always an overview of every session - what needs you, what is working, what is idle - each a link to its thread.',
   '*How a thread reads*',
   '• Its first message shows the session, and what it is doing right now - it changes in place, so it never pings you.',
   '• Each turn ends in one message: what Claude did, in grey, then its answer. A prompt that needs you comes up as buttons, and mentions you.',
@@ -50,6 +52,7 @@ const HELP = [
   '• Anything you write is typed into the session and sent, as at its keyboard - `!cmd` runs a shell command there, as it would.',
   '• `;compact`, `;model opus`, `;clear` … run Claude Code\'s slash commands (Slack keeps `/` for its own).',
   '• `;esc` interrupts what it is doing. `;screen` shows its terminal. `;keys 2`, `;keys down enter`, `;keys shift-tab` press keys.',
+  '• *More…* on a thread\'s first message: compact, switch model, change permission mode, show context, mute, or start over.',
   '• `;mute` stops showing what it writes here (it still tells you when it needs you); `;unmute` starts again.',
   '• Writing while it waits on a prompt answers the prompt with Esc - no - and sends what you wrote instead. The buttons pick a choice.',
   '• Files you attach are saved on its machine, and their paths are added to the message.',
@@ -200,13 +203,27 @@ export function startBridge({ info = () => null, usage = () => '', here = 'this 
       { type: 'context', elements: [{ type: 'mrkdwn', text: `${facts}${facts ? '\n' : ''}${how}` }] },
     ];
     if (!x.ended && s.controllable) {
-      blocks.push({ type: 'actions', elements: [
-        button('Screen', 'ct:screen', x), button('Esc', 'ct:keys', x, ['esc']),
-        ...(x.muted ? [button('Unmute', 'ct:unmute', x)] : []),
-      ] });
+      blocks.push({ type: 'actions', elements: [button('Screen', 'ct:screen', x), button('Esc', 'ct:keys', x, ['esc']), menu(x)] });
+    } else if (!x.ended) {
+      blocks.push({ type: 'actions', elements: [x.muted ? button('Unmute', 'ct:unmute', x) : button('Mute', 'ct:mute', x)] });
     }
     const word = x.ended ? 'ended' : s.status === 'waiting' ? `waiting on you (${s.waitingFor})` : s.status === 'busy' ? 'working' : 'idle';
     return { text: `${name}: ${word}`, blocks };
+  }
+
+  /** Claude Code's slash commands worth a tap, and the thread's own settings. */
+  function menu(x) {
+    const opt = (text, c) => ({ text: { type: 'plain_text', text }, value: JSON.stringify({ m: x.machine ?? null, s: x.s.sessionId, c }) });
+    return {
+      type: 'static_select', action_id: `ct:menu:${crypto.randomBytes(3).toString('hex')}`,
+      placeholder: { type: 'plain_text', text: 'More…' },
+      options: [
+        opt('Compact the conversation', 'compact'), opt('Switch model…', 'model'),
+        opt('Change permission mode', 'mode'), opt('Show context use', 'context'),
+        x.muted ? opt('Unmute this thread', 'unmute') : opt('Mute this thread', 'mute'),
+        opt('Start over (/clear)…', 'clear'),
+      ],
+    };
   }
 
   function button(text, action, x, keys = null, style = null, extra = {}) {
@@ -228,6 +245,7 @@ export function startBridge({ info = () => null, usage = () => '', here = 'this 
     x.cardSig = sig; x.cardAt = Date.now();
     send('chat.update', { channel: x.thread.channel, ts: x.thread.ts, text: c.text, blocks: c.blocks }, { priority: 2, key: `card:${x.key}` })
       .catch((err) => slackFailed(err, 'chat.update'));
+    refreshOverview();
   }
 
   /** The thread a session is carried in: the one it had, or a new one. */
@@ -248,10 +266,119 @@ export function startBridge({ info = () => null, usage = () => '', here = 'this 
       x.cardSig = JSON.stringify(c.blocks); x.cardAt = Date.now();
       x.cardState = [x.ended, x.s.status, x.s.waitingFor, x.s.controllable, x.muted, machines.get(x.machine ?? '')?.online].join('|');
       q.put.run(x.s.sessionId, x.machine, r.channel, r.ts, nameOf(x.s), 0, Date.now());
+      toppled();
     }
     byThread.set(`${x.thread.channel}/${x.thread.ts}`, x.key);
     for (const l of launches.filter((l) => l.match(x))) l.found(x);
     return x.thread;
+  }
+
+  /* --- the overview ------------------------------------------------------ */
+
+  /**
+   * One message listing every session - what needs you, what is working, what
+   * is idle, and what runs on other machines - each a link to its thread. It
+   * is kept the newest message in the channel, so opening the channel shows
+   * it: edited in place as things change (which notifies no one), and moved
+   * to the bottom when something else is posted there.
+   */
+  let ov = null;
+  try { ov = JSON.parse(getMeta('slack_overview') ?? 'null'); } catch { /* none yet */ }
+  let ovTimer = null, moveTimer = null, ovSig = null;
+  const saveOv = (v) => { ov = v; try { setMeta('slack_overview', JSON.stringify(v)); } catch { /* next time */ } };
+  const at = (ts) => `<!date^${Math.floor(ts / 1000)}^{time}|${new Date(ts).toISOString().slice(11, 16)} UTC>`;
+
+  function overviewBlocks() {
+    const rows = [...live.values()].filter((x) => !x.ended && x.thread);
+    const entry = (x) => {
+      const s = x.s;
+      const l = link(x.thread.channel, x.thread.ts);
+      const name = l ? `<${l}|${escape(nameOf(s))}>` : `*${escape(nameOf(s))}*`;
+      const title = s.title ? `  ${escape(clip(s.title, 48))}` : '';
+      const since = s.statusAt ? ` since ${at(s.statusAt)}` : '';
+      const what = s.status === 'waiting' ? `*${escape(clip(x.alert?.title ?? s.waitingFor ?? 'waiting on you', 60))}*${since}`
+        : s.status === 'busy' ? `working${x.work?.at ? ` since ${at(x.work.at)}` : since}`
+          : `idle${s.statusAt ? ` since ${when(s.statusAt)}` : ''}`;
+      return `${EMOJI[s.status] ?? EMOJI.idle} ${name}${title} · ${what}`;
+    };
+    const rank = { waiting: 0, busy: 1 };
+    const order = (a, b) => (rank[a.s.status] ?? 2) - (rank[b.s.status] ?? 2) || (b.s.statusAt ?? 0) - (a.s.statusAt ?? 0);
+    const here = rows.filter((x) => !x.machine).sort(order);
+    const n = { waiting: 0, busy: 0, idle: 0 };
+    for (const x of rows) n[x.s.status === 'waiting' || x.s.status === 'busy' ? x.s.status : 'idle']++;
+    const counts = [
+      n.waiting && `${EMOJI.waiting} *${n.waiting} need${n.waiting === 1 ? 's' : ''} you*`,
+      n.busy && `${EMOJI.busy} ${n.busy} working`,
+      n.idle && `${EMOJI.idle} ${n.idle} idle`,
+    ].filter(Boolean);
+    const blocks = [{ type: 'section', text: { type: 'mrkdwn', text: `*Claude sessions*${counts.length ? `   ${counts.join('   ')}` : ' · none running'}` } }];
+    const group = (title, list) => {
+      if (!list.length) return;
+      // A section holds 3000 characters; a long group takes several.
+      let chunk = title ? [`*${title}*`] : [];
+      for (const line of list.map(entry)) {
+        if (chunk.join('\n').length + line.length > 2800) { blocks.push({ type: 'section', text: { type: 'mrkdwn', text: chunk.join('\n') } }); chunk = []; }
+        chunk.push(line);
+      }
+      if (chunk.length) blocks.push({ type: 'section', text: { type: 'mrkdwn', text: chunk.join('\n') } });
+    };
+    // Machine headings only when there is more than one machine.
+    group(machines.size > 1 ? `On ${escape(machines.get('')?.name ?? 'this machine')}` : null, here);
+    for (const m of [...machines.values()].filter((m) => m.id)) {
+      const theirs = rows.filter((x) => x.machine === m.id).sort(order);
+      const note = !m.online ? ' - not connected' : theirs.length && theirs.every((x) => !x.s.controllable) ? ' - read only: not in tmux' : '';
+      if (theirs.length || !m.online) group(`On ${escape(m.name)}${note}`, theirs);
+    }
+    blocks.push(context(`Reply in a session's thread to talk to it · \`new <folder>\` starts one · \`help\` · updated ${at(Date.now())}`));
+    const plainCounts = counts.map(plain).join(', ');
+    return { text: `Claude sessions: ${plainCounts || 'none running'}`, blocks };
+  }
+
+  /** Bring the overview up to date, a moment from now: changes come in bursts. */
+  function refreshOverview() {
+    if (!ready() || ovTimer) return;
+    ovTimer = setTimeout(async () => {
+      ovTimer = null;
+      if (!ready()) return;
+      const o = overviewBlocks();
+      const sig = JSON.stringify(o.blocks.slice(0, -1));
+      if (ov?.channel === cfg.channel && sig === ovSig) return;
+      ovSig = sig;
+      if (ov?.channel !== cfg.channel) return postOverview(o);
+      try {
+        await send('chat.update', { channel: ov.channel, ts: ov.ts, text: o.text, blocks: o.blocks }, { priority: 2, key: 'overview' });
+      } catch (err) {
+        // Deleted by hand, or too old to edit: post it anew.
+        if (['message_not_found', 'cant_update_message', 'edit_window_closed'].includes(err.code)) await postOverview(o);
+      }
+    }, 2000);
+    ovTimer.unref?.();
+  }
+
+  async function postOverview(o = overviewBlocks()) {
+    const old = ov;
+    const r = await send('chat.postMessage', { channel: cfg.channel, text: o.text, blocks: o.blocks, unfurl_links: false }, { priority: 1 });
+    saveOv({ channel: r.channel, ts: r.ts });
+    ovSig = JSON.stringify(o.blocks.slice(0, -1));
+    if (old?.channel && old.ts !== r.ts) send('chat.delete', { channel: old.channel, ts: old.ts }, { priority: 2 }).catch(() => {});
+  }
+
+  /** Something else went to the bottom of the channel: the overview follows, once things settle. */
+  function toppled() {
+    if (!ready()) return;
+    clearTimeout(moveTimer);
+    moveTimer = setTimeout(() => { moveTimer = null; if (ready()) postOverview().catch((err) => slackFailed(err, 'overview')); }, 8000);
+    moveTimer.unref?.();
+  }
+
+  /** On starting: is the overview still the newest message? */
+  async function checkOverview() {
+    if (!ready()) return;
+    if (ov?.channel !== cfg.channel) return toppled();
+    try {
+      const h = await send('conversations.history', { channel: cfg.channel, limit: 1 }, { priority: 2 });
+      if (h.messages?.[0]?.ts !== ov.ts) toppled(); else refreshOverview();
+    } catch { refreshOverview(); }
   }
 
   /* --- what sessions say ------------------------------------------------- */
@@ -318,6 +445,7 @@ export function startBridge({ info = () => null, usage = () => '', here = 'this 
         refreshCard(x);
       });
     }
+    refreshOverview();
     for (const x of gone) {
       if (seen.has(x.key) || !live.has(x.key)) continue;
       x.ended = true;
@@ -374,7 +502,14 @@ export function startBridge({ info = () => null, usage = () => '', here = 'this 
           }
           // What a slash command printed, with the command it answers.
           const cmd = x.command && Date.now() - x.command.at < 120_000 ? x.command : null;
-          if (!quiet || cmd?.mine) await meta(x, `${cmd ? `\`${escape(cmd.text)}\` → ` : ''}${escape(it.text)}`);
+          if (quiet && !cmd?.mine) continue;
+          const head = cmd ? `\`${escape(cmd.text)}\` →` : '';
+          // Output with lines of its own - a table, a list - keeps them, in code.
+          if (it.text.includes('\n')) {
+            await post(x.thread.channel, x.thread.ts, plain(`${cmd?.text ?? ''} ${it.text}`).slice(0, 150), {
+              blocks: [...(head ? [context(head)] : []), { type: 'section', text: { type: 'mrkdwn', text: `\`\`\`${escape(it.text).slice(0, 2800)}\`\`\`` } }],
+            });
+          } else await meta(x, `${head ? `${head} ` : ''}${escape(it.text)}`);
         }
       }
       // What arrives after it went idle finishes the turn.
@@ -479,6 +614,7 @@ export function startBridge({ info = () => null, usage = () => '', here = 'this 
     }
     const r = await post(x.thread.channel, x.thread.ts, `${mention()} ${name} needs you: ${title}`, { blocks }, 0);
     x.alert = { ts: r.ts, waitingFor: x.s.waitingFor, title };
+    refreshOverview();
   }
 
   /**
@@ -497,6 +633,7 @@ export function startBridge({ info = () => null, usage = () => '', here = 'this 
       channel: x.thread.channel, ts: a.ts, text: `${a.title}: ${plain(how)}`,
       blocks: [context(`:ballot_box_with_check: ${escape(a.title)} · ${how}`)],
     }, { priority: chose ? 0 : 2, key: `alert:${a.ts}` }).catch(() => {});
+    refreshOverview();
   }
 
   /* --- acting on a session -------------------------------------------------- */
@@ -518,6 +655,29 @@ export function startBridge({ info = () => null, usage = () => '', here = 'this 
     return out;
   }
 
+  /** Type into a session from here: kept so it is not echoed back, and a prompt it answers says so. */
+  async function typeIn(x, typed, files = []) {
+    if (x.s.status === 'waiting' && x.alert) x.alert.pending = 'Esc, then your reply';
+    x.sent.push({ norm: norm(typed), at: Date.now() });
+    x.sent = x.sent.filter((m) => Date.now() - m.at < 15 * 60_000).slice(-20);
+    try {
+      const r = await act(x, { op: 'type', sessionId: x.s.sessionId, text: typed, files });
+      if (r.typed && norm(r.typed) !== norm(typed)) x.sent.push({ norm: norm(r.typed), at: Date.now() });
+      if (r.dismissed && x.alert?.pending) answered(x, x.alert.pending);
+      return r;
+    } catch (err) {
+      if (x.alert) delete x.alert.pending;
+      throw err;
+    }
+  }
+
+  function setMuted(x, on) {
+    x.muted = on;
+    q.mute.run(on ? 1 : 0, x.s.sessionId);
+    refreshCard(x, true);
+    return meta(x, on ? ':mute: muted - only prompts that need you come through' : ':sound: unmuted', 0);
+  }
+
   /** A reply in a session's thread: typed in, or a `;` command. */
   async function reply(x, ev) {
     const t = x.thread;
@@ -529,12 +689,7 @@ export function startBridge({ info = () => null, usage = () => '', here = 'this 
       if (ctl) {
         const [cmd, rest] = ctl;
         if (cmd === 'help') return say(HELP);
-        if (cmd === 'mute' || cmd === 'unmute') {
-          x.muted = cmd === 'mute';
-          q.mute.run(x.muted ? 1 : 0, x.s.sessionId);
-          refreshCard(x, true);
-          return meta(x, x.muted ? ':mute: muted - only prompts that need you come through' : ':sound: unmuted', 0);
-        }
+        if (cmd === 'mute' || cmd === 'unmute') return setMuted(x, cmd === 'mute');
         if (cmd === 'screen' || cmd === 's') return showScreen(x, await act(x, { op: 'screen', sessionId: x.s.sessionId }));
         if (cmd === 'esc' || cmd === 'stop' || cmd === 'interrupt') {
           await act(x, { op: 'keys', sessionId: x.s.sessionId, keys: ['esc'] });
@@ -547,16 +702,11 @@ export function startBridge({ info = () => null, usage = () => '', here = 'this 
         }
       }
       const typed = ctl ? `/${ctl[0]}${ctl[1] ? ` ${ctl[1]}` : ''}` : text;
-      if (x.s.status === 'waiting' && x.alert) x.alert.pending = 'Esc, then your reply';
       const files = await filesOf(ev);
       if (!typed && !files.length) return;
-      x.sent.push({ norm: norm(typed), at: Date.now() });
-      x.sent = x.sent.filter((m) => Date.now() - m.at < 15 * 60_000).slice(-20);
-      const r = await act(x, { op: 'type', sessionId: x.s.sessionId, text: typed, files });
-      if (r.typed && norm(r.typed) !== norm(typed)) x.sent.push({ norm: norm(r.typed), at: Date.now() });
+      const r = await typeIn(x, typed, files);
       x.asked = { at: Date.now(), ts: ev.ts };
       react(ev.channel, ev.ts, r.sent === false ? 'warning' : 'white_check_mark');
-      if (r.dismissed && x.alert?.pending) answered(x, x.alert.pending);
       const notes = [
         r.cleared && `cleared what was in its input box first: “${escape(clip(r.cleared, 300))}”`,
         ...(r.skipped ?? []).map((f) => `${escape(f.name)} not attached: ${escape(f.skipped)}`),
@@ -564,7 +714,6 @@ export function startBridge({ info = () => null, usage = () => '', here = 'this 
       ].filter(Boolean);
       if (notes.length) await meta(x, notes.join('\n'), 0);
     } catch (err) {
-      if (x.alert) delete x.alert.pending;
       await fail(err);
     }
   }
@@ -660,8 +809,8 @@ export function startBridge({ info = () => null, usage = () => '', here = 'this 
       if (ev.subtype && ev.subtype !== 'file_share' && ev.subtype !== 'thread_broadcast') return;
       if (cfg.pair && !cfg.owner) return pairing(ev);
       if (cfg.pair && /\bpair\s+\d{6}\b/.test(ev.text ?? '')) return pairing(ev);
-      if (ev.user !== cfg.owner) return;
       const inThread = ev.thread_ts && ev.thread_ts !== ev.ts;
+      if (ev.user !== cfg.owner) { if (!inThread && ev.channel === cfg.channel) toppled(); return; }
       if (inThread) {
         const key = byThread.get(`${ev.channel}/${ev.thread_ts}`);
         const x = key && live.get(key);
@@ -676,6 +825,7 @@ export function startBridge({ info = () => null, usage = () => '', here = 'this 
         return;
       }
       if (forwarded) return;
+      if (ev.channel === cfg.channel) toppled();
       if (ev.channel === cfg.channel || ev.channel_type === 'im') return command(ev);
       return;
     }
@@ -687,7 +837,7 @@ export function startBridge({ info = () => null, usage = () => '', here = 'this 
 
   async function action(a, payload, forwarded) {
     let v;
-    try { v = JSON.parse(a.value); } catch { return; }
+    try { v = JSON.parse(a.value ?? a.selected_option?.value); } catch { return; }
     const kind = a.action_id.split(':').slice(0, 2).join(':');
     const channel = payload.channel?.id ?? payload.container?.channel_id;
     const thread = payload.message?.thread_ts ?? payload.message?.ts;
@@ -708,7 +858,14 @@ export function startBridge({ info = () => null, usage = () => '', here = 'this 
     }
     try {
       if (kind === 'ct:screen') return await showScreen(x, await act(x, { op: 'screen', sessionId: x.s.sessionId }));
-      if (kind === 'ct:unmute') { x.muted = false; q.mute.run(0, x.s.sessionId); refreshCard(x, true); return; }
+      if (kind === 'ct:unmute' || kind === 'ct:mute') return await setMuted(x, kind === 'ct:mute');
+      if (kind === 'ct:menu') return await chose(x, v.c, payload);
+      if (kind === 'ct:clear') {
+        // The confirmation was for you alone; it goes once answered.
+        if (payload.response_url) fetch(payload.response_url, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ delete_original: true }) }).catch(() => {});
+        await typeIn(x, '/clear');
+        return;
+      }
       if (kind === 'ct:keys') {
         // A choice on the prompt: the prompt says what you chose, in place.
         const label = v.l ?? v.k.join(' ');
@@ -724,6 +881,29 @@ export function startBridge({ info = () => null, usage = () => '', here = 'this 
       }
     } catch (err) {
       await post(x.thread.channel, x.thread.ts, `:x: ${escape(err.message)}`, {}, 0);
+    }
+  }
+
+  /** A choice from a card's More… menu. */
+  async function chose(x, c, payload) {
+    const typed = { compact: '/compact', model: '/model', context: '/context' }[c];
+    if (typed) return typeIn(x, typed);
+    if (c === 'mute' || c === 'unmute') return setMuted(x, c === 'mute');
+    if (c === 'mode') {
+      const r = await act(x, { op: 'keys', sessionId: x.s.sessionId, keys: ['shift-tab'] });
+      // Claude Code says which mode it is in at the foot of its screen.
+      const mode = (r.screen?.text ?? '').split('\n').reverse().find((l) => /mode on|accept edits on|plan mode/i.test(l));
+      return meta(x, `:arrows_counterclockwise: permission mode: ${escape(mode ? plain(mode).replace(/\(shift\+tab.*$/i, '').replace(/·.*$/, '').trim() : 'changed')}`, 0);
+    }
+    if (c === 'clear') {
+      // Starting over drops the conversation it carries: asked first, and only you see the question.
+      return send('chat.postEphemeral', {
+        channel: x.thread.channel, user: payload.user.id, thread_ts: x.thread.ts, text: `Start over in ${nameOf(x.s)}?`,
+        blocks: [
+          { type: 'section', text: { type: 'mrkdwn', text: `Start a new conversation in *${escape(nameOf(x.s))}*? It stays in this thread, and \`/resume\` brings the old one back.` } },
+          { type: 'actions', elements: [button('Start over', 'ct:clear', x, null, 'danger')] },
+        ],
+      }, { priority: 0 });
     }
   }
 
@@ -768,6 +948,7 @@ export function startBridge({ info = () => null, usage = () => '', here = 'this 
       },
     });
     for (const m of machines.values()) if (m.last) sessions(m.id, m.last);
+    setTimeout(() => checkOverview().catch(() => {}), 5000).unref?.();
   }
 
   // Setup and pairing write the config from another process; pick it up.
@@ -805,6 +986,7 @@ export function startBridge({ info = () => null, usage = () => '', here = 'this 
       if (!m) return;
       m.online = false; m.old = old; m.refused = refused;
       for (const x of live.values()) if (x.machine === (id ?? null)) refreshCard(x, true);
+      refreshOverview();
     },
     sessions(id, list) {
       const m = machines.get(id ?? '');
@@ -817,11 +999,11 @@ export function startBridge({ info = () => null, usage = () => '', here = 'this 
     /** One of the tracker's own alerts, said in the channel too. */
     notice(title, text) {
       if (!ready()) return;
-      post(cfg.channel, null, `:bell: *${escape(title)}*\n${escape(text)}`).catch(() => {});
+      post(cfg.channel, null, `:bell: *${escape(title)}*\n${escape(text)}`).then(toppled, () => {});
     },
     status: () => ({ ...status, threads: cfg?.channel ? q.count.get(cfg.channel).n : 0, backlog: api?.backlog ?? 0 }),
     stop() {
-      clearInterval(watcher); clearInterval(cards);
+      clearInterval(watcher); clearInterval(cards); clearTimeout(ovTimer); clearTimeout(moveTimer);
       sock?.stop(); api?.stop();
     },
   };

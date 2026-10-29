@@ -115,6 +115,10 @@ test('a running session gets a thread, and what it says shows there', { skip: !h
   assert.match(blocksText(one.root), /tmux `alpha:0\.0`/);
   const st = await m.get('/api/slack');
   assert.equal(st.state, 'connected');
+  // The overview: the newest message in the channel, listing the session with a link to its thread.
+  const ov = await until('the overview', () => slack.top('C1').at(-1)?.text?.startsWith('Claude sessions') && slack.top('C1').at(-1));
+  assert.match(blocksText(ov), /<https:\/\/test\.slack\.com\/archives\/C1\/p\d+\|alpha> · idle/);
+  one.ov = ov;
 });
 
 test('a reply in the thread is typed into the session, and its answer comes back', { skip: !hasTmux, timeout: 30_000 }, async () => {
@@ -163,6 +167,11 @@ test('a permission prompt: the screen and a button per choice, with a mention, a
   assert.ok(!/fake ·/.test(blocksText(alert)), 'the question, not the whole screen');
   const card = await until('the card to say it waits', () => slack.messages.get(one.root.ts)?.text === 'alpha: waiting on you (permission prompt)');
   assert.ok(card);
+  const ov = await until('the overview to say it needs you', () => {
+    const o = slack.top('C1').at(-1);
+    return /1 needs you/.test(blocksText(o)) && /alpha>[^·]* · \*Do you want to proceed\?\*/.test(blocksText(o)) && o;
+  });
+  assert.equal(ov.text, 'Claude sessions: 1 needs you');
   await sleep(2500);   // a prompt pauses the turn: nothing of it is posted while it waits
   assert.ok(!inThread(one.root.ts).some((p) => Number(p.ts) > Number(alert.ts)), 'nothing posted while it waits');
   const yes = actions[0];
@@ -221,6 +230,34 @@ test('a turn that ends with shells left running still ends, and the card says so
   await until('the card', () => /idle · shells running in the background/.test(blocksText(slack.messages.get(one.root.ts))), 5000);
 });
 
+test('the More… menu: commands, permission mode, and starting over only once confirmed', { skip: !hasTmux, timeout: 40_000 }, async () => {
+  const card = slack.messages.get(one.root.ts);
+  const pick = (c) => {
+    const menu = card.blocks.find((b) => b.type === 'actions').elements.find((e) => e.type === 'static_select');
+    const option = menu.options.find((o) => JSON.parse(o.value).c === c);
+    slack.push('interactive', { type: 'block_actions', user: { id: 'U1' }, channel: { id: 'C1' }, message: { ts: one.root.ts }, actions: [{ action_id: menu.action_id, selected_option: option }] });
+  };
+  pick('compact');
+  await until('/compact typed', () => prompts(one.s.transcript).some((p) => p.startsWith('<command-name>/compact</command-name>')));
+  pick('context');
+  const out = await until('/context output, in code', () => inThread(one.root.ts).find((p) => p.blocks?.some((b) => b.text?.text?.includes('```Context usage\n  messages  41k'))));
+  assert.match(blocksText(out), /`\/context` →/);
+  pick('mode');
+  await until('the mode changed', () => said(one.s.transcript).some((e) => e.type === 'permission-mode' && e.permissionMode === 'acceptEdits'));
+  await until('the thread says which mode', () => inThread(one.root.ts).find((p) => /permission mode: ⏵⏵ accept edits on/.test(blocksText(p))));
+  const before = prompts(one.s.transcript).length;
+  pick('clear');
+  const ask = await until('the confirmation', () => slack.calls.find((c) => c.method === 'chat.postEphemeral' && c.args.user === 'U1'));
+  await sleep(1000);
+  assert.equal(prompts(one.s.transcript).length, before, 'nothing typed until confirmed');
+  const yes = ask.args.blocks.find((b) => b.type === 'actions').elements[0];
+  assert.equal(yes.style, 'danger');
+  slack.push('interactive', { type: 'block_actions', user: { id: 'U1' }, channel: { id: 'C1' }, message: { ts: 'ephemeral' }, actions: [{ action_id: yes.action_id, value: yes.value }] });
+  await until('/clear typed', () => prompts(one.s.transcript).some((p) => p.startsWith('<command-name>/clear</command-name>')));
+  pick('mode'); pick('mode');   // back to where it was, for the tests after
+  await until('mode back', () => said(one.s.transcript).filter((e) => e.type === 'permission-mode').at(-1)?.permissionMode === 'default');
+});
+
 test('nobody but the owner is listened to', { skip: !hasTmux, timeout: 30_000 }, async () => {
   slack.message({ channel: 'C1', user: 'U2', text: 'not from the owner', thread_ts: one.root.ts });
   slack.push('interactive', { type: 'block_actions', user: { id: 'U2' }, channel: { id: 'C1' }, message: { ts: 'x', thread_ts: one.root.ts }, actions: [{ action_id: 'ct:keys:000000', value: JSON.stringify({ m: null, s: SESSION, k: ['esc'] }) }] });
@@ -251,6 +288,13 @@ test('a session that ended while the tracker was down has its thread closed when
   m.start();
   m.claude('gamma', 'cccccccc-1111-2222-3333-444444444444');
   const root = await until('gamma\'s thread', () => slack.posts('C1').find((p) => !p.thread_ts && /^gamma: idle/.test(p.text)));
+  // A new card went to the bottom of the channel; the overview follows it there, and the old one goes.
+  const moved = await until('the overview below the new card', () => {
+    const o = slack.top('C1').at(-1);
+    return o?.text?.startsWith('Claude sessions') && Number(o.ts) > Number(root.ts) && o;
+  });
+  assert.match(blocksText(moved), /gamma>/);
+  assert.equal(slack.top('C1').filter((p) => p.text?.startsWith('Claude sessions')).length, 1, 'one overview');
   await new Promise((r) => { m.proc.once('exit', r); m.proc.kill(); });
   tmux('send-keys', '-t', 'gamma', '-l', '/exit');
   tmux('send-keys', '-t', 'gamma', 'Enter');

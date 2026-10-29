@@ -211,8 +211,9 @@ export function readEntry(e, state) {
     }
     const stdout = text.match(/<local-command-stdout>([\s\S]*?)<\/local-command-stdout>/);
     if (stdout) {
-      const t = stripAnsi(stdout[1]).trim();
-      if (t) out.push({ kind: 'note', text: short(t, 1500), at, uuid: e.uuid });
+      // Clipped with its lines kept: command output is often a table.
+      const t = stripAnsi(stdout[1]).replace(/[ \t]+$/gm, '').trim();
+      if (t) out.push({ kind: 'note', text: t.length > 1500 ? `${t.slice(0, 1499)}…` : t, at, uuid: e.uuid });
       return out;
     }
     // Only what a person typed. Newer versions say where each prompt came from,

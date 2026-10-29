@@ -26,6 +26,8 @@ fs.mkdirSync(path.dirname(registry), { recursive: true });
 let input = '', status = 'idle', waitingFor = null, menu = null, timer = null, log = [];
 const queued = [];   // typed while it works: taken once the turn is over, as Claude Code does
 let titled = false;
+const MODES = ['default', 'acceptEdits', 'plan'];
+let mode = 'default';
 const pane = process.env.TMUX_PANE;
 
 function register() {
@@ -49,7 +51,7 @@ function draw() {
     const lines = input.split('\n');
     out += `${rule}\r\n❯ ${input ? lines[0] : '\x1b[2mTry "something"\x1b[0m'}\r\n`;
     for (const l of lines.slice(1)) out += `  ${l}\r\n`;
-    out += `${rule}\r\n  fake · ${status}\r\n`;
+    out += `${rule}\r\n  fake · ${status}\r\n  ${mode === 'default' ? '⏸ manual mode on' : mode === 'plan' ? '⏸ plan mode on' : '⏵⏵ accept edits on'} (shift+tab to cycle)\r\n`;
   }
   process.stdout.write(out);
 }
@@ -71,7 +73,8 @@ function submit(text) {
   if (!titled) { titled = true; write({ type: 'ai-title', aiTitle: `Fake ${text.split('\n')[0].slice(0, 30)}` }); }
   // A slash command prints what it did, as Claude Code's do, and Claude says nothing.
   if (command) {
-    write({ type: 'user', message: { content: `<local-command-stdout>ran /${command[1]}</local-command-stdout>` } });
+    const out = command[1] === 'context' ? 'Context usage\n  messages  41k\n  free     920k' : `ran /${command[1]}`;
+    write({ type: 'user', message: { content: `<local-command-stdout>${out}</local-command-stdout>` } });
     draw();
     return;
   }
@@ -124,6 +127,13 @@ process.stdin.on('data', (d) => {
       continue;
     }
     if (s.startsWith('\x1b[3~')) { s = s.slice(4); continue; }                 // Delete
+    if (s.startsWith('\x1b[Z')) {                                             // Shift-Tab: the next permission mode
+      s = s.slice(3);
+      mode = MODES[(MODES.indexOf(mode) + 1) % MODES.length];
+      write({ type: 'permission-mode', permissionMode: mode });
+      draw();
+      continue;
+    }
     if (s[0] === '\x1b') {                                                     // Esc
       s = s.slice(1);
       if (menu) { menu = null; clearTimeout(timer); say('denied'); setStatus('idle'); }
