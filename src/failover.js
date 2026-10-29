@@ -222,6 +222,8 @@ export function plan(ov, live, settings = failoverSettings(), now = Date.now(), 
       : turnOf(options.filter((x) => String(rank(x)) === String(rank(options[0]))));
     // In order: where it goes, then where it goes if that fails.
     const order = first ? [first, ...options.filter((x) => x.accountUuid !== first.accountUuid)] : [];
+    // Refused here, should every one of those fail to switch to: a spare too low to pick still beats refused.
+    const fallback = isOut ? usable.filter((x) => !order.some((o) => o.accountUuid === x.accountUuid)).sort((x, y) => y.room * y.capacity - x.room * x.capacity) : [];
     // Out, but back within the wait: not worth a switch.
     const freesAt = isOut ? (own?.until ?? a?.available.at ?? null) : null;
     const soon = freesAt != null && freesAt - now < settings.waitMin * 60e3;
@@ -234,6 +236,8 @@ export function plan(ov, live, settings = failoverSettings(), now = Date.now(), 
       spentUntil: own?.out ? own.until : null,
       target: order[0] ? shape(order[0]) : null,
       then: order.slice(1, 4).map(shape),
+      // Every spare to try, in turn, when it switches.
+      tries: [...order, ...fallback].map(shape),
     });
   }
   const covered = new Set([...held.map((s) => s.accountUuid), ...entries.map((e) => e.account)]);
@@ -313,7 +317,7 @@ export function runFailover(ov, live, now = Date.now()) {
     // Not to come back to this account before it resets, whatever its numbers say.
     if (e.spentUntil) markSpent(e.account, e.spentUntil);
     // The first that works: a spare that fails to switch to, the next one is tried.
-    for (const t of [e.target, ...e.then]) {
+    for (const t of e.tries) {
       const m = switchProfile(e, t);
       made.push(m);
       if (m.status === 'switched') break;

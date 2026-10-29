@@ -300,6 +300,9 @@ export async function serve({ port = 4785, open = false, refresh, fastRefresh, a
         const names = new Map(ov.accounts.map((a) => [a.accountUuid, a.label]));
         const made = runFailover(ov, live);
         for (const m of made) {
+          // A switch failing the same way every tick is said once an hour, not every 20 seconds.
+          const why = `${m.profile}|${m.to_account}|${m.error}`;
+          if (m.status !== 'switched') { if (Date.now() - (told.get(why) ?? 0) < 3600e3) continue; told.set(why, Date.now()); }
           send(m.status === 'switched' ? 'Claude switched accounts' : 'Claude could not switch accounts',
             m.status === 'switched'
               ? `${names.get(m.from_account) ?? 'The account'} ran low; its sessions carry on as ${names.get(m.to_account) ?? 'another account'}.`

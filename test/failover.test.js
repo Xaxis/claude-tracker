@@ -122,9 +122,12 @@ test('nothing switches while failover is off, below the threshold, or when the a
   assert.deepEqual(out, { off: 0, below: 0, soon: 0, still: 'A' });
 });
 
-test('on macOS the sign-in moves between Keychain items named as Claude Code names them', () => {
-  const root = scratch();
-  // A stand-in for security(1): items in a JSON file, keyed by service and account.
+/**
+ * A stand-in for security(1): items in a JSON file, keyed by service and account.
+ * Like the real one, `security -i` reads each command into a 4 KB line, and one
+ * longer than that is not carried out.
+ */
+function fakeSecurity(root) {
   const items = path.join(root, 'keychain.json');
   const security = path.join(root, 'security');
   fs.writeFileSync(security, `#!${process.execPath}
@@ -132,11 +135,23 @@ const fs = require('fs'); const f = ${JSON.stringify(items)};
 const db = fs.existsSync(f) ? JSON.parse(fs.readFileSync(f, 'utf8')) : {};
 const opt = (args, k) => args[args.indexOf(k) + 1];
 let args = process.argv.slice(2);
-if (args[0] === '-i') args = fs.readFileSync(0, 'utf8').trim().match(/"[^"]*"|\\S+/g).map((x) => x.replace(/^"|"$/g, ''));
+if (args[0] !== 'find-generic-password') fs.appendFileSync(f + '.calls', (args[0] === '-i' ? 'stdin' : 'args') + '\\n');
+if (args[0] === '-i') {
+  const line = fs.readFileSync(0, 'utf8').split('\\n')[0];
+  if (line.length > 4095) { process.stderr.write('security: line too long\\n'); process.exit(0); }
+  args = line.match(/"[^"]*"|\\S+/g).map((x) => x.replace(/^"|"$/g, ''));
+}
 const key = opt(args, '-s') + '|' + opt(args, '-a');
 if (args[0] === 'find-generic-password') { if (!(key in db)) process.exit(44); process.stdout.write(db[key]); }
+else if (args[0] === 'add-generic-password' && opt(args, '-s') === process.env.FAKE_SECURITY_DROP) process.exit(0);
 else if (args[0] === 'add-generic-password') { db[key] = Buffer.from(opt(args, '-X'), 'hex').toString('utf8'); fs.writeFileSync(f, JSON.stringify(db)); }
 `, { mode: 0o755 });
+  return { items, security };
+}
+
+test('on macOS the sign-in moves between Keychain items named as Claude Code names them', () => {
+  const root = scratch();
+  const { items, security } = fakeSecurity(root);
   const user = os.userInfo().username;
   const hash = (dir) => crypto.createHash('sha256').update(dir).digest('hex').slice(0, 8);
   const spareDir = path.join(root, '.claude-pool-b'), outDir = path.join(root, '.claude-pool-a');
@@ -163,6 +178,68 @@ else if (args[0] === 'add-generic-password') { db[key] = Buffer.from(opt(args, '
   assert.deepEqual(item('Claude Code-credentials').mcpOAuth, { x: 1 }, "the profile's other tokens stay");
   assert.equal(item(`Claude Code-credentials-${hash(spareDir)}`).claudeAiOauth, undefined);
   assert.equal(item(`Claude Code-credentials-${hash(outDir)}`).claudeAiOauth.refreshToken, 'rt-A');
+});
+
+test('on macOS a sign-in too long for one security -i line still moves, as arguments', () => {
+  const root = scratch();
+  const { items, security } = fakeSecurity(root);
+  const user = os.userInfo().username;
+  const hash = (dir) => crypto.createHash('sha256').update(dir).digest('hex').slice(0, 8);
+  const spareDir = path.join(root, '.claude-pool-b');
+  // A profile several MCP servers have signed into: its Keychain item runs past 4 KB as hex.
+  const mcpOAuth = Object.fromEntries(['linear', 'slack', 'github', 'notion', 'sentry', 'figma'].map((n) => [n,
+    { serverName: n, serverUrl: `https://mcp.${n}.com/mcp`, accessToken: n.repeat(40).slice(0, 180), refreshToken: n.repeat(40).slice(0, 180), expiresAt: 1 }]));
+  fs.writeFileSync(items, JSON.stringify({
+    [`Claude Code-credentials|${user}`]: JSON.stringify({ claudeAiOauth: { accessToken: 'at-A', refreshToken: 'rt-A' }, mcpOAuth }),
+    [`Claude Code-credentials-${hash(spareDir)}|${user}`]: JSON.stringify({ claudeAiOauth: { accessToken: 'at-B', refreshToken: 'rt-B' } }),
+  }));
+  const out = inChild(root, `
+    const main = { dir: path.join(HOME, '.claude'), isDefault: true };
+    fs.mkdirSync(main.dir, { recursive: true });
+    fs.writeFileSync(path.join(HOME, '.claude.json'), JSON.stringify({ oauthAccount: account('A', 'a@x.com') }));
+    const spare = { dir: path.join(HOME, '.claude-pool-b'), isDefault: false };
+    fs.mkdirSync(spare.dir, { recursive: true });
+    fs.writeFileSync(path.join(spare.dir, '.claude.json'), JSON.stringify({ oauthAccount: account('B', 'b@x.com') }));
+    const outgoing = { dir: path.join(HOME, '.claude-pool-a'), isDefault: false };
+    fs.mkdirSync(outgoing.dir, { recursive: true });
+    const r = S.switchSignin(main, spare, outgoing, 'darwin');
+    return { to: r.to.accountUuid };
+  `, { USER: user, CLAUDE_TRACKER_SECURITY: security });
+  assert.equal(out.to, 'B');
+  const item = JSON.parse(JSON.parse(fs.readFileSync(items, 'utf8'))[`Claude Code-credentials|${user}`]);
+  assert.equal(item.claudeAiOauth.refreshToken, 'rt-B');
+  assert.deepEqual(item.mcpOAuth, mcpOAuth, "the MCP servers' tokens stay");
+  // Short items still go through stdin, so their secret is never on a command line.
+  assert.deepEqual(fs.readFileSync(`${items}.calls`, 'utf8').trim().split('\n'), ['stdin', 'args', 'stdin']);
+});
+
+test('on macOS a write the Keychain drops is caught: nothing switches and no sign-in is lost', () => {
+  const root = scratch();
+  const { items, security } = fakeSecurity(root);
+  const user = os.userInfo().username;
+  const hash = (dir) => crypto.createHash('sha256').update(dir).digest('hex').slice(0, 8);
+  const spareDir = path.join(root, '.claude-pool-b');
+  fs.writeFileSync(items, JSON.stringify({
+    [`Claude Code-credentials|${user}`]: JSON.stringify({ claudeAiOauth: { accessToken: 'at-A', refreshToken: 'rt-A' } }),
+    [`Claude Code-credentials-${hash(spareDir)}|${user}`]: JSON.stringify({ claudeAiOauth: { accessToken: 'at-B', refreshToken: 'rt-B' } }),
+  }));
+  const out = inChild(root, `
+    const main = { dir: path.join(HOME, '.claude'), isDefault: true, shown: '~/.claude' };
+    fs.mkdirSync(main.dir, { recursive: true });
+    fs.writeFileSync(path.join(HOME, '.claude.json'), JSON.stringify({ oauthAccount: account('A', 'a@x.com') }));
+    const spare = { dir: path.join(HOME, '.claude-pool-b'), isDefault: false };
+    fs.mkdirSync(spare.dir, { recursive: true });
+    fs.writeFileSync(path.join(spare.dir, '.claude.json'), JSON.stringify({ oauthAccount: account('B', 'b@x.com') }));
+    const outgoing = { dir: path.join(HOME, '.claude-pool-a'), isDefault: false };
+    fs.mkdirSync(outgoing.dir, { recursive: true });
+    let error = null;
+    try { S.switchSignin(main, spare, outgoing, 'darwin'); } catch (err) { error = err.message; }
+    return { error, main: S.readSignin(main, 'darwin'), spare: S.readSignin(spare, 'darwin') };
+  `, { USER: user, CLAUDE_TRACKER_SECURITY: security, FAKE_SECURITY_DROP: 'Claude Code-credentials' });
+  assert.equal(out.error, "~/.claude did not take b@x.com's sign-in, so it stays on a@x.com");
+  assert.equal(out.main.oauth.refreshToken, 'rt-A');
+  assert.equal(out.main.account.accountUuid, 'A', 'its account details go back with its tokens');
+  assert.equal(out.spare.oauth.refreshToken, 'rt-B', 'the spare keeps its sign-in');
 });
 
 test('a lock Claude Code left behind is taken over once stale', () => {
@@ -303,6 +380,25 @@ test('refused right after a switch, it switches again at once, never back to the
   assert.deepEqual(out.made, ['failed', 'switched'], 'the next spare is tried when one fails');
   assert.notEqual(out.on, 'b@x.com');
   assert.equal(out.spentB, true, 'B is not offered again before it resets');
+});
+
+test('refused, with the one spare that has real room failing to switch to: one with less room beats staying refused', () => {
+  const root = scratch();
+  const out = inChild(root, `${SETUP}
+    db().prepare("UPDATE utilization SET pct = 92 WHERE account_uuid = 'C' AND limit_type = 'five_hour'").run();   // C: too low to pick while B has room
+    db().prepare("INSERT INTO limit_events (ts, session_id, account_uuid, limit_type, resets_at, status, config_dir) VALUES (?, 'sess-1', 'A', 'five_hour', ?, 'rejected', ?)")
+      .run(now - MIN, Math.round((now + 4 * HOUR) / 1000), main);
+    F.setFailover({ mode: 'auto', at: 90 });
+    const p = F.plan(api.overview(), api.liveSessions()).entries[0];
+    fs.rmSync(path.join(p.target.dir, '.credentials.json'));   // B's spare lost its token
+    const made = F.runFailover(api.overview(), api.liveSessions());
+    return { out: p.out, target: p.target.label, then: p.then.map((t) => t.label), made: made.map((m) => m.status), on: read(path.join(HOME, '.claude.json')).oauthAccount.emailAddress };
+  `);
+  assert.equal(out.out, true, 'refused in the profile');
+  assert.equal(out.target, 'b@x.com');
+  assert.deepEqual(out.then, [], 'C is not offered while B has room');
+  assert.deepEqual(out.made, ['failed', 'switched']);
+  assert.equal(out.on, 'c@x.com');
 });
 
 test('room on a bigger plan counts for more, and it says when another account is needed', () => {

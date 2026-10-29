@@ -164,6 +164,8 @@ main {
   gap: 12px; flex-wrap: wrap; margin-bottom: 12px;
 }
 .panel-note { margin: 0; font-size: 12px; color: var(--text-muted); }
+.panel-note.is-bad  { color: var(--critical); }
+.panel-note.is-warn { color: var(--warning); }
 .panel-link { color: var(--accent, inherit); text-decoration: underline; text-underline-offset: 2px; white-space: nowrap; }
 .panel-row { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
 

@@ -194,6 +194,22 @@ test('another machine’s GPU and CPU pool show as it last reported them', () =>
   assert.deepEqual(r.map((b) => [b.machine, b.gpu.waiting[0].session]), [['devbox', 'cw']]);
 });
 
+test('another machine’s failed switches arrive with their reason, a failure repeated every tick as one row', () => {
+  const root = scratch();
+  const r = inChild(root, `
+    const R = await import('${SRC}replica.js');
+    db().prepare('INSERT INTO sync_machines (machine_id, name, last_seen) VALUES (?,?,?)').run('m2', 'Mac', now);
+    const failed = (ts) => ({ ts, profile: '~/.claude', from: 'b@x.com', to: 'u@x.com', status: 'failed', error: 'the Keychain would not take it' });
+    R.saveState('m2', { running: [], profiles: [], failover: { mode: 'auto', at: 90, entries: [], notices: [],
+      switches: [failed(now - 20e3), failed(now - 40e3), failed(now - 60e3), { ts: now - HOUR, profile: '~/.claude', from: 'a@x.com', to: 'b@x.com', status: 'switched' }] } });
+    return api.overview().failover.recent.map((m) => [m.machine, m.status, m.to, m.times, m.error ?? null]);
+  `);
+  assert.deepEqual(r, [
+    ['Mac', 'failed', 'u@x.com', 3, 'the Keychain would not take it'],
+    ['Mac', 'switched', 'b@x.com', 1, null],
+  ]);
+});
+
 test('re-written caches are counted for subagents and the main thread apart, and the advice goes once subagents keep an hour', () => {
   const root = scratch();
   const r = inChild(root, `

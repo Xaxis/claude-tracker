@@ -632,10 +632,12 @@ async function cmdFailover(action, args, flags) {
   console.log(`\n${c.bold}Failover${c.reset}  ${s.mode === 'auto' ? `${c.green}on${c.reset} at ${s.at}%` : `${c.dim}off${c.reset} ${c.dim}(claude-tracker failover on)${c.reset}`}${s.prefer ? ` ${c.dim}· prefers ${s.prefer}${c.reset}` : ''}\n`);
   printPlan(p, 'this machine', s);
   for (const r of ov.failover.remote) { console.log(); printPlan(r, r.machine, { at: r.at }); }
-  if (ov.failover.switches.length) {
+  const recent = ov.failover.recent.filter((m) => Date.now() - m.ts < 24 * 3600e3);
+  if (recent.length) {
     console.log(`\n${c.bold}Switched today${c.reset}`);
-    for (const m of ov.failover.switches) {
-      console.log(`  ${when(m.ts)}  ${m.profile} ${c.dim}${m.from} →${c.reset} ${m.to}${m.status === 'switched' ? '' : `  ${c.red}${m.error}${c.reset}`}`);
+    for (const m of recent) {
+      const failed = m.status === 'switched' ? '' : `  ${c.red}failed${m.times > 1 ? ` ×${m.times}` : ''}: ${m.error ?? 'no reason given'}${c.reset}`;
+      console.log(`  ${when(m.ts)}  ${m.profile}${m.machine ? ` on ${m.machine}` : ''} ${c.dim}${m.from} →${c.reset} ${m.to}${failed}`);
     }
   }
   console.log();

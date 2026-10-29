@@ -171,10 +171,11 @@ function failoverLines(f, here, now) {
     }
     if (p.local && p.best) rows.push(`    ${C.muted}${p.best.label} has ${Math.round(p.best.room)}% free: claude-tracker pool add ${p.best.email}${C.reset}`);
   }
-  for (const m of (f.switches ?? []).filter((x) => now - x.ts < 6 * 3600e3).slice(0, 3)) {
+  for (const m of (f.recent ?? f.switches ?? []).filter((x) => now - x.ts < 6 * 3600e3).slice(0, 3)) {
+    const where = `${m.profile}${m.machine ? ` on ${m.machine}` : ''}`;
     rows.push(m.status === 'switched'
-      ? `    ${C.good}switched${C.reset} ${m.profile} ${m.from} → ${m.to}`
-      : `    ${C.critical}could not switch${C.reset} ${m.profile}: ${C.muted}${m.error}${C.reset}`);
+      ? `    ${C.good}switched${C.reset} ${where} ${m.from} → ${m.to}`
+      : `    ${C.critical}could not switch${C.reset} ${where} to ${m.to}${m.times > 1 ? ` ×${m.times}` : ''}: ${C.muted}${m.error ?? 'no reason given'}${C.reset}`);
   }
   if (!rows.length) return [];
   const pick = f.prefer ? ` · prefers ${f.prefer}` : '';

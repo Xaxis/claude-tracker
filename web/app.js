@@ -624,8 +624,11 @@ function renderFailover(ov) {
     }
     if (p.local && p.best) host.append(el('p', 'panel-note', `${p.best.label} has ${Math.round(p.best.room)}% free and no spare here: claude-tracker pool add ${p.best.email}`));
   }
-  for (const m of (f?.switches ?? []).filter((x) => Date.now() - x.ts < 6 * 3600e3).slice(0, 3)) {
-    host.append(el('p', 'panel-note', m.status === 'switched' ? `Switched ${m.profile} from ${m.from} to ${m.to}.` : `Could not switch ${m.profile}: ${m.error}`));
+  for (const m of (f?.recent ?? f?.switches ?? []).filter((x) => Date.now() - x.ts < 6 * 3600e3).slice(0, 3)) {
+    const where = `${m.profile}${m.machine ? ` on ${m.machine}` : ''}`;
+    host.append(m.status === 'switched'
+      ? el('p', 'panel-note', `Switched ${where} from ${m.from} to ${m.to}.`)
+      : el('p', 'panel-note is-bad', `Could not switch ${where} to ${m.to}${m.times > 1 ? ` (${m.times} tries)` : ''}: ${m.error ?? 'no reason given'}`));
   }
   $('#failover-mode').textContent = f?.mode === 'auto' ? `on at ${f.at}%` : 'off · claude-tracker failover on';
   $('#failover').hidden = !host.childNodes.length;

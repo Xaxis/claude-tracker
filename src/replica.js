@@ -457,7 +457,7 @@ export function saveState(id, state) {
       level: n?.level === 'bad' ? 'bad' : 'warn', text: clean(n?.text, 300), fix: clean(n?.fix, 300),
     })),
     switches: (Array.isArray(f.switches) ? f.switches : []).slice(0, 20).map((m) => ({
-      ts: num(m?.ts), profile: clean(m?.profile), from: clean(m?.from), to: clean(m?.to), status: clean(m?.status, 10),
+      ts: num(m?.ts), profile: clean(m?.profile), from: clean(m?.from), to: clean(m?.to), status: clean(m?.status, 10), error: clean(m?.error, 300),
     })),
   } : null;
   // Which tracker it runs. One that sends no build predates builds; one that

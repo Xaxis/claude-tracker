@@ -21,6 +21,8 @@ import { configFileOf } from './paths.js';
  */
 
 const LOCK_STALE_MS = 15_000;
+/** The longest command Claude Code sends through `security -i`; longer ones go as arguments. */
+const SECURITY_LINE_MAX = 4032;
 
 /** Run `fn` holding the profile's secure-storage write lock. */
 export function withStorageLock(dir, fn) {
@@ -86,9 +88,12 @@ export function storeOf(profile, platform = process.platform) {
       }
     },
     write(data) {
-      // As Claude Code does: through stdin, so the secret is never on a command line.
+      // As Claude Code does: through stdin, so the secret is never on a command line -
+      // unless it is too long for the 4 KB line `security -i` reads, which would drop it.
       const hex = Buffer.from(JSON.stringify(data), 'utf8').toString('hex');
-      execFileSync(security, ['-i'], { input: `add-generic-password -U -a "${account}" -s "${service}" -X "${hex}"\n`, stdio: ['pipe', 'ignore', 'pipe'], timeout: 10_000 });
+      const line = `add-generic-password -U -a "${account}" -s "${service}" -X "${hex}"\n`;
+      if (line.length <= SECURITY_LINE_MAX) execFileSync(security, ['-i'], { input: line, stdio: ['pipe', 'ignore', 'pipe'], timeout: 10_000 });
+      else execFileSync(security, ['add-generic-password', '-U', '-a', account, '-s', service, '-X', hex], { stdio: ['ignore', 'ignore', 'pipe'], timeout: 10_000 });
     },
   };
 }
@@ -151,7 +156,12 @@ export function switchSignin(profile, spare, outgoing, platform = process.platfo
       if (saved?.oauth.refreshToken !== current.oauth.refreshToken) throw new Error(`could not save ${current.account.emailAddress}'s sign-in, so nothing was switched`);
     }
     writeSignin(profile, incoming, platform);
-    if (readSignin(profile, platform)?.account.accountUuid !== incoming.account.accountUuid) throw new Error('the profile did not take the new sign-in');
+    // The tokens, not only the account details beside them: a write the store dropped leaves the old ones.
+    const taken = readSignin(profile, platform);
+    if (taken?.oauth.refreshToken !== incoming.oauth.refreshToken || taken.account.accountUuid !== incoming.account.accountUuid) {
+      if (current) { try { writeSignin(profile, current, platform); } catch { /* its own copy is saved in outgoing */ } }
+      throw new Error(`${profile.shown ?? profile.dir} did not take ${incoming.account.emailAddress}'s sign-in, so it stays on ${current?.account.emailAddress ?? 'none'}`);
+    }
     writeSignin(spare, null, platform);
     return { from: current?.account ?? null, to: incoming.account };
   }));

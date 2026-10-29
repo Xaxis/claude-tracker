@@ -549,7 +549,7 @@ export function localState() {
         then: (e.then ?? []).map((t) => ({ label: t.label, room: t.room })),
       })),
       notices: (f.plan?.notices ?? []).map((n) => ({ level: n.level, text: n.text, fix: n.fix })),
-      switches: f.switches.map((m) => ({ ts: m.ts, profile: m.profile, from: m.from, to: m.to, status: m.status })),
+      switches: f.switches.map((m) => ({ ts: m.ts, profile: m.profile, from: m.from, to: m.to, status: m.status, error: m.error })),
     },
   };
 }
@@ -568,7 +568,24 @@ function failoverSummary(now = Date.now()) {
     to: names.get(m.to_account) ?? m.to_account, status: m.status, error: m.error,
   }));
   const remote = remoteMachines(now).filter((m) => m.failover).map((m) => ({ machine: m.name, ...m.failover }));
-  return { ...failoverSettings(), plan: cached, switches, remote };
+  return { ...failoverSettings(), plan: cached, switches, remote, recent: recentAll(switches, remote) };
+}
+
+/**
+ * Every machine's switches, newest first, each with its machine (null: this
+ * one). A switch that failed the same way again and again is one row, with how
+ * many times.
+ */
+function recentAll(switches, remote) {
+  const all = [...switches.map((m) => ({ ...m, machine: null })), ...remote.flatMap((r) => (r.switches ?? []).map((m) => ({ ...m, machine: r.machine })))]
+    .sort((x, y) => y.ts - x.ts);
+  const rows = new Map();
+  for (const m of all) {
+    const key = m.status === 'switched' ? `${m.machine}|${m.ts}` : [m.machine, m.profile, m.from, m.to, m.error].join('|');
+    const row = rows.get(key);
+    if (row) row.times++; else rows.set(key, { ...m, times: 1 });
+  }
+  return [...rows.values()];
 }
 
 /**
