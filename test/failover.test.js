@@ -125,7 +125,7 @@ test('nothing switches while failover is off, below the threshold, or when the a
 /**
  * A stand-in for security(1): items in a JSON file, keyed by service and account.
  * Like the real one, `security -i` reads each command into a 4 KB line, and one
- * longer than that is not carried out.
+ * longer than that is cut short.
  */
 function fakeSecurity(root) {
   const items = path.join(root, 'keychain.json');
@@ -138,12 +138,15 @@ let args = process.argv.slice(2);
 if (args[0] !== 'find-generic-password') fs.appendFileSync(f + '.calls', (args[0] === '-i' ? 'stdin' : 'args') + '\\n');
 if (args[0] === '-i') {
   const line = fs.readFileSync(0, 'utf8').split('\\n')[0];
-  if (line.length > 4095) { process.stderr.write('security: line too long\\n'); process.exit(0); }
-  args = line.match(/"[^"]*"|\\S+/g).map((x) => x.replace(/^"|"$/g, ''));
+  // A longer line is cut at the buffer: the item gets what of its value fit, and cannot be read back.
+  args = line.slice(0, 4095).match(/"[^"]*"|\\S+/g).map((x) => x.replace(/^"|"$/g, ''));
 }
 const key = opt(args, '-s') + '|' + opt(args, '-a');
 if (args[0] === 'find-generic-password') { if (!(key in db)) process.exit(44); process.stdout.write(db[key]); }
 else if (args[0] === 'add-generic-password' && opt(args, '-s') === process.env.FAKE_SECURITY_DROP) process.exit(0);
+else if (args[0] === 'add-generic-password' && opt(args, '-s') === process.env.FAKE_SECURITY_GARBLE && !fs.existsSync(f + '.garbled')) {
+  fs.writeFileSync(f + '.garbled', ''); db[key] = '{"claudeAiOauth":{"acc'; fs.writeFileSync(f, JSON.stringify(db));
+}
 else if (args[0] === 'add-generic-password') { db[key] = Buffer.from(opt(args, '-X'), 'hex').toString('utf8'); fs.writeFileSync(f, JSON.stringify(db)); }
 `, { mode: 0o755 });
   return { items, security };
@@ -240,6 +243,65 @@ test('on macOS a write the Keychain drops is caught: nothing switches and no sig
   assert.equal(out.main.oauth.refreshToken, 'rt-A');
   assert.equal(out.main.account.accountUuid, 'A', 'its account details go back with its tokens');
   assert.equal(out.spare.oauth.refreshToken, 'rt-B', 'the spare keeps its sign-in');
+});
+
+/** ~/.claude signed into A and a spare holding B, in the fake Keychain; `main` set to `item`, as it reads. */
+function keychainPair(root, items, main) {
+  const user = os.userInfo().username;
+  const hash = (dir) => crypto.createHash('sha256').update(dir).digest('hex').slice(0, 8);
+  fs.writeFileSync(items, JSON.stringify({
+    [`Claude Code-credentials|${user}`]: main,
+    [`Claude Code-credentials-${hash(path.join(root, '.claude-pool-b'))}|${user}`]: JSON.stringify({ claudeAiOauth: { accessToken: 'at-B', refreshToken: 'rt-B' } }),
+  }));
+  return `
+    const main = { dir: path.join(HOME, '.claude'), isDefault: true, shown: '~/.claude' };
+    fs.mkdirSync(main.dir, { recursive: true });
+    fs.writeFileSync(path.join(HOME, '.claude.json'), JSON.stringify({ oauthAccount: account('A', 'a@x.com') }));
+    const spare = { dir: path.join(HOME, '.claude-pool-b'), isDefault: false };
+    fs.mkdirSync(spare.dir, { recursive: true });
+    fs.writeFileSync(path.join(spare.dir, '.claude.json'), JSON.stringify({ oauthAccount: account('B', 'b@x.com') }));
+    const outgoing = { dir: path.join(HOME, '.claude-pool-a'), isDefault: false };
+    fs.mkdirSync(outgoing.dir, { recursive: true });
+    const safe = (fn) => { try { return fn(); } catch (err) { return { error: err.message }; } };
+  `;
+}
+
+test('on macOS a profile whose sign-in was cut short is signed into the spare’s account, as a /login would', () => {
+  const root = scratch();
+  const { items, security } = fakeSecurity(root);
+  const user = os.userInfo().username;
+  const out = inChild(root, `${keychainPair(root, items, '7b22636c61756465416')}
+    const r = S.switchSignin(main, spare, outgoing, 'darwin');
+    return { from: r.from, to: r.to.accountUuid, main: S.readSignin(main, 'darwin'), spare: S.readSignin(spare, 'darwin') };
+  `, { USER: user, CLAUDE_TRACKER_SECURITY: security });
+  assert.equal(out.from, null, 'nothing readable to keep');
+  assert.equal(out.to, 'B');
+  assert.equal(out.main.oauth.refreshToken, 'rt-B', 'readable again, as B');
+  assert.equal(out.spare, null, 'moved, not copied');
+});
+
+test('on macOS a write that leaves the profile unreadable puts its sign-in back, and the spare keeps its own', () => {
+  const root = scratch();
+  const { items, security } = fakeSecurity(root);
+  const user = os.userInfo().username;
+  const out = inChild(root, `${keychainPair(root, items, JSON.stringify({ claudeAiOauth: { accessToken: 'at-A', refreshToken: 'rt-A' } }))}
+    const r = safe(() => S.switchSignin(main, spare, outgoing, 'darwin'));
+    return { error: r.error, main: S.readSignin(main, 'darwin'), spare: S.readSignin(spare, 'darwin') };
+  `, { USER: user, CLAUDE_TRACKER_SECURITY: security, FAKE_SECURITY_GARBLE: 'Claude Code-credentials' });
+  assert.equal(out.error, "~/.claude did not take b@x.com's sign-in, so it stays on a@x.com");
+  assert.equal(out.main.oauth.refreshToken, 'rt-A');
+  assert.equal(out.spare.oauth.refreshToken, 'rt-B');
+});
+
+test('a sign-in that cannot be read is named by its profile', () => {
+  const root = scratch();
+  const out = inChild(root, `
+    const p = { dir: path.join(HOME, 'p'), shown: '~/p' };
+    fs.mkdirSync(p.dir, { recursive: true });
+    fs.writeFileSync(path.join(p.dir, '.credentials.json'), '{"claudeAiOauth":{"acc');
+    try { S.readSignin(p, 'linux'); return null; } catch (err) { return err.message; }
+  `);
+  assert.equal(out, "~/p's sign-in could not be read");
 });
 
 test('a lock Claude Code left behind is taken over once stale', () => {

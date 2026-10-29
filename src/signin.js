@@ -53,12 +53,15 @@ export function keychainService(dir, isDefault) {
   return `Claude Code-credentials${suffix}`;
 }
 
+/** A store holding something that is not a sign-in: one cut short, say. What it held is gone. */
+class Unreadable extends Error {}
+
 function parseStore(text) {
   const t = String(text ?? '').trim();
   if (!t) return null;
   try { return JSON.parse(t); } catch { /* maybe hex */ }
   if (/^[0-9a-f]+$/i.test(t)) { try { return JSON.parse(Buffer.from(t, 'hex').toString('utf8')); } catch { /* not that either */ } }
-  throw new Error('its sign-in could not be read');
+  throw new Unreadable('its sign-in could not be read');
 }
 
 /** Where a profile keeps its tokens, and how to read and write them. */
@@ -117,7 +120,10 @@ const usable = (o) => typeof o?.accessToken === 'string' && typeof o?.refreshTok
 
 /** A profile's sign-in: its tokens and its account, or null if it holds none. */
 export function readSignin(profile, platform = process.platform) {
-  const store = storeOf(profile, platform).read();
+  let store;
+  try { store = storeOf(profile, platform).read(); } catch (err) {
+    throw err instanceof Unreadable ? new Unreadable(`${profile.shown ?? profile.dir}'s sign-in could not be read`) : err;
+  }
   const oauth = store?.claudeAiOauth;
   const account = readJson(configOf(profile))?.oauthAccount ?? null;
   return usable(oauth) && account?.accountUuid ? { oauth, account } : null;
@@ -126,7 +132,8 @@ export function readSignin(profile, platform = process.platform) {
 /** Put a sign-in into a profile - or, with null, take the one it holds out. */
 export function writeSignin(profile, signin, platform = process.platform) {
   const store = storeOf(profile, platform);
-  const data = store.read() ?? {};
+  let data;
+  try { data = store.read() ?? {}; } catch (err) { if (!(err instanceof Unreadable)) throw err; data = {}; }
   if (signin) data.claudeAiOauth = signin.oauth; else delete data.claudeAiOauth;
   store.write(data);
   const file = configOf(profile);
@@ -146,7 +153,9 @@ export function writeSignin(profile, signin, platform = process.platform) {
  */
 export function switchSignin(profile, spare, outgoing, platform = process.platform) {
   return withStorageLock(profile.dir, () => withStorageLock(spare.dir, () => {
-    const current = readSignin(profile, platform);
+    // A profile whose sign-in can no longer be read has nothing to keep: no session there can use it either.
+    let current;
+    try { current = readSignin(profile, platform); } catch (err) { if (!(err instanceof Unreadable)) throw err; current = null; }
     const incoming = readSignin(spare, platform);
     if (!incoming) throw new Error(`${spare.shown ?? spare.dir} holds no sign-in`);
     if (current && !outgoing) throw new Error(`nowhere to keep ${current.account.emailAddress}'s sign-in, so nothing was switched`);
@@ -157,10 +166,11 @@ export function switchSignin(profile, spare, outgoing, platform = process.platfo
     }
     writeSignin(profile, incoming, platform);
     // The tokens, not only the account details beside them: a write the store dropped leaves the old ones.
-    const taken = readSignin(profile, platform);
+    let taken = null;
+    try { taken = readSignin(profile, platform); } catch { /* unreadable: not taken */ }
     if (taken?.oauth.refreshToken !== incoming.oauth.refreshToken || taken.account.accountUuid !== incoming.account.accountUuid) {
       if (current) { try { writeSignin(profile, current, platform); } catch { /* its own copy is saved in outgoing */ } }
-      throw new Error(`${profile.shown ?? profile.dir} did not take ${incoming.account.emailAddress}'s sign-in, so it stays on ${current?.account.emailAddress ?? 'none'}`);
+      throw new Error(`${profile.shown ?? profile.dir} did not take ${incoming.account.emailAddress}'s sign-in${current ? `, so it stays on ${current.account.emailAddress}` : ''}`);
     }
     writeSignin(spare, null, platform);
     return { from: current?.account ?? null, to: incoming.account };
