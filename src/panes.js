@@ -475,6 +475,25 @@ export function startPanes({ onSessions = () => {}, onItems = () => {} } = {}) {
     return false;
   }
 
+  /**
+   * What a transcript said of itself before `end` - its title, and the folder
+   * it works in. A read resumed from where it left off starts after both.
+   */
+  function lookBack(p, end, state) {
+    const start = Math.max(0, end - BACKFILL_BYTES);
+    let text = '';
+    try {
+      const fd = fs.openSync(p, 'r');
+      try { const b = Buffer.alloc(end - start); text = b.subarray(0, fs.readSync(fd, b, 0, b.length, start)).toString('utf8'); } finally { fs.closeSync(fd); }
+    } catch { return; }
+    for (const line of text.split('\n')) {
+      if (!/"type":"(ai|custom)-title"/.test(line)) continue;
+      try { readEntry(JSON.parse(line), state); } catch { /* cut through at the start */ }
+    }
+    const cwd = [...text.matchAll(/"cwd":"((?:[^"\\]|\\.)*)"/g)].at(-1)?.[1];
+    if (cwd) try { state.cwd = JSON.parse(`"${cwd}"`); } catch { /* keep the registry's */ }
+  }
+
   /** Read what a session's transcript gained, as conversation items. */
   function read(s, profile) {
     let r = reads.get(s.sessionId);
@@ -485,7 +504,7 @@ export function startPanes({ onSessions = () => {}, onItems = () => {} } = {}) {
       r = { path: p, offset: 0, partial: '', state: { tools: [], turnTools: 0, title: null }, backfill: false };
       let size = 0;
       try { size = fs.statSync(p).size; } catch { return []; }
-      if (saved?.path === p && saved.offset <= size) r.offset = saved.offset;
+      if (saved?.path === p && saved.offset <= size) { r.offset = saved.offset; lookBack(p, r.offset, r.state); }
       else if (!begunNow(p, s)) { r.offset = Math.max(0, size - BACKFILL_BYTES); r.backfill = true; }
       unseen.delete(s.sessionId);
       if (size - r.offset > CATCH_UP_BYTES) { r.offset = size - BACKFILL_BYTES; r.skipped = true; }

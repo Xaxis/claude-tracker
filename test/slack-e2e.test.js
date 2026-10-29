@@ -27,6 +27,7 @@ const tmux = (...args) => spawnSync('tmux', ['-S', sock, ...args], { encoding: '
 const screen = (target) => tmux('capture-pane', '-p', '-t', target).stdout;
 // However the run ends, its tmux server and the fakes in it go with it.
 process.on('exit', () => { tmux('kill-server'); fs.rmSync(root, { recursive: true, force: true }); });
+for (const sig of ['SIGINT', 'SIGTERM']) process.once(sig, () => process.exit(1));
 
 let slack;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -273,6 +274,15 @@ test('a conversation from before the tracker was watching shows as context, not 
   await sleep(2500);
   assert.match(blocksText(first), /before this thread · asked: “asked before anyone watched”/);
   assert.equal(inThread(root.ts).length, 1, JSON.stringify(inThread(root.ts).map((p) => p.text)));
+  assert.match(blocksText(slack.messages.get(root.ts)), /\*delta\*  ·  Fake asked before anyone watched/);
+  // Restarted, it carries on from where it read to - and still knows the title from before that.
+  await new Promise((r) => { m.proc.once('exit', r); m.proc.kill(); });
+  const updates = slack.calls.filter((c) => c.method === 'chat.update' && c.args.ts === root.ts).length;
+  m.start();
+  await until('the card refreshed after the restart', () => slack.calls.filter((c) => c.method === 'chat.update' && c.args.ts === root.ts).length > updates);
+  await sleep(1500);
+  assert.match(blocksText(slack.messages.get(root.ts)), /\*delta\*  ·  Fake asked before anyone watched/);
+  assert.equal(inThread(root.ts).length, 1, 'nothing repeated');
   await new Promise((r) => { m.proc.once('exit', r); m.proc.kill(); });
 });
 
@@ -284,6 +294,8 @@ test('pairing, and a synced machine\'s session driven through the one that has S
   const s = peer.claude('beta', 'bbbbbbbb-1111-2222-3333-444444444444');
   for (const x of [hub, peer]) { assert.equal(x.cli('sync', 'name', x.name).status, 0); x.start(); }
   for (const x of [hub, peer]) await until(`${x.name} to serve`, () => x.get('/api/health'));
+  // Slack delivers events only to a connection that is open.
+  await until('the hub to connect to Slack', async () => (await hub.get('/api/slack')).state === 'connected');
 
   // Pairing: a wrong code is ignored; the right one sets owner and home.
   slack.message({ channel: 'C9', user: 'U7', text: 'pair 111111', channel_type: 'channel' });

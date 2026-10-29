@@ -25,6 +25,7 @@ fs.mkdirSync(path.dirname(registry), { recursive: true });
 
 let input = '', status = 'idle', waitingFor = null, menu = null, timer = null, log = [];
 const queued = [];   // typed while it works: taken once the turn is over, as Claude Code does
+let titled = false;
 const pane = process.env.TMUX_PANE;
 
 function register() {
@@ -66,6 +67,8 @@ function submit(text) {
     content: command ? `<command-name>/${command[1]}</command-name>\n<command-message>${command[1]}</command-message>\n<command-args>${command[2]}</command-args>` : text,
   } });
   log.push(`> ${text.split('\n')[0]}`);
+  // Claude Code names a conversation after its first prompt.
+  if (!titled) { titled = true; write({ type: 'ai-title', aiTitle: `Fake ${text.split('\n')[0].slice(0, 30)}` }); }
   // A slash command prints what it did, as Claude Code's do, and Claude says nothing.
   if (command) {
     write({ type: 'user', message: { content: `<local-command-stdout>ran /${command[1]}</local-command-stdout>` } });

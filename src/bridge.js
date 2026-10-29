@@ -186,7 +186,7 @@ export function startBridge({ info = () => null, usage = () => '', here = 'this 
     const machine = machines.get(x.machine ?? '');
     if (!x.ended && x.machine && !machine?.online) state = `${EMOJI.ended} ${escape(machine?.name ?? 'its machine')} is not connected · last ${state}`;
     const facts = [
-      s.cwd && `\`${escape(tilde(s.cwd))}\``,
+      s.cwd && tilde(s.cwd) !== '~' && `\`${escape(tilde(s.cwd))}\``,
       i.account && escape(i.account),
       i.context?.tokens && `${shortNum(i.context.tokens)} context`,
       x.machine && machine?.name && `on ${escape(machine.name)}`,
