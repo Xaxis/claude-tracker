@@ -670,10 +670,15 @@ async function cmdPool(action, args, flags) {
     const a = profileAccount(p);
     if (a) console.log(`  ${pad(tildePath(p.dir), 26)} ${pad(a.email ?? a.accountUuid, 28)} ${c.dim}${room(a.accountUuid)} · in use${c.reset}`);
   }
+  const inUse = new Set(discoverProfiles().filter((p) => !p.dir.includes(F.SPARE_PREFIX)).map((p) => profileAccount(p)?.email?.toLowerCase()).filter(Boolean));
   for (const s of F.spares()) {
+    const lasts = s.runsOutAt ? ` · sign-in runs out ${when(s.runsOutAt)}` : '';
+    const gone = s.lapsed ? 'sign-in ran out' : !inUse.has(s.for?.toLowerCase()) ? 'holds no sign-in' : null;
     console.log(s.accountUuid
-      ? `  ${pad(s.shown, 26)} ${pad(s.email, 28)} ${c.dim}${room(s.accountUuid)} · spare${c.reset}`
-      : `  ${pad(s.shown, 26)} ${pad(s.for ?? '', 28)} ${c.dim}signed into a profile right now${c.reset}`);
+      ? `  ${pad(s.shown, 26)} ${pad(s.email, 28)} ${c.dim}${room(s.accountUuid)} · spare${lasts}${c.reset}`
+      : gone
+        ? `  ${pad(s.shown, 26)} ${pad(s.for ?? '', 28)} ${c.red}${gone}${c.reset} ${c.dim}· claude-tracker pool add ${s.for}${c.reset}`
+        : `  ${pad(s.shown, 26)} ${pad(s.for ?? '', 28)} ${c.dim}signed into a profile right now${c.reset}`);
   }
   const here = new Set([...F.spares().map((s) => s.email?.toLowerCase()), ...F.spares().map((s) => s.for?.toLowerCase()),
     ...discoverProfiles().map((p) => profileAccount(p)?.email?.toLowerCase())]);

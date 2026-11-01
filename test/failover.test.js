@@ -339,6 +339,15 @@ esac
   r = add('b@x.com', 'b@x.com', '--as', 'b');
   assert.equal(r.status, 0, r.stderr);
   assert.match(r.stdout, /b@x\.com is a spare, in ~\/\.claude-pool-b/);
+  r = add('b@x.com', 'b@x.com');
+  assert.match(r.stdout, /already a spare here/);
+  // Its sign-in runs out in an hour: adding it again signs it in again, in the same spare.
+  const creds = path.join(root, '.claude-pool-b', '.credentials.json');
+  fs.writeFileSync(creds, JSON.stringify({ claudeAiOauth: { accessToken: 'at', refreshToken: 'rt-old', refreshTokenExpiresAt: Date.now() + 3600e3 } }));
+  r = add('b@x.com', 'b@x.com');
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stdout, /b@x\.com is a spare, in ~\/\.claude-pool-b/);
+  assert.equal(JSON.parse(fs.readFileSync(creds, 'utf8')).claudeAiOauth.refreshToken, 'rt-b@x.com');
   r = add('main@x.com', 'main@x.com');
   assert.match(r.stdout, /is what ~\/\.claude is signed into now/, 'the account in use needs no spare yet');
 });
@@ -481,6 +490,66 @@ test('room on a bigger plan counts for more, and it says when another account is
   assert.equal(out.target, null);
   assert.equal(out.notices[0].level, 'bad');
   assert.match(out.notices[0].fix, /claude-tracker pool add/);
+});
+
+test('a spare whose sign-in has run out, or that Claude Code logged out, is never switched to, and it says which to sign in again', () => {
+  const root = scratch();
+  const out = inChild(root, `${SETUP}
+    reading('A', 'five_hour', 95, now + 3 * HOUR);
+    F.setFailover({ mode: 'auto', at: 90 });
+    const put = (who, oauth) => fs.writeFileSync(path.join(HOME, '.claude-pool-' + who, '.credentials.json'), JSON.stringify({ claudeAiOauth: oauth }));
+    // B has the most room, but its refresh token ran out an hour ago: every session switched to it would be logged out.
+    put('b', { ...token('B'), refreshTokenExpiresAt: now - HOUR });
+    // C still works, for two more days.
+    put('c', { ...token('C'), refreshTokenExpiresAt: now + 48 * HOUR });
+    // D was refused a refresh while in use, and Claude Code emptied both its tokens.
+    db().prepare("INSERT INTO accounts (account_uuid, email, last_seen) VALUES ('D', 'd@x.com', ?)").run(now);
+    S.writeSignin(F.makeSpare('d@x.com'), { oauth: { ...token('D'), accessToken: '', refreshToken: '', expiresAt: 0, refreshTokenExpiresAt: now + 20 * 24 * HOUR }, account: account('D', 'd@x.com') });
+    reading('D', 'five_hour', 0, now + 2 * HOUR);
+    const p = F.plan(api.overview(), api.liveSessions());
+    const made = F.runFailover(api.overview(), api.liveSessions());
+    return { target: p.entries[0].target?.label, tries: p.entries[0].tries.map((t) => t.label), made: made.map((m) => [m.status, m.to_account]),
+      notices: p.notices, on: read(path.join(HOME, '.claude.json')).oauthAccount.emailAddress };
+  `);
+  assert.equal(out.target, 'c@x.com');
+  assert.deepEqual(out.tries, ['c@x.com'], 'neither B nor D is ever tried');
+  assert.deepEqual(out.made, [['switched', 'C']]);
+  assert.equal(out.on, 'c@x.com');
+  const renew = out.notices.find((n) => /run out/.test(n.text));
+  assert.equal(renew?.level, 'bad', JSON.stringify(out.notices));
+  assert.match(renew.text, /b@x\.com \(ran out\)/);
+  assert.match(renew.text, /c@x\.com \(runs out /);
+  assert.match(renew.text, /d@x\.com \(ran out\)/);
+  assert.equal(renew.fix, 'claude-tracker pool add b@x.com && claude-tracker pool add c@x.com && claude-tracker pool add d@x.com');
+  assert.ok(!out.notices.some((n) => /no longer holds/.test(n.text)), 'said once, as run out');
+});
+
+test('a profile moves off its sign-in before the refresh token runs out, and at once once Claude Code has logged it out', () => {
+  const soon = inChild(scratch(), `${SETUP}
+    reading('A', 'five_hour', 10, now + 3 * HOUR);   // hardly used
+    F.setFailover({ mode: 'auto', at: 90 });
+    fs.writeFileSync(path.join(main, '.credentials.json'), JSON.stringify({ claudeAiOauth: { ...token('A'), refreshTokenExpiresAt: now + 30 * MIN } }));
+    const e = F.plan(api.overview(), api.liveSessions()).entries[0];
+    const made = F.runFailover(api.overview(), api.liveSessions());
+    return { due: e.due, made: made.map((m) => [m.status, m.to_account]), on: read(path.join(HOME, '.claude.json')).oauthAccount.emailAddress };
+  `);
+  assert.deepEqual(soon, { due: true, made: [['switched', 'B']], on: 'b@x.com' });
+
+  const gone = inChild(scratch(), `${SETUP}
+    reading('A', 'five_hour', 10, now + 3 * HOUR);
+    F.setFailover({ mode: 'auto', at: 90 });
+    // A refresh refused: Claude Code empties both tokens, keeps the account's details, and every session says "Login expired".
+    fs.writeFileSync(path.join(main, '.credentials.json'), JSON.stringify({ claudeAiOauth: { accessToken: '', refreshToken: '', expiresAt: 0, refreshTokenExpiresAt: now - MIN }, mcpOAuth: { linear: { accessToken: 'mcp' } } }));
+    const e = F.plan(api.overview(), api.liveSessions()).entries[0];
+    const made = F.runFailover(api.overview(), api.liveSessions());
+    return { due: e.due, made: made.map((m) => [m.status, m.to_account, m.error]), store: read(path.join(main, '.credentials.json')),
+      spareA: read(path.join(HOME, '.claude-pool-a', '.credentials.json')) };
+  `);
+  assert.equal(gone.due, true);
+  assert.deepEqual(gone.made, [['switched', 'B', null]]);
+  assert.equal(gone.store.claudeAiOauth.refreshToken, 'rt-B');
+  assert.deepEqual(gone.store.mcpOAuth, { linear: { accessToken: 'mcp' } }, "the profile's other tokens stay");
+  assert.equal(gone.spareA?.claudeAiOauth, undefined, 'nothing dead is kept to be switched back to');
 });
 
 test('when every account is nearly used up, each runs to the end before the next', () => {

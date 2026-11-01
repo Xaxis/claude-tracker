@@ -409,6 +409,15 @@ sends a notification: sign another account up, then `claude-tracker pool add
 <email>`. A spare whose sign-in was lost (a `/login` over a switched profile
 does that) is listed with the command that puts it back.
 
+A sign-in does not last: its refresh token runs out some weeks after the
+browser login, however often it is used, and every session on it is then
+logged out ("Login expired"). So failover never switches to a spare that has
+run out, or has under two hours left, and moves a profile off its own sign-in
+an hour before it runs out - or at once, if Claude Code has already logged it
+out. Three days ahead, the dashboards name each spare running out, and a day
+ahead the service sends a notification, with the `pool add` for each:
+adding an account again signs it in afresh, in the same spare.
+
 It picks the spare with the most room, unless you pick: `claude-tracker failover
 prefer <email>` sends it to that account while it has room (`prefer auto` hands
 the choice back). In the terminal dashboard the same settings are keys: `f`

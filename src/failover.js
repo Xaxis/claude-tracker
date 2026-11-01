@@ -4,7 +4,7 @@ import { spawn } from 'node:child_process';
 import { db, getMeta, setMeta } from './db.js';
 import { discoverProfiles, tildify, HOME, configFileOf } from './paths.js';
 import { profileAccount } from './accounts.js';
-import { readSignin, writeSignin, switchSignin, withStorageLock } from './signin.js';
+import { readSignin, writeSignin, switchSignin, withStorageLock, signinHealth } from './signin.js';
 import { machine } from './replica.js';
 
 /**
@@ -47,6 +47,14 @@ const LEFTOVER = 2;
  * free to switch again - at once, if the new account turns out to be out too.
  */
 const GRACE_MS = 45e3;
+/**
+ * A sign-in lapses when its refresh token runs out, some weeks after the browser login
+ * however often it is refreshed, and every session on it is logged out. A profile moves
+ * off one this long before that, and a spare needs twice this left to be switched to.
+ */
+const LAPSE_MS = 3600e3;
+/** A spare running out within this long is named, to be signed in again ahead of time. */
+const RENEW_MS = 3 * 86400e3;
 export const SPARE_PREFIX = '.claude-pool-';
 const MARK = '.claude-tracker-spare';
 
@@ -131,6 +139,20 @@ export function level(a) {
 
 const readJson = (f) => { try { return JSON.parse(fs.readFileSync(f, 'utf8')); } catch { return null; } };
 
+const healthRead = new Map();
+/** A profile's signinHealth, read at most once a minute - on a Mac each read is a Keychain call. Undefined when it cannot be read. */
+function health(p) {
+  const hit = healthRead.get(p.dir);
+  if (hit && Date.now() - hit.at < 60e3) return hit.h;
+  let h;
+  try { h = signinHealth(p); } catch { h = undefined; }
+  healthRead.set(p.dir, { at: Date.now(), h });
+  return h;
+}
+
+/** Less than `ms` left before it runs out. */
+const within = (runsOutAt, ms, now = Date.now()) => runsOutAt != null && runsOutAt - now < ms;
+
 /**
  * Among spares equally good, which this machine takes: each machine synced
  * with takes its own turn, so two running low together on one account do not
@@ -144,7 +166,11 @@ function turnOf(group) {
   return sorted[ids.indexOf(me) % sorted.length];
 }
 
-/** This machine's spares: what each is for, and the account whose sign-in it holds now, if any. */
+/**
+ * This machine's spares: what each is for, the account whose sign-in it holds now if any,
+ * and when that runs out. One that has run out, or that Claude Code logged out, holds none:
+ * it is `lapsed` until signed in again.
+ */
 export function spares() {
   let names = [];
   try { names = fs.readdirSync(HOME); } catch { return []; }
@@ -153,7 +179,12 @@ export function spares() {
     const mark = readJson(path.join(dir, MARK));
     if (!mark) return null;
     const a = profileAccount({ dir, configFile: configFileOf(dir) });
-    return { dir, shown: tildify(dir), isDefault: false, for: mark.email ?? null, accountUuid: a?.accountUuid ?? null, email: a?.email ?? null };
+    const h = health({ dir, isDefault: false });
+    const lapsed = !!h && (h.out || within(h.runsOutAt, 0));
+    // Tokens that could not be read are given the benefit of the doubt, as before; none at all, or lapsed, are no sign-in.
+    const holds = !!a?.accountUuid && h !== null && !lapsed;
+    return { dir, shown: tildify(dir), isDefault: false, for: mark.email ?? null, accountUuid: holds ? a.accountUuid : null, email: holds ? a.email ?? null : null,
+      runsOutAt: h?.runsOutAt ?? null, lapsed };
   }).filter(Boolean);
 }
 
@@ -201,18 +232,22 @@ export function plan(ov, live, settings = failoverSettings(), now = Date.now(), 
     const own = ownState(dir, signedSince(dir, signed.accountUuid), now);
     const lvl = own ? own.level : level(a);
     const isOut = own ? own.out : !!a && !a.available.now;
+    // Its sign-in logged out by Claude Code, or about to run out: nothing its sessions can go on with, whatever its room.
+    const h = health(profile);
+    const lapsing = !!h && (h.out || within(h.runsOutAt, LAPSE_MS, now));
+    const stuck = isOut || lapsing;
     // Room weighed by plan size; within 5 points counts as equal and, between
     // equals, one no other machine is using; then this machine's turn among them.
     const rank = (x) => [Math.round(x.room * x.capacity / 5), elsewhere.has(x.accountUuid) ? 0 : 1];
     const usable = held
-      .filter((s) => s.accountUuid && s.accountUuid !== signed.accountUuid && !out.has(s.accountUuid))
+      .filter((s) => s.accountUuid && s.accountUuid !== signed.accountUuid && !out.has(s.accountUuid) && !within(s.runsOutAt, 2 * LAPSE_MS, now))
       .map((s) => ({ ...s, label: accounts.get(s.accountUuid)?.label ?? s.email, room: headroom(accounts.get(s.accountUuid)), capacity: capacity(tiers.get(s.accountUuid)) }))
       .filter((s) => s.room > LEFTOVER);
     // Nothing with real room left: use this account to the end, then whatever has more than it.
     const scarce = !usable.some((s) => s.room >= MIN_ROOM);
     const at = scarce ? Math.max(settings.at, LAST_CALL) : settings.at;
     // What this account will have left when it switches: worth going to only what has more.
-    const left = isOut ? 0 : Math.min(100 - at, Math.max(0, 100 - lvl));
+    const left = stuck ? 0 : Math.min(100 - at, Math.max(0, 100 - lvl));
     const options = usable
       .filter((s) => (scarce ? s.room > left + LEFTOVER : s.room >= MIN_ROOM))
       .sort((x, y) => rank(y)[0] - rank(x)[0] || rank(y)[1] - rank(x)[1]);
@@ -222,8 +257,8 @@ export function plan(ov, live, settings = failoverSettings(), now = Date.now(), 
       : turnOf(options.filter((x) => String(rank(x)) === String(rank(options[0]))));
     // In order: where it goes, then where it goes if that fails.
     const order = first ? [first, ...options.filter((x) => x.accountUuid !== first.accountUuid)] : [];
-    // Refused here, should every one of those fail to switch to: a spare too low to pick still beats refused.
-    const fallback = isOut ? usable.filter((x) => !order.some((o) => o.accountUuid === x.accountUuid)).sort((x, y) => y.room * y.capacity - x.room * x.capacity) : [];
+    // Refused or logged out here, should every one of those fail to switch to: a spare too low to pick still beats that.
+    const fallback = stuck ? usable.filter((x) => !order.some((o) => o.accountUuid === x.accountUuid)).sort((x, y) => y.room * y.capacity - x.room * x.capacity) : [];
     // Out, but back within the wait: not worth a switch.
     const freesAt = isOut ? (own?.until ?? a?.available.at ?? null) : null;
     const soon = freesAt != null && freesAt - now < settings.waitMin * 60e3;
@@ -231,7 +266,8 @@ export function plan(ov, live, settings = failoverSettings(), now = Date.now(), 
     entries.push({
       dir, profile: tildify(dir), isDefault: !!profile.isDefault, sessions,
       account: signed.accountUuid, email: signed.email, label: a?.label ?? signed.email ?? signed.accountUuid,
-      level: lvl, at, scarce, due: (lvl >= at || isOut) && !soon, out: isOut, freesAt, measured: !!own,
+      level: lvl, at, scarce, due: lapsing || ((lvl >= at || isOut) && !soon), out: isOut, freesAt, measured: !!own,
+      lapsing, runsOutAt: h?.runsOutAt ?? null,
       // Until when this account is no use, when the profile's own sessions were refused on it.
       spentUntil: own?.out ? own.until : null,
       target: order[0] ? shape(order[0]) : null,
@@ -246,14 +282,17 @@ export function plan(ov, live, settings = failoverSettings(), now = Date.now(), 
     .filter((a) => a.available.now && !covered.has(a.accountUuid) && a.email)
     .map((a) => ({ accountUuid: a.accountUuid, label: a.label, email: a.email, room: headroom(a) }))
     .sort((x, y) => y.room - x.room)[0] ?? null;
-  return { ...settings, entries, best: best && best.room >= top + 10 ? best : null, notices: notices(entries, held, profiles, out, accounts) };
+  return { ...settings, entries, best: best && best.room >= top + 10 ? best : null, notices: notices(entries, held, profiles, out, now) };
 }
+
+const day = (t) => new Date(t).toLocaleString('en-US', { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
 
 /**
  * What needs doing by hand for failover to keep working: an account to add
- * when nothing is left to switch to, or a spare that no longer holds a sign-in.
+ * when nothing is left to switch to, a spare whose sign-in has run out or soon
+ * will, or one that no longer holds a sign-in.
  */
-function notices(entries, held, profiles, out, accounts) {
+function notices(entries, held, profiles, out, now = Date.now()) {
   const list = [];
   const ADD = 'add another Claude account (a Max plan goes furthest): sign it up at claude.ai, then run claude-tracker pool add <email> on this machine';
   for (const e of entries) {
@@ -269,9 +308,30 @@ function notices(entries, held, profiles, out, accounts) {
   // A spare emptied by a switch is fine while its account is signed into a profile; otherwise its sign-in is gone.
   const signedHere = new Set(profiles.filter((p) => !p.dir.includes(SPARE_PREFIX)).map((p) => profileAccount(p)?.email?.toLowerCase()).filter(Boolean));
   const holding = new Set(held.map((s) => s.email?.toLowerCase()).filter(Boolean));
+  // Run out, or soon to: signed in again ahead of time, unless the account has a lasting sign-in here besides.
+  const lasting = new Set(held.filter((s) => s.accountUuid && !within(s.runsOutAt, RENEW_MS, now)).map((s) => s.email?.toLowerCase()));
+  const renew = new Map();
+  let urgent = false;
   for (const s of held) {
     const e = s.for?.toLowerCase();
-    if (s.accountUuid || !e || signedHere.has(e) || holding.has(e)) continue;
+    if (!e || signedHere.has(e) || lasting.has(e)) continue;
+    if (s.lapsed) { renew.set(e, 'ran out'); urgent = true; }
+    else if (s.accountUuid && within(s.runsOutAt, RENEW_MS, now) && !renew.has(e)) {
+      renew.set(e, `runs out ${day(s.runsOutAt)}`);
+      urgent ||= within(s.runsOutAt, 86400e3, now);
+    }
+  }
+  if (renew.size) {
+    const names = [...renew.keys()].sort();
+    list.push({
+      level: urgent ? 'bad' : 'warn',
+      text: `Spare sign-ins that have run out or soon will: ${names.map((e) => `${e} (${renew.get(e)})`).join(', ')}. A sign-in lasts some weeks from its login, and failover will not switch to one that has run out.`,
+      fix: names.map((e) => `claude-tracker pool add ${e}`).join(' && '),
+    });
+  }
+  for (const s of held) {
+    const e = s.for?.toLowerCase();
+    if (s.accountUuid || !e || signedHere.has(e) || holding.has(e) || renew.has(e)) continue;
     list.push({ level: 'warn', text: `${s.shown} no longer holds a sign-in for ${s.for}.`, fix: `claude-tracker pool add ${s.for}` });
   }
   return list;
@@ -294,6 +354,8 @@ export function switchProfile(entry, target) {
     row.status = 'switched';
   } catch (err) {
     row.error = String(err.message ?? err).slice(0, 300);
+  } finally {
+    healthRead.clear();   // sign-ins moved, or may have
   }
   return record(row);
 }
@@ -318,7 +380,7 @@ export function runFailover(ov, live, now = Date.now()) {
     if (e.spentUntil) markSpent(e.account, e.spentUntil);
     // The first that works: a spare that fails to switch to, the next one is tried.
     for (const t of e.tries) {
-      const m = switchProfile(e, t);
+      const m = { ...switchProfile(e, t), lapsing: e.lapsing };
       made.push(m);
       if (m.status === 'switched') break;
     }
@@ -340,11 +402,13 @@ function claude(args, env) {
 export async function addSpare(email, name, profiles = discoverProfiles()) {
   const e = email.toLowerCase();
   const list = spares();
-  const holding = list.find((s) => s.email?.toLowerCase() === e);
+  const lasts = (s) => !within(s.runsOutAt, RENEW_MS);
+  const holding = list.find((s) => s.email?.toLowerCase() === e && lasts(s));
   if (holding) return { already: `${email} is already a spare here, in ${holding.shown}.` };
   const inUse = profiles.find((p) => !p.dir.includes(SPARE_PREFIX) && profileAccount(p)?.email?.toLowerCase() === e);
   if (inUse?.isDefault) return { already: `${email} is what ${tildify(inUse.dir)} is signed into now; when it is switched away it gets a spare of its own.` };
-  const waiting = list.find((s) => s.for?.toLowerCase() === e && !s.accountUuid);
+  // An empty spare, or one whose sign-in has run out or soon will: signed in again where it is.
+  const waiting = list.find((s) => s.for?.toLowerCase() === e && (!s.accountUuid || !lasts(s)));
   const spare = waiting ?? makeSpare(email, name ?? email.split('@')[0]);
   const code = await claude(['auth', 'login', '--email', email], { ...process.env, CLAUDE_CONFIG_DIR: spare.dir });
   const who = readSignin(spare);

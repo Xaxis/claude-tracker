@@ -116,7 +116,26 @@ function configOf(profile) {
     : path.join(profile.dir, '.claude.json'));
 }
 
-const usable = (o) => typeof o?.accessToken === 'string' && typeof o?.refreshToken === 'string';
+/** Both tokens, not empty: Claude Code empties them when a refresh is refused, and the profile is logged out. */
+const usable = (o) => [o?.accessToken, o?.refreshToken].every((t) => typeof t === 'string' && t !== '');
+
+/**
+ * How long a profile's sign-in will go on working, from its tokens alone: null when it
+ * holds none; `out` when Claude Code has logged it out (or it was cut short); and
+ * `runsOutAt`, when its refresh token expires. That is fixed at the browser login and no
+ * refresh moves it, so every sign-in lapses some weeks on, however much it is used.
+ */
+export function signinHealth(profile, platform = process.platform) {
+  let store;
+  try { store = storeOf(profile, platform).read(); } catch (err) {
+    if (err instanceof Unreadable) return { out: true, runsOutAt: null };
+    throw err;
+  }
+  const o = store?.claudeAiOauth;
+  if (!o) return null;
+  const t = Number(o.refreshTokenExpiresAt);
+  return { out: !usable(o), runsOutAt: t > 0 ? t : null };
+}
 
 /** A profile's sign-in: its tokens and its account, or null if it holds none. */
 export function readSignin(profile, platform = process.platform) {
