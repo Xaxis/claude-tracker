@@ -665,14 +665,19 @@ async function cmdPool(action, args, flags) {
     const email = args[0];
     if (!email || !/^[^\s@]+@[^\s@]+$/.test(email)) { console.error('usage: claude-tracker pool add <email> --long'); process.exitCode = 1; return; }
     let token = typeof flags.token === 'string' ? flags.token : null;
+    let caught = false;
     if (!token) {
-      console.log(`Making a year-long token for ${email}. Sign in to ${c.bold}${email}${c.reset} in the browser when it asks.\n`);
-      const { spawnSync } = await import('node:child_process');
-      spawnSync(process.env.CLAUDE_TRACKER_CLAUDE || 'claude', ['setup-token'], { stdio: 'inherit' });
-      token = await pastedToken(`\nPaste the token it printed (sk-ant-oat…), then Enter: `);
+      console.log(`Making a year-long token for ${email}. Sign in to ${c.bold}${email}${c.reset} in the browser when it asks - the token is taken from the screen, nothing to copy.\n`);
+      token = tokenIn(await onTerminal(process.env.CLAUDE_TRACKER_CLAUDE || 'claude', ['setup-token']));
+      caught = !!token;
+      if (!token) token = await pastedToken(`\nIt was not picked up. Paste the token it printed (sk-ant-oat…), then Enter: `);
     }
     console.log(`${c.dim}Checking Claude runs on it…${c.reset}`);
-    const r = await F.addToken(email, token);
+    let r = await F.addToken(email, token);
+    if (r.error && caught) {
+      console.error(`${c.red}✗${c.reset} ${r.error}.`);
+      r = await F.addToken(email, await pastedToken('Paste the token it printed (sk-ant-oat…), then Enter: '));
+    }
     if (r.error) { console.error(`${c.red}✗${c.reset} ${r.error}. Nothing was changed.`); process.exitCode = 1; return; }
     console.log(`${c.green}✓${c.reset} ${email} is a spare for a year, in ${r.added.shown}.`);
     console.log(`${c.dim}  Another machine takes every token here with: ssh ${os.hostname()} "bash -lc 'claude-tracker pool tokens'" | claude-tracker pool import${c.reset}`);
@@ -726,6 +731,48 @@ async function cmdPool(action, args, flags) {
 }
 
 const tildePath = (p) => p.replace(process.env.HOME ?? '', '~');
+
+/**
+ * Run a command on a terminal of its own (script(1)), shown as it goes, and give back
+ * everything it printed. Keys go to it, so a Ctrl-C stops it and not this.
+ */
+async function onTerminal(cmd, args) {
+  const { spawn, spawnSync } = await import('node:child_process');
+  const q = (s) => `'${String(s).replace(/'/g, `'\\''`)}'`;
+  const how = process.platform === 'darwin' ? ['-q', '/dev/null', cmd, ...args] : ['-q', '-e', '-c', [cmd, ...args].map(q).join(' '), '/dev/null'];
+  return new Promise((resolve) => {
+    let out = '', over = false;
+    const ignore = () => {};
+    process.on('SIGINT', ignore);
+    const done = () => { if (over) return; over = true; process.removeListener('SIGINT', ignore); resolve(out); };
+    const child = spawn('script', how, { stdio: ['inherit', 'pipe', 'inherit'] });
+    child.stdout.on('data', (d) => { process.stdout.write(d); out = (out + d).slice(-(1 << 20)); });
+    // No script(1): run it plainly, and the token is pasted.
+    child.on('error', () => { spawnSync(cmd, args, { stdio: 'inherit' }); done(); });
+    child.on('close', done);
+  });
+}
+
+/**
+ * The last long-lived token in what a terminal showed. Claude Code wraps it to the
+ * width of the screen, each line indented, so it carries on past a line break until a
+ * blank line.
+ */
+export function tokenIn(shown) {
+  const text = String(shown).replace(/\x1b\][^\x07\x1b]*(\x07|\x1b\\)/g, '').replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, '').replace(/\x1b[()][0-9A-B]/g, '').replace(/\r/g, '');
+  const at = text.lastIndexOf('sk-ant-oat');
+  if (at < 0) return null;
+  let token = '';
+  for (let i = at; i < text.length;) {
+    if (/[A-Za-z0-9_-]/.test(text[i])) { token += text[i++]; continue; }
+    if (text[i] !== '\n') break;
+    let k = i + 1;
+    while (text[k] === ' ') k++;
+    if (!/[A-Za-z0-9_-]/.test(text[k] ?? '') || /^[A-Za-z0-9_-]*\s+\S/.test(text.slice(k).split('\n')[0])) break;   // a blank line, or words
+    i = k;
+  }
+  return /^sk-ant-oat\d+-[A-Za-z0-9_-]{40,}$/.test(token) ? token : null;
+}
 
 /**
  * A token pasted at a prompt. A terminal that wrapped it pastes it as several lines,

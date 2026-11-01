@@ -597,12 +597,14 @@ test('pool add --long keeps a token only once Claude runs on it, and pool import
   const fake = path.join(root, 'claude');
   fs.writeFileSync(fake, `#!/bin/sh
 case "$1" in
-  setup-token) echo " Your OAuth token (valid for 1 year):" ;;
+  setup-token) printf ' ✓ Long-lived authentication token created successfully!\n\n Your OAuth token (valid for 1 year):\n\n'
+               [ -n "$PART1" ] && printf ' %s\n %s\n\n' "$PART1" "$PART2"
+               printf " Store this token securely. You won't be able to see it again.\n" ;;
   -p) case "$CLAUDE_CODE_OAUTH_TOKEN" in *good) exit 0 ;; *) exit 1 ;; esac ;;
 esac
 `, { mode: 0o755 });
-  const cli = (home, args, input = '') => spawnSync(process.execPath, [CLI, 'pool', ...args], {
-    env: { ...process.env, HOME: home, CLAUDE_TRACKER_DIR: path.join(home, 'data'), CLAUDE_TRACKER_CLAUDE: fake, CLAUDE_CONFIG_DIR: '', NO_COLOR: '1' },
+  const cli = (home, args, input = '', env = {}) => spawnSync(process.execPath, [CLI, 'pool', ...args], {
+    env: { ...process.env, HOME: home, CLAUDE_TRACKER_DIR: path.join(home, 'data'), CLAUDE_TRACKER_CLAUDE: fake, CLAUDE_CONFIG_DIR: '', NO_COLOR: '1', ...env },
     encoding: 'utf8', input, timeout: 60_000,
   });
   const good = 'sk-ant-oat01-' + 'x'.repeat(60) + 'good';
@@ -613,9 +615,15 @@ esac
   assert.equal(r.status, 1);
   assert.match(r.stderr, /could not run on that token/);
   assert.equal(fs.existsSync(path.join(root, '.claude-pool-b')), false, 'nothing kept');
-  // The terminal wrapped the token it printed, so it is pasted as two lines.
-  r = cli(root, ['add', 'b@x.com', '--long'], `${good.slice(0, 50)}\n${good.slice(50)}\n`);
+  // Where script(1) cannot be run, the token is pasted - wrapped by the terminal, so as two lines.
+  r = cli(root, ['add', 'b@x.com', '--long'], `${good.slice(0, 50)}\n${good.slice(50)}\n`, { PATH: '/nonexistent' });
   assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stdout, /b@x\.com is a spare for a year, in ~\/\.claude-pool-b/);
+  // Otherwise it is taken from what setup-token shows, wrapped and indented as Claude Code shows it: nothing to copy.
+  fs.rmSync(path.join(root, '.claude-pool-b'), { recursive: true });
+  r = cli(root, ['add', 'b@x.com', '--long'], '', { PART1: good.slice(0, 66), PART2: good.slice(66) });
+  assert.equal(r.status, 0, r.stderr);
+  assert.doesNotMatch(r.stdout, /Paste the token/);
   assert.match(r.stdout, /b@x\.com is a spare for a year, in ~\/\.claude-pool-b/);
   const creds = JSON.parse(fs.readFileSync(path.join(root, '.claude-pool-b', '.credentials.json'), 'utf8')).claudeAiOauth;
   assert.deepEqual([creds.accessToken, creds.refreshToken, creds.subscriptionType, creds.rateLimitTier], [good, null, 'team', 'default_raven']);
