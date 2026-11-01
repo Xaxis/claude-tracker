@@ -1,3 +1,4 @@
+import os from 'node:os';
 import { ingestAll, ingestPaths, placeRecords } from './ingest.js';
 import { ingestLive } from './live.js';
 import {
@@ -645,9 +646,41 @@ async function cmdFailover(action, args, flags) {
 
 async function cmdPool(action, args, flags) {
   const F = await import('./failover.js');
+  if (action === 'tokens') {
+    // For another machine's `pool import`: secrets, so only ever into a pipe or a private file.
+    for (const t of F.longLivedTokens()) process.stdout.write(`${JSON.stringify(t)}\n`);
+    return;
+  }
+  if (action === 'import') {
+    const text = await new Promise((resolve) => { let s = ''; process.stdin.on('data', (d) => { s += d; }); process.stdin.on('end', () => resolve(s)); });
+    const list = text.split('\n').filter((l) => l.trim()).map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter((x) => x?.email && x?.token);
+    if (!list.length) { console.error('No tokens came in. On a machine that has them: claude-tracker pool tokens | ssh <this machine> claude-tracker pool import'); process.exitCode = 1; return; }
+    for (const r of await F.importTokens(list)) {
+      console.log(r.error ? `  ${c.red}✗${c.reset} ${r.email}: ${r.error}` : r.already ? `  ${c.dim}· ${r.email}: already here${c.reset}` : `  ${c.green}✓${c.reset} ${r.email}, in ${r.added.shown}`);
+      if (r.error) process.exitCode = 1;
+    }
+    return;
+  }
+  if (action === 'add' && (flags.long || flags.token)) {
+    const email = args[0];
+    if (!email || !/^[^\s@]+@[^\s@]+$/.test(email)) { console.error('usage: claude-tracker pool add <email> --long'); process.exitCode = 1; return; }
+    let token = typeof flags.token === 'string' ? flags.token : null;
+    if (!token) {
+      console.log(`Making a year-long token for ${email}. Sign in to ${c.bold}${email}${c.reset} in the browser when it asks.\n`);
+      const { spawnSync } = await import('node:child_process');
+      spawnSync(process.env.CLAUDE_TRACKER_CLAUDE || 'claude', ['setup-token'], { stdio: 'inherit' });
+      token = await pastedToken(`\nPaste the token it printed (sk-ant-oat…), then Enter: `);
+    }
+    console.log(`${c.dim}Checking Claude runs on it…${c.reset}`);
+    const r = await F.addToken(email, token);
+    if (r.error) { console.error(`${c.red}✗${c.reset} ${r.error}. Nothing was changed.`); process.exitCode = 1; return; }
+    console.log(`${c.green}✓${c.reset} ${email} is a spare for a year, in ${r.added.shown}.`);
+    console.log(`${c.dim}  Another machine takes every token here with: ssh ${os.hostname()} "bash -lc 'claude-tracker pool tokens'" | claude-tracker pool import${c.reset}`);
+    return;
+  }
   if (action === 'add') {
     const email = args[0];
-    if (!email || !/^[^\s@]+@[^\s@]+$/.test(email)) { console.error('usage: claude-tracker pool add <email> [--as <name>]'); process.exitCode = 1; return; }
+    if (!email || !/^[^\s@]+@[^\s@]+$/.test(email)) { console.error('usage: claude-tracker pool add <email> [--as <name>] [--long]'); process.exitCode = 1; return; }
     console.log(`Signing ${email} into a spare - finish the login in your browser.\n`);
     const r = await F.addSpare(email, typeof flags.as === 'string' ? flags.as : undefined);
     if (r.already) { console.log(r.already); return; }
@@ -672,12 +705,14 @@ async function cmdPool(action, args, flags) {
   }
   const inUse = new Set(discoverProfiles().filter((p) => !p.dir.includes(F.SPARE_PREFIX)).map((p) => profileAccount(p)?.email?.toLowerCase()).filter(Boolean));
   for (const s of F.spares()) {
-    const lasts = s.runsOutAt ? ` · sign-in runs out ${when(s.runsOutAt)}` : '';
+    const lasts = !s.runsOutAt ? '' : s.longLived
+      ? ` · year-long token, until ${new Date(s.runsOutAt).toLocaleDateString([], { year: 'numeric', month: 'short', day: 'numeric' })}`
+      : ` · sign-in runs out ${when(s.runsOutAt)}`;
     const gone = s.lapsed ? 'sign-in ran out' : !inUse.has(s.for?.toLowerCase()) ? 'holds no sign-in' : null;
     console.log(s.accountUuid
       ? `  ${pad(s.shown, 26)} ${pad(s.email, 28)} ${c.dim}${room(s.accountUuid)} · spare${lasts}${c.reset}`
       : gone
-        ? `  ${pad(s.shown, 26)} ${pad(s.for ?? '', 28)} ${c.red}${gone}${c.reset} ${c.dim}· claude-tracker pool add ${s.for}${c.reset}`
+        ? `  ${pad(s.shown, 26)} ${pad(s.for ?? '', 28)} ${c.red}${gone}${c.reset} ${c.dim}· claude-tracker pool add ${s.for} --long${c.reset}`
         : `  ${pad(s.shown, 26)} ${pad(s.for ?? '', 28)} ${c.dim}signed into a profile right now${c.reset}`);
   }
   const here = new Set([...F.spares().map((s) => s.email?.toLowerCase()), ...F.spares().map((s) => s.for?.toLowerCase()),
@@ -691,6 +726,22 @@ async function cmdPool(action, args, flags) {
 }
 
 const tildePath = (p) => p.replace(process.env.HOME ?? '', '~');
+
+/**
+ * A token pasted at a prompt. A terminal that wrapped it pastes it as several lines,
+ * so lines arriving together are one paste, joined.
+ */
+function pastedToken(prompt) {
+  process.stdout.write(prompt);
+  return new Promise((resolve) => {
+    let got = '', timer = null;
+    const finish = () => { process.stdin.pause(); process.stdin.removeAllListeners('data'); resolve(got.replace(/\s+/g, '')); };
+    process.stdin.setEncoding('utf8');
+    process.stdin.on('data', (d) => { got += d; clearTimeout(timer); if (got.trim()) timer = setTimeout(finish, 400); });
+    process.stdin.on('end', finish);
+    process.stdin.resume();
+  });
+}
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const ago = (t) => (t ? `${duration(Date.now() - t)} ago` : 'never');

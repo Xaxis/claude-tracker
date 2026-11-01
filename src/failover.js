@@ -1,4 +1,5 @@
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { db, getMeta, setMeta } from './db.js';
@@ -184,7 +185,7 @@ export function spares() {
     // Tokens that could not be read are given the benefit of the doubt, as before; none at all, or lapsed, are no sign-in.
     const holds = !!a?.accountUuid && h !== null && !lapsed;
     return { dir, shown: tildify(dir), isDefault: false, for: mark.email ?? null, accountUuid: holds ? a.accountUuid : null, email: holds ? a.email ?? null : null,
-      runsOutAt: h?.runsOutAt ?? null, lapsed };
+      runsOutAt: h?.runsOutAt ?? null, longLived: !!h?.longLived, lapsed };
   }).filter(Boolean);
 }
 
@@ -294,7 +295,7 @@ const day = (t) => new Date(t).toLocaleString('en-US', { month: 'short', day: 'n
  */
 function notices(entries, held, profiles, out, now = Date.now()) {
   const list = [];
-  const ADD = 'add another Claude account (a Max plan goes furthest): sign it up at claude.ai, then run claude-tracker pool add <email> on this machine';
+  const ADD = 'add another Claude account (a Max plan goes furthest): sign it up at claude.ai, then run claude-tracker pool add <email> --long on this machine';
   for (const e of entries) {
     if (!e.target) {
       const back = [...out.values()].sort((x, y) => x - y)[0] ?? null;
@@ -326,13 +327,13 @@ function notices(entries, held, profiles, out, now = Date.now()) {
     list.push({
       level: urgent ? 'bad' : 'warn',
       text: `Spare sign-ins that have run out or soon will: ${names.map((e) => `${e} (${renew.get(e)})`).join(', ')}. A sign-in lasts some weeks from its login, and failover will not switch to one that has run out.`,
-      fix: names.map((e) => `claude-tracker pool add ${e}`).join(' && '),
+      fix: names.map((e) => `claude-tracker pool add ${e} --long`).join(' && '),
     });
   }
   for (const s of held) {
     const e = s.for?.toLowerCase();
     if (s.accountUuid || !e || signedHere.has(e) || holding.has(e) || renew.has(e)) continue;
-    list.push({ level: 'warn', text: `${s.shown} no longer holds a sign-in for ${s.for}.`, fix: `claude-tracker pool add ${s.for}` });
+    list.push({ level: 'warn', text: `${s.shown} no longer holds a sign-in for ${s.for}.`, fix: `claude-tracker pool add ${s.for} --long` });
   }
   return list;
 }
@@ -386,6 +387,80 @@ export function runFailover(ov, live, now = Date.now()) {
     }
   }
   return made;
+}
+
+/* --- long-lived tokens -------------------------------------------------------- */
+
+/** How long a token from `claude setup-token` lasts. */
+const LONG_LIVED_MS = 365 * 86400e3;
+const LONG_TOKEN = /^sk-ant-oat\d+-[A-Za-z0-9_-]{40,}$/;
+
+/** The plan Claude Code shows and runs a token as - it cannot ask, with only the inference scope. */
+const planOf = (tier) => (/max/.test(tier ?? '') ? 'max' : /raven/.test(tier ?? '') ? 'team' : 'pro');
+
+/** Whether Claude Code runs on `token`: one short request, in a scratch profile. */
+function works(token) {
+  const dir = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), 'ct-token-'));
+  return new Promise((resolve) => {
+    const env = { ...process.env, CLAUDE_CONFIG_DIR: dir, CLAUDE_CODE_OAUTH_TOKEN: token };
+    delete env.ANTHROPIC_API_KEY;
+    const child = spawn(process.env.CLAUDE_TRACKER_CLAUDE || 'claude', ['-p', 'Reply with just: ok', '--model', 'haiku'], { env, cwd: dir, stdio: ['ignore', 'ignore', 'ignore'] });
+    const timer = setTimeout(() => child.kill(), 120e3);
+    const done = (ok) => { clearTimeout(timer); fs.rmSync(dir, { recursive: true, force: true }); resolve(ok); };
+    child.on('error', () => done(false));
+    child.on('close', (code) => done(code === 0));
+  });
+}
+
+/**
+ * Keep `email`'s long-lived token, from `claude setup-token`, in a spare. It lasts a year
+ * and is never refreshed, so being in two places does not use it up as it would a
+ * sign-in: one token is a spare on every machine. It can only run Claude - claude.ai's
+ * connectors, Remote Control and Claude in Chrome want a full sign-in.
+ */
+export async function addToken(email, token, { until = Date.now() + LONG_LIVED_MS, account = null, check = true } = {}) {
+  const e = email.toLowerCase();
+  const t = String(token ?? '').replace(/\s+/g, '');
+  if (!LONG_TOKEN.test(t)) return { error: 'that is not a long-lived token - they start sk-ant-oat' };
+  const row = db().prepare('SELECT account_uuid, email, org_uuid, rate_limit_tier FROM accounts WHERE lower(email) = ?').get(e);
+  const who = account ?? (row && { accountUuid: row.account_uuid, emailAddress: row.email, organizationUuid: row.org_uuid, rateLimitTier: row.rate_limit_tier });
+  if (!who?.accountUuid) return { error: `${email} has not been seen on this machine yet, so its account is not known` };
+  if (check && !(await works(t))) return { error: 'Claude Code could not run on that token' };
+  const list = spares();
+  const spare = list.find((s) => s.email?.toLowerCase() === e) ?? list.find((s) => s.for?.toLowerCase() === e && !s.accountUuid) ?? makeSpare(email);
+  const tier = who.rateLimitTier ?? null;
+  withStorageLock(spare.dir, () => writeSignin(spare, {
+    oauth: { accessToken: t, refreshToken: null, expiresAt: null, refreshTokenExpiresAt: until, scopes: ['user:inference'], subscriptionType: planOf(tier), rateLimitTier: tier },
+    account: { accountUuid: who.accountUuid, emailAddress: who.emailAddress ?? email, organizationUuid: who.organizationUuid ?? null },
+  }));
+  healthRead.clear();
+  return { added: spare };
+}
+
+/** Every long-lived token on this machine, in spares and profiles alike: what `pool import` takes on another. */
+export function longLivedTokens(profiles = discoverProfiles()) {
+  const found = new Map();
+  for (const p of [...profiles.filter((x) => !x.dir.includes(SPARE_PREFIX)), ...spares()]) {
+    let s = null;
+    try { s = readSignin(p); } catch { /* unreadable: nothing to give */ }
+    if (!s || s.oauth.refreshToken != null || !s.account.emailAddress) continue;
+    found.set(s.account.emailAddress.toLowerCase(), {
+      email: s.account.emailAddress, token: s.oauth.accessToken, until: s.oauth.refreshTokenExpiresAt ?? null,
+      account: { accountUuid: s.account.accountUuid, emailAddress: s.account.emailAddress, organizationUuid: s.account.organizationUuid ?? null, rateLimitTier: s.oauth.rateLimitTier ?? null },
+    });
+  }
+  return [...found.values()];
+}
+
+/** Take another machine's long-lived tokens, each into its account's spare, unless this machine holds it already. */
+export async function importTokens(list, profiles = discoverProfiles()) {
+  const here = new Set(longLivedTokens(profiles).map((x) => x.token));
+  const out = [];
+  for (const x of list) {
+    if (here.has(x.token)) { out.push({ email: x.email, already: true }); continue; }
+    out.push({ email: x.email, ...(await addToken(x.email, x.token, { until: x.until ?? undefined, account: x.account, check: false })) });
+  }
+  return out;
 }
 
 /* --- adding accounts ---------------------------------------------------------- */

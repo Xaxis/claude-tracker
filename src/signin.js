@@ -116,8 +116,16 @@ function configOf(profile) {
     : path.join(profile.dir, '.claude.json'));
 }
 
-/** Both tokens, not empty: Claude Code empties them when a refresh is refused, and the profile is logged out. */
-const usable = (o) => [o?.accessToken, o?.refreshToken].every((t) => typeof t === 'string' && t !== '');
+/**
+ * An access token, and a refresh token unless it is long-lived (`claude setup-token`:
+ * a year, never refreshed). Claude Code empties both when a refresh is refused, and the
+ * profile is logged out.
+ */
+const usable = (o) => typeof o?.accessToken === 'string' && o.accessToken !== ''
+  && (o.refreshToken == null || (typeof o.refreshToken === 'string' && o.refreshToken !== ''));
+
+/** What tells one sign-in from another: its refresh token, or a long-lived one's only token. */
+const tokenOf = (signin) => signin?.oauth.refreshToken ?? signin?.oauth.accessToken;
 
 /**
  * How long a profile's sign-in will go on working, from its tokens alone: null when it
@@ -134,7 +142,7 @@ export function signinHealth(profile, platform = process.platform) {
   const o = store?.claudeAiOauth;
   if (!o) return null;
   const t = Number(o.refreshTokenExpiresAt);
-  return { out: !usable(o), runsOutAt: t > 0 ? t : null };
+  return { out: !usable(o), runsOutAt: t > 0 ? t : null, longLived: o.refreshToken == null };
 }
 
 /** A profile's sign-in: its tokens and its account, or null if it holds none. */
@@ -181,13 +189,13 @@ export function switchSignin(profile, spare, outgoing, platform = process.platfo
     if (current) {
       withStorageLock(outgoing.dir, () => writeSignin(outgoing, current, platform));
       const saved = readSignin(outgoing, platform);
-      if (saved?.oauth.refreshToken !== current.oauth.refreshToken) throw new Error(`could not save ${current.account.emailAddress}'s sign-in, so nothing was switched`);
+      if (tokenOf(saved) !== tokenOf(current)) throw new Error(`could not save ${current.account.emailAddress}'s sign-in, so nothing was switched`);
     }
     writeSignin(profile, incoming, platform);
     // The tokens, not only the account details beside them: a write the store dropped leaves the old ones.
     let taken = null;
     try { taken = readSignin(profile, platform); } catch { /* unreadable: not taken */ }
-    if (taken?.oauth.refreshToken !== incoming.oauth.refreshToken || taken.account.accountUuid !== incoming.account.accountUuid) {
+    if (tokenOf(taken) !== tokenOf(incoming) || taken.account.accountUuid !== incoming.account.accountUuid) {
       if (current) { try { writeSignin(profile, current, platform); } catch { /* its own copy is saved in outgoing */ } }
       throw new Error(`${profile.shown ?? profile.dir} did not take ${incoming.account.emailAddress}'s sign-in${current ? `, so it stays on ${current.account.emailAddress}` : ''}`);
     }

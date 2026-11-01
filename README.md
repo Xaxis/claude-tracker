@@ -88,6 +88,8 @@ Run it from any directory once linked:
 | `claude-tracker failover` | where sessions go when their account runs low |
 | `claude-tracker failover on` | switch accounts automatically when one runs low |
 | `claude-tracker pool add me@example.com` | sign an account into a spare, to switch to |
+| `claude-tracker pool add me@example.com --long` | the same with a year-long token, which every machine can share |
+| `claude-tracker pool import` | take another machine's year-long tokens, piped from its `pool tokens` |
 | `claude-tracker slack setup` | every session in Slack, a thread each: read it, answer it, drive it |
 
 Or from inside the repo, without linking — `yarn` and `npm run` both work:
@@ -417,6 +419,21 @@ an hour before it runs out - or at once, if Claude Code has already logged it
 out. Three days ahead, the dashboards name each spare running out, and a day
 ahead the service sends a notification, with the `pool add` for each:
 adding an account again signs it in afresh, in the same spare.
+
+So add accounts with year-long tokens instead: `claude-tracker pool add
+<email> --long` runs `claude setup-token`, takes the token you paste, checks
+Claude runs on it, and keeps it as the account's spare. A token is never
+refreshed, so it is not used up by being in two places: another machine takes
+every token this one has with
+
+```sh
+ssh <this machine> "bash -lc 'claude-tracker pool tokens'" | claude-tracker pool import
+```
+
+One login per account a year, for every machine. A token can only run Claude:
+while a profile is on one, claude.ai's connectors, Remote Control and Claude in
+Chrome are not there (Claude Code says so). `pool tokens` prints secrets: pipe
+it, never paste it.
 
 It picks the spare with the most room, unless you pick: `claude-tracker failover
 prefer <email>` sends it to that account while it has room (`prefer auto` hands

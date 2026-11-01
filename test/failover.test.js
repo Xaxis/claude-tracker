@@ -520,7 +520,7 @@ test('a spare whose sign-in has run out, or that Claude Code logged out, is neve
   assert.match(renew.text, /b@x\.com \(ran out\)/);
   assert.match(renew.text, /c@x\.com \(runs out /);
   assert.match(renew.text, /d@x\.com \(ran out\)/);
-  assert.equal(renew.fix, 'claude-tracker pool add b@x.com && claude-tracker pool add c@x.com && claude-tracker pool add d@x.com');
+  assert.equal(renew.fix, 'claude-tracker pool add b@x.com --long && claude-tracker pool add c@x.com --long && claude-tracker pool add d@x.com --long');
   assert.ok(!out.notices.some((n) => /no longer holds/.test(n.text)), 'said once, as run out');
 });
 
@@ -550,6 +550,86 @@ test('a profile moves off its sign-in before the refresh token runs out, and at 
   assert.equal(gone.store.claudeAiOauth.refreshToken, 'rt-B');
   assert.deepEqual(gone.store.mcpOAuth, { linear: { accessToken: 'mcp' } }, "the profile's other tokens stay");
   assert.equal(gone.spareA?.claudeAiOauth, undefined, 'nothing dead is kept to be switched back to');
+});
+
+test('a year-long token from claude setup-token is a spare like any other: switched to, and away from, as it is', () => {
+  const root = scratch();
+  const out = inChild(root, `${SETUP}
+    reading('A', 'five_hour', 95, now + 3 * HOUR);
+    F.setFailover({ mode: 'auto', at: 90 });
+    // D: a long-lived token - no refresh token, no expiry for Claude Code to refresh at - and the most room.
+    db().prepare("INSERT INTO accounts (account_uuid, email, org_uuid, rate_limit_tier, last_seen) VALUES ('D', 'd@x.com', 'org-D', 'default_claude_max_20x', ?)").run(now);
+    reading('D', 'five_hour', 0, now + 2 * HOUR);
+    const tok = 'sk-ant-oat01-' + 'd'.repeat(95);
+    await F.addToken('d@x.com', tok, { check: false });
+    const spareD = F.spares().find((s) => s.for === 'd@x.com');
+    const target = F.plan(api.overview(), api.liveSessions()).entries[0].target?.label;
+    const first = F.runFailover(api.overview(), api.liveSessions()).map((m) => [m.status, m.to_account, m.error]);
+    const onD = { store: read(path.join(main, '.credentials.json')), account: read(path.join(HOME, '.claude.json')).oauthAccount.accountUuid };
+    // D runs low in its turn: its token goes back into its spare as it is, and B takes over.
+    db().prepare("UPDATE utilization SET pct = 96 WHERE account_uuid = 'D'").run();
+    db().prepare('UPDATE switches SET ts = ts - 60000').run();   // past the settling time
+    const second = F.runFailover(api.overview(), api.liveSessions()).map((m) => [m.status, m.to_account, m.error]);
+    return { spareD, target, first, onD, second, main: read(path.join(main, '.credentials.json')), back: read(path.join(spareD.dir, '.credentials.json')) };
+  `);
+  assert.equal(out.spareD.accountUuid, 'D');
+  assert.ok(Math.abs(out.spareD.runsOutAt - (Date.now() + 365 * 86400e3)) < 600e3, 'it runs out a year on');
+  assert.equal(out.target, 'd@x.com');
+  assert.deepEqual(out.first, [['switched', 'D', null]]);
+  assert.equal(out.onD.account, 'D');
+  assert.match(out.onD.store.claudeAiOauth.accessToken, /^sk-ant-oat01-d+$/);
+  assert.deepEqual([out.onD.store.claudeAiOauth.refreshToken, out.onD.store.claudeAiOauth.expiresAt, out.onD.store.claudeAiOauth.subscriptionType], [null, null, 'max']);
+  assert.deepEqual(out.onD.store.mcpOAuth, { linear: { accessToken: 'mcp' } }, "the profile's other tokens stay");
+  assert.deepEqual(out.second, [['switched', 'B', null]]);
+  assert.equal(out.main.claudeAiOauth.refreshToken, 'rt-B');
+  assert.equal(out.back.claudeAiOauth.accessToken, out.onD.store.claudeAiOauth.accessToken, 'the token is back in its spare');
+});
+
+test('pool add --long keeps a token only once Claude runs on it, and pool import hands every token to another machine', () => {
+  const root = scratch(), other = scratch();
+  for (const r of [root, other]) {
+    fs.mkdirSync(path.join(r, '.claude', 'projects'), { recursive: true });
+    fs.writeFileSync(path.join(r, '.claude', 'settings.json'), '{}');
+    fs.writeFileSync(path.join(r, '.claude.json'), JSON.stringify({ oauthAccount: { accountUuid: 'main', emailAddress: 'main@x.com' } }));
+  }
+  inChild(root, `db().prepare("INSERT INTO accounts (account_uuid, email, org_uuid, rate_limit_tier, last_seen) VALUES ('B', 'b@x.com', 'org-B', 'default_raven', ?)").run(now); return 1;`);
+  // Claude Code, as far as this goes: setup-token prints a token; -p works only on a token that ends "good".
+  const fake = path.join(root, 'claude');
+  fs.writeFileSync(fake, `#!/bin/sh
+case "$1" in
+  setup-token) echo " Your OAuth token (valid for 1 year):" ;;
+  -p) case "$CLAUDE_CODE_OAUTH_TOKEN" in *good) exit 0 ;; *) exit 1 ;; esac ;;
+esac
+`, { mode: 0o755 });
+  const cli = (home, args, input = '') => spawnSync(process.execPath, [CLI, 'pool', ...args], {
+    env: { ...process.env, HOME: home, CLAUDE_TRACKER_DIR: path.join(home, 'data'), CLAUDE_TRACKER_CLAUDE: fake, CLAUDE_CONFIG_DIR: '', NO_COLOR: '1' },
+    encoding: 'utf8', input, timeout: 60_000,
+  });
+  const good = 'sk-ant-oat01-' + 'x'.repeat(60) + 'good';
+  let r = cli(root, ['add', 'b@x.com', '--token', 'not-a-token']);
+  assert.equal(r.status, 1);
+  assert.match(r.stderr, /not a long-lived token/);
+  r = cli(root, ['add', 'b@x.com', '--token', good.replace('good', 'bad0')]);
+  assert.equal(r.status, 1);
+  assert.match(r.stderr, /could not run on that token/);
+  assert.equal(fs.existsSync(path.join(root, '.claude-pool-b')), false, 'nothing kept');
+  // The terminal wrapped the token it printed, so it is pasted as two lines.
+  r = cli(root, ['add', 'b@x.com', '--long'], `${good.slice(0, 50)}\n${good.slice(50)}\n`);
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stdout, /b@x\.com is a spare for a year, in ~\/\.claude-pool-b/);
+  const creds = JSON.parse(fs.readFileSync(path.join(root, '.claude-pool-b', '.credentials.json'), 'utf8')).claudeAiOauth;
+  assert.deepEqual([creds.accessToken, creds.refreshToken, creds.subscriptionType, creds.rateLimitTier], [good, null, 'team', 'default_raven']);
+  // The other machine has never seen b@x.com: the account comes with the token.
+  const tokens = cli(root, ['tokens']).stdout;
+  assert.equal(JSON.parse(tokens.trim()).email, 'b@x.com');
+  r = cli(other, ['import'], tokens);
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stdout, /✓ b@x\.com, in ~\/\.claude-pool-b/);
+  const there = JSON.parse(fs.readFileSync(path.join(other, '.claude-pool-b', '.credentials.json'), 'utf8'));
+  assert.equal(there.claudeAiOauth.accessToken, good);
+  assert.equal(JSON.parse(fs.readFileSync(path.join(other, '.claude-pool-b', '.claude.json'), 'utf8')).oauthAccount.accountUuid, 'B');
+  r = cli(other, ['import'], tokens);
+  assert.match(r.stdout, /b@x\.com: already here/);
 });
 
 test('when every account is nearly used up, each runs to the end before the next', () => {
