@@ -593,14 +593,16 @@ test('pool add --long keeps a token only once Claude runs on it, and pool import
     fs.writeFileSync(path.join(r, '.claude.json'), JSON.stringify({ oauthAccount: { accountUuid: 'main', emailAddress: 'main@x.com' } }));
   }
   inChild(root, `db().prepare("INSERT INTO accounts (account_uuid, email, org_uuid, rate_limit_tier, last_seen) VALUES ('B', 'b@x.com', 'org-B', 'default_raven', ?)").run(now); return 1;`);
-  // Claude Code, as far as this goes: setup-token prints a token; -p works only on a token that ends "good".
+  // Claude Code, as far as this goes: setup-token draws $SCREEN, a real one with its token swapped for a
+  // made-up one; -p runs on any token but a "bad" one, and says when the account's week resets.
   const fake = path.join(root, 'claude');
   fs.writeFileSync(fake, `#!/bin/sh
 case "$1" in
-  setup-token) printf ' ✓ Long-lived authentication token created successfully!\n\n Your OAuth token (valid for 1 year):\n\n'
-               [ -n "$PART1" ] && printf ' %s\n %s\n\n' "$PART1" "$PART2"
-               printf " Store this token securely. You won't be able to see it again.\n" ;;
-  -p) case "$CLAUDE_CODE_OAUTH_TOKEN" in *good) exit 0 ;; *) exit 1 ;; esac ;;
+  setup-token) if [ -n "$SCREEN" ]; then cat "$SCREEN"; else printf ' Store this token securely.\\n'; fi ;;
+  -p) case "$CLAUDE_CODE_OAUTH_TOKEN" in *bad*) exit 1 ;; esac
+      [ -n "$WEEK" ] && printf '{"type":"rate_limit_event","rate_limit_info":{"status":"%s","rateLimitType":"seven_day","resetsAt":%s}}\\n' "\${LIMIT:-allowed}" "$WEEK"
+      [ "$LIMIT" = rejected ] && exit 1
+      printf '{"type":"result","subtype":"success","is_error":false,"result":"ok"}\\n' ;;
 esac
 `, { mode: 0o755 });
   const cli = (home, args, input = '', env = {}) => spawnSync(process.execPath, [CLI, 'pool', ...args], {
@@ -619,12 +621,34 @@ esac
   r = cli(root, ['add', 'b@x.com', '--long'], `${good.slice(0, 50)}\n${good.slice(50)}\n`, { PATH: '/nonexistent' });
   assert.equal(r.status, 0, r.stderr);
   assert.match(r.stdout, /b@x\.com is a spare for a year, in ~\/\.claude-pool-b/);
-  // Otherwise it is taken from what setup-token shows, wrapped and indented as Claude Code shows it: nothing to copy.
+  // Otherwise it is read off what setup-token drew - the screen of a real run, where Claude Code moves
+  // the cursor down a row rather than writing a line break: nothing to copy.
   fs.rmSync(path.join(root, '.claude-pool-b'), { recursive: true });
-  r = cli(root, ['add', 'b@x.com', '--long'], '', { PART1: good.slice(0, 66), PART2: good.slice(66) });
+  const shown = 'sk-ant-oat01-' + 'FakeToken_0123456789-abcdefghij'.repeat(4).slice(0, 95);
+  r = cli(root, ['add', 'b@x.com', '--long'], '', { SCREEN: path.join(import.meta.dirname, 'fixtures', 'setup-token-screen.txt') });
   assert.equal(r.status, 0, r.stderr);
   assert.doesNotMatch(r.stdout, /Paste the token/);
   assert.match(r.stdout, /b@x\.com is a spare for a year, in ~\/\.claude-pool-b/);
+  assert.equal(JSON.parse(fs.readFileSync(path.join(root, '.claude-pool-b', '.credentials.json'), 'utf8')).claudeAiOauth.accessToken, shown);
+  // The browser signs in as whoever is signed in to claude.ai there. A token whose week resets when
+  // another account's does is that account's: refused, unless it is said to be right.
+  const hour = 3600e3, week = 7 * 24 * hour, at = Date.UTC(2026, 9, 15, 6);
+  inChild(root, `db().prepare("INSERT INTO accounts (account_uuid, email, org_uuid, rate_limit_tier, last_seen) VALUES ('C', 'c@x.com', 'org-C', 'default_claude_max_20x', ?)").run(now);
+    const u = db().prepare("INSERT INTO utilization (ts, session_id, account_uuid, limit_type, pct, resets_at) VALUES (?, ?, ?, 'seven_day', 10, ?)");
+    u.run(now, 's1', 'B', ${at}); u.run(now, 's2', 'C', ${at + 5 * hour}); return 1;`);
+  fs.rmSync(path.join(root, '.claude-pool-b'), { recursive: true });
+  r = cli(root, ['add', 'b@x.com', '--token', good], '', { WEEK: String((at + 5 * hour + 3 * week) / 1000) });
+  assert.equal(r.status, 1);
+  assert.match(r.stderr, /that token is c@x\.com's, not b@x\.com's/);
+  assert.equal(fs.existsSync(path.join(root, '.claude-pool-b')), false, 'nothing kept');
+  r = cli(root, ['add', 'b@x.com', '--token', good, '--anyway'], '', { WEEK: String((at + 5 * hour + 3 * week) / 1000) });
+  assert.equal(r.status, 0, r.stderr);
+  assert.doesNotMatch(r.stdout, /It is b@x\.com's/);
+  // Its own week: said to be its own. Out of usage, it still answers with its limits, so it works.
+  fs.rmSync(path.join(root, '.claude-pool-b'), { recursive: true });
+  r = cli(root, ['add', 'b@x.com', '--token', good], '', { WEEK: String((at + 3 * week) / 1000), LIMIT: 'rejected' });
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stdout, /It is b@x\.com's: its week resets when b@x\.com's does/);
   const creds = JSON.parse(fs.readFileSync(path.join(root, '.claude-pool-b', '.credentials.json'), 'utf8')).claudeAiOauth;
   assert.deepEqual([creds.accessToken, creds.refreshToken, creds.subscriptionType, creds.rateLimitTier], [good, null, 'team', 'default_raven']);
   // The other machine has never seen b@x.com: the account comes with the token.

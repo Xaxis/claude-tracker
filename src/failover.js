@@ -398,18 +398,56 @@ const LONG_TOKEN = /^sk-ant-oat\d+-[A-Za-z0-9_-]{40,}$/;
 /** The plan Claude Code shows and runs a token as - it cannot ask, with only the inference scope. */
 const planOf = (tier) => (/max/.test(tier ?? '') ? 'max' : /raven/.test(tier ?? '') ? 'team' : 'pro');
 
-/** Whether Claude Code runs on `token`: one short request, in a scratch profile. */
-function works(token) {
+/**
+ * Whether Claude Code runs on `token` - one short request, in a scratch profile - and
+ * when the week of the account it belongs to resets. An account out of usage is still
+ * answered, with its limits: so a token works if the request was answered or its limits
+ * came back.
+ */
+function tryToken(token) {
   const dir = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), 'ct-token-'));
   return new Promise((resolve) => {
     const env = { ...process.env, CLAUDE_CONFIG_DIR: dir, CLAUDE_CODE_OAUTH_TOKEN: token };
     delete env.ANTHROPIC_API_KEY;
-    const child = spawn(process.env.CLAUDE_TRACKER_CLAUDE || 'claude', ['-p', 'Reply with just: ok', '--model', 'haiku'], { env, cwd: dir, stdio: ['ignore', 'ignore', 'ignore'] });
+    const child = spawn(process.env.CLAUDE_TRACKER_CLAUDE || 'claude', ['-p', 'Reply with just: ok', '--model', 'haiku', '--output-format', 'stream-json', '--verbose'], { env, cwd: dir, stdio: ['ignore', 'pipe', 'ignore'] });
+    let out = '';
+    child.stdout.on('data', (d) => { out = (out + d).slice(-(1 << 20)); });
     const timer = setTimeout(() => child.kill(), 120e3);
-    const done = (ok) => { clearTimeout(timer); fs.rmSync(dir, { recursive: true, force: true }); resolve(ok); };
-    child.on('error', () => done(false));
-    child.on('close', (code) => done(code === 0));
+    const done = (code) => {
+      clearTimeout(timer);
+      fs.rmSync(dir, { recursive: true, force: true });
+      let works = code === 0, week = null;
+      for (const line of out.split('\n')) {
+        let m;
+        try { m = JSON.parse(line); } catch { continue; }
+        if (m?.type === 'result' && m.subtype === 'success' && !m.is_error) works = true;
+        if (m?.type !== 'rate_limit_event') continue;
+        works = true;
+        const i = m.rate_limit_info ?? {};
+        const at = i.unifiedWindows?.seven_day?.resetsAt ?? (i.rateLimitType === 'seven_day' ? i.resetsAt : null);
+        if (at > 0) week = at * 1000;
+      }
+      resolve({ works, week });
+    };
+    child.on('error', () => done(-1));
+    child.on('close', done);
   });
+}
+
+const WEEK_MS = 7 * 86400e3;
+
+/**
+ * Which accounts a token whose week resets at `at` could be. Each account's week starts
+ * at its own hour, the same every week, so the resets its sessions have shown say whose
+ * a token is - `known`, the accounts that have shown one; `same`, those at that hour.
+ */
+function weekMates(at) {
+  const seen = db().prepare(`SELECT DISTINCT a.account_uuid AS uuid, a.email, u.resets_at AS r FROM utilization u
+    JOIN accounts a ON a.account_uuid = u.account_uuid WHERE u.limit_type = 'seven_day' AND u.resets_at > 0`).all();
+  const off = (r) => { const d = (((r - at) % WEEK_MS) + WEEK_MS) % WEEK_MS; return Math.min(d, WEEK_MS - d); };
+  const same = new Map();
+  for (const s of seen) if (off(s.r) < 10 * 60e3) same.set(s.uuid, s.email);
+  return { known: new Set(seen.map((s) => s.uuid)), same };
 }
 
 /**
@@ -418,14 +456,25 @@ function works(token) {
  * sign-in: one token is a spare on every machine. It can only run Claude - claude.ai's
  * connectors, Remote Control and Claude in Chrome want a full sign-in.
  */
-export async function addToken(email, token, { until = Date.now() + LONG_LIVED_MS, account = null, check = true } = {}) {
+export async function addToken(email, token, { until = Date.now() + LONG_LIVED_MS, account = null, check = true, anyway = false } = {}) {
   const e = email.toLowerCase();
   const t = String(token ?? '').replace(/\s+/g, '');
   if (!LONG_TOKEN.test(t)) return { error: 'that is not a long-lived token - they start sk-ant-oat' };
   const row = db().prepare('SELECT account_uuid, email, org_uuid, rate_limit_tier FROM accounts WHERE lower(email) = ?').get(e);
   const who = account ?? (row && { accountUuid: row.account_uuid, emailAddress: row.email, organizationUuid: row.org_uuid, rateLimitTier: row.rate_limit_tier });
   if (!who?.accountUuid) return { error: `${email} has not been seen on this machine yet, so its account is not known` };
-  if (check && !(await works(t))) return { error: 'Claude Code could not run on that token' };
+  let confirmed = false;
+  if (check) {
+    const tried = await tryToken(t);
+    if (!tried.works) return { error: 'Claude Code could not run on that token' };
+    // The browser signs in as whoever is signed in to claude.ai there, whatever was asked.
+    const mates = tried.week ? weekMates(tried.week) : null;
+    confirmed = !!mates?.same.has(who.accountUuid);
+    if (mates && !confirmed && mates.known.has(who.accountUuid) && mates.same.size && !anyway) {
+      const them = [...new Set(mates.same.values())].join(' or ');
+      return { error: `that token is ${them}'s, not ${email}'s: its week resets when theirs does. The browser was signed in to claude.ai as ${them}. Sign out there (or use a private window), sign in as ${email}, and run this again - or, if it really is ${email}'s, add --anyway`, wrongAccount: true };
+    }
+  }
   const list = spares();
   const spare = list.find((s) => s.email?.toLowerCase() === e) ?? list.find((s) => s.for?.toLowerCase() === e && !s.accountUuid) ?? makeSpare(email);
   const tier = who.rateLimitTier ?? null;
@@ -434,7 +483,7 @@ export async function addToken(email, token, { until = Date.now() + LONG_LIVED_M
     account: { accountUuid: who.accountUuid, emailAddress: who.emailAddress ?? email, organizationUuid: who.organizationUuid ?? null },
   }));
   healthRead.clear();
-  return { added: spare };
+  return { added: spare, confirmed };
 }
 
 /** Every long-lived token on this machine, in spares and profiles alike: what `pool import` takes on another. */

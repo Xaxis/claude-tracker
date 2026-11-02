@@ -13,6 +13,7 @@ import { invalidateAggregates, aggregatesCutoff } from './aggregates.js';
 import { closeDb } from './db.js';
 import { importMark, remoteMachines } from './replica.js';
 import { DATA_DIR, DB_PATH } from './paths.js';
+import { tokenIn } from './screen.js';
 
 const C = {
   reset: '\x1b[0m', dim: '\x1b[2m', bold: '\x1b[1m',
@@ -667,19 +668,24 @@ async function cmdPool(action, args, flags) {
     let token = typeof flags.token === 'string' ? flags.token : null;
     let caught = false;
     if (!token) {
-      console.log(`Making a year-long token for ${email}. Sign in to ${c.bold}${email}${c.reset} in the browser when it asks - the token is taken from the screen, nothing to copy.\n`);
-      token = tokenIn(await onTerminal(process.env.CLAUDE_TRACKER_CLAUDE || 'claude', ['setup-token']));
+      console.log(`Making a year-long token for ${email}. The browser signs in as whoever is signed in to claude.ai there: make that ${c.bold}${email}${c.reset} first. The token is read off the screen - nothing to copy.\n`);
+      const shown = await onTerminal(process.env.CLAUDE_TRACKER_CLAUDE || 'claude', ['setup-token']);
+      token = tokenIn(shown, process.stdout.columns || 1000, process.stdout.rows || undefined);
       caught = !!token;
-      if (!token) token = await pastedToken(`\nIt was not picked up. Paste the token it printed (sk-ant-oat…), then Enter: `);
+      if (!token) token = await pastedToken(`\nIt was not picked up. Paste the token it printed (sk-ant-oat…) - line breaks and all - then Enter: `);
     }
-    console.log(`${c.dim}Checking Claude runs on it…${c.reset}`);
-    let r = await F.addToken(email, token);
-    if (r.error && caught) {
+    if (token == null) { console.error('Nothing was changed.'); process.exitCode = 1; return; }
+    console.log(`${c.dim}Checking Claude runs on it, and whose it is…${c.reset}`);
+    const anyway = !!flags.anyway;
+    let r = await F.addToken(email, token, { anyway });
+    if (r.error && caught && !r.wrongAccount) {
       console.error(`${c.red}✗${c.reset} ${r.error}.`);
-      r = await F.addToken(email, await pastedToken('Paste the token it printed (sk-ant-oat…), then Enter: '));
+      const pasted = await pastedToken('Paste the token it printed (sk-ant-oat…) - line breaks and all - then Enter: ');
+      if (pasted == null) { console.error('Nothing was changed.'); process.exitCode = 1; return; }
+      r = await F.addToken(email, pasted, { anyway });
     }
     if (r.error) { console.error(`${c.red}✗${c.reset} ${r.error}. Nothing was changed.`); process.exitCode = 1; return; }
-    console.log(`${c.green}✓${c.reset} ${email} is a spare for a year, in ${r.added.shown}.`);
+    console.log(`${c.green}✓${c.reset} ${email} is a spare for a year, in ${r.added.shown}.${r.confirmed ? ` It is ${email}'s: its week resets when ${email}'s does.` : ''}`);
     console.log(`${c.dim}  Another machine takes every token here with: ssh ${os.hostname()} "bash -lc 'claude-tracker pool tokens'" | claude-tracker pool import${c.reset}`);
     return;
   }
@@ -754,39 +760,59 @@ async function onTerminal(cmd, args) {
 }
 
 /**
- * The last long-lived token in what a terminal showed. Claude Code wraps it to the
- * width of the screen, each line indented, so it carries on past a line break until a
- * blank line.
- */
-export function tokenIn(shown) {
-  const text = String(shown).replace(/\x1b\][^\x07\x1b]*(\x07|\x1b\\)/g, '').replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, '').replace(/\x1b[()][0-9A-B]/g, '').replace(/\r/g, '');
-  const at = text.lastIndexOf('sk-ant-oat');
-  if (at < 0) return null;
-  let token = '';
-  for (let i = at; i < text.length;) {
-    if (/[A-Za-z0-9_-]/.test(text[i])) { token += text[i++]; continue; }
-    if (text[i] !== '\n') break;
-    let k = i + 1;
-    while (text[k] === ' ') k++;
-    if (!/[A-Za-z0-9_-]/.test(text[k] ?? '') || /^[A-Za-z0-9_-]*\s+\S/.test(text.slice(k).split('\n')[0])) break;   // a blank line, or words
-    i = k;
-  }
-  return /^sk-ant-oat\d+-[A-Za-z0-9_-]{40,}$/.test(token) ? token : null;
-}
-
-/**
- * A token pasted at a prompt. A terminal that wrapped it pastes it as several lines,
- * so lines arriving together are one paste, joined.
+ * A token pasted at a prompt, or null if given up with Ctrl-C. A terminal pastes a
+ * wrapped token as several lines, and holds back a last line with no Enter after it
+ * until one comes: so the keys are read one by one, a line break inside a paste is
+ * part of it, and only an Enter with nothing pasted after it ends it.
  */
 function pastedToken(prompt) {
   process.stdout.write(prompt);
+  const stdin = process.stdin;
+  if (!stdin.isTTY) {
+    if (stdin.readableEnded) return Promise.resolve('');
+    return new Promise((resolve) => {
+      let got = '';
+      stdin.setEncoding('utf8');
+      stdin.on('data', (d) => { got += d; });
+      stdin.once('end', () => resolve(got.replace(/\s+/g, '')));
+      stdin.resume();
+    });
+  }
   return new Promise((resolve) => {
-    let got = '', timer = null;
-    const finish = () => { process.stdin.pause(); process.stdin.removeAllListeners('data'); resolve(got.replace(/\s+/g, '')); };
-    process.stdin.setEncoding('utf8');
-    process.stdin.on('data', (d) => { got += d; clearTimeout(timer); if (got.trim()) timer = setTimeout(finish, 400); });
-    process.stdin.on('end', finish);
-    process.stdin.resume();
+    let got = '', pasting = false, timer = null;
+    const finish = (value) => {
+      clearTimeout(timer);
+      stdin.removeListener('data', onKeys);
+      stdin.setRawMode(false);
+      stdin.pause();
+      process.stdout.write('\x1b[?2004l\n');
+      resolve(value);
+    };
+    const onKeys = (d) => {
+      clearTimeout(timer);
+      let enter = false;
+      for (const part of String(d).split(/(\x1b\[20[01]~|\x1b\[[0-9;?]*[ -/]*[@-~]|\x1bO.|\x1b.?)/)) {
+        if (part === '\x1b[200~') { pasting = true; continue; }
+        if (part === '\x1b[201~') { pasting = false; continue; }
+        if (part.startsWith('\x1b')) continue;   // arrows, focus and the like
+        for (const ch of part) {
+          if (ch === '\x03' || (ch === '\x04' && !got)) return finish(null);
+          if (ch === '\r' || ch === '\n') { enter = !pasting; continue; }
+          if (ch === '\x7f' || ch === '\b') { if (got) { got = got.slice(0, -1); process.stdout.write('\b \b'); } enter = false; continue; }
+          if (ch < ' ' || ch === ' ') continue;
+          got += ch;
+          enter = false;
+          process.stdout.write(ch);
+        }
+      }
+      // An Enter pasted without brackets has more of the paste right behind it.
+      if (enter && got) timer = setTimeout(() => finish(got), 250);
+    };
+    stdin.setEncoding('utf8');
+    stdin.setRawMode(true);
+    process.stdout.write('\x1b[?2004h');
+    stdin.on('data', onKeys);
+    stdin.resume();
   });
 }
 
