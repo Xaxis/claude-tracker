@@ -465,7 +465,7 @@ body:not(.detail) #cache { display: none !important; }
   .seg button { padding: 4px 8px; }
   .project-open { flex-basis: 100%; }
 }
-.project-body[hidden] { display: none; }
+.storage-row[hidden], .project-body[hidden] { display: none; }
 .more-btn { margin-top: 8px; }
 @media (max-width: 560px) {
   .project-sum { white-space: normal; }

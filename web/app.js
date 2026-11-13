@@ -1388,8 +1388,10 @@ function renderStorage(s) {
   btn.disabled = !!s.surveying;
   btn.textContent = s.surveying ? 'Surveying…' : 'Rescan';
   const note = $('#storage-note');
+  $('#storage .storage-row').hidden = !s.at;
   if (!s.at) {
-    note.textContent = s.surveying ? 'Measuring the disks for the first time; this takes a few minutes' : 'Not measured yet';
+    note.textContent = s.surveying ? 'Measuring the disks for the first time; this takes a few minutes'
+      : 'Not measured yet: the first survey starts a minute and a half after the tracker does, or press Rescan';
     for (const id of ['#disks', '#owners', '#leftovers', '#cleanup', '#owners-legend']) $(id).textContent = '';
     return;
   }
