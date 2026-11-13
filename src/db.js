@@ -1,5 +1,6 @@
 import { DatabaseSync } from 'node:sqlite';
 import { DB_PATH, ensureDataDir } from './paths.js';
+import { PRICING_ID, repriceSql } from './pricing.js';
 
 const PRAGMAS = `
 PRAGMA journal_mode = WAL;
@@ -374,7 +375,32 @@ export function db() {
   _db = new DatabaseSync(DB_PATH);
   _db.exec(PRAGMAS);
   ensureSchema(_db);
+  repriceIfChanged(_db);
   return _db;
+}
+
+/**
+ * Every stored call priced again by the current table, once each time it changes.
+ * Calibration sums these costs: a window holding calls priced by two tables would
+ * measure neither. Peers price what they receive themselves, so nothing is re-sent.
+ */
+function repriceIfChanged(d) {
+  const priced = () => d.prepare("SELECT value FROM meta WHERE key = 'pricing'").get()?.value === PRICING_ID;
+  if (priced()) return;
+  d.exec('BEGIN IMMEDIATE');
+  try {
+    // Another process may have done it while this one waited for the lock.
+    if (priced()) { d.exec('COMMIT'); return; }
+    for (const { model } of d.prepare('SELECT DISTINCT model FROM events').all()) {
+      d.prepare(`UPDATE events SET cost_usd = ${repriceSql(model)} WHERE model IS ?`).run(model);
+    }
+    d.prepare(`INSERT INTO meta (key, value) VALUES ('pricing', ?)
+               ON CONFLICT(key) DO UPDATE SET value = excluded.value`).run(PRICING_ID);
+    d.exec('COMMIT');
+  } catch (err) {
+    try { d.exec('ROLLBACK'); } catch { /* already rolled back */ }
+    throw err;
+  }
 }
 
 export function getMeta(key, fallback = null) {

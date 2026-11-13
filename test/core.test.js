@@ -10,7 +10,7 @@ process.env.CLAUDE_TRACKER_DIR = TMP;
 process.env.NO_COLOR = '1';
 
 const { db, closeDb } = await import('../src/db.js');
-const { costOf, modelInfo, modelLabel } = await import('../src/pricing.js');
+const { costOf, modelInfo, modelLabel, repriceSql } = await import('../src/pricing.js');
 const { buildWindows, currentWindow, FIVE_HOUR, SEVEN_DAY } = await import('../src/windows.js');
 const { calibrateAll, capacityFor } = await import('../src/calibrate.js');
 const { attributeSessions, attributeEvents } = await import('../src/accounts.js');
@@ -61,6 +61,38 @@ test('pricing uses the right per-model rates', () => {
   // Sonnet 5 and Haiku 4.5 are cheaper tiers.
   assert.equal(costOf('claude-sonnet-5', { input: 1_000_000 }), 2);
   assert.equal(costOf('claude-haiku-4-5-20251001', { output: 1_000_000 }), 5);
+});
+
+test('each point release is priced and named as itself, not as its family', () => {
+  // Opus 5.5 is cheaper than Opus 5, and its cache reads are priced on their own.
+  assert.equal(costOf('claude-opus-5-5', { input: 1_000_000 }), 4);
+  assert.equal(costOf('claude-opus-5-5', { output: 1_000_000 }), 20);
+  assert.equal(costOf('claude-opus-5-5', { cacheRead: 1_000_000 }), 0.2);
+  assert.equal(costOf('claude-sonnet-5-5', { cacheRead: 1_000_000 }), 0.1);
+  assert.equal(costOf('claude-fable-5-2', { output: 1_000_000 }), 40);
+  assert.deepEqual(['claude-opus-5-5', 'claude-opus-5', 'claude-sonnet-5-5', 'claude-haiku-5-5', 'claude-fable-5-2', 'claude-haiku-4-5-20251001']
+    .map(modelLabel), ['Opus 5.5', 'Opus 5', 'Sonnet 5.5', 'Haiku 5.5', 'Fable 5.2', 'Haiku 4.5']);
+  assert.equal(modelLabel('claude-opus-5-7'), 'Opus 5.7', 'a release the table does not list yet still shows as itself');
+  assert.equal(modelLabel('claude-3-7-sonnet-20250219'), 'Sonnet 3.7');
+});
+
+test('Haiku 5.5 costs five times as much once a prompt passes 100K tokens', () => {
+  assert.equal(costOf('claude-haiku-5-5', { input: 100_000, output: 1_000_000 }), 0.01 + 0.5);
+  assert.equal(costOf('claude-haiku-5-5', { input: 50_000, cacheRead: 60_000, output: 1_000_000 }), (50_000 * 0.5 + 60_000 * 0.05) / 1e6 + 2.5,
+    'cached tokens count toward the prompt');
+});
+
+test('stored calls are repriced in SQL exactly as costOf prices a new one', () => {
+  const d = db();
+  const row = (model, i, o, w5, w1, r) => ({ model, input_tokens: i, output_tokens: o, cache_write_5m: w5, cache_write_1h: w1, cache_read: r });
+  const rows = [row('claude-opus-5-5[1m]', 1234, 5678, 910, 1112, 131415), row('claude-haiku-5-5', 20_000, 300, 0, 0, 90_000),
+    row('claude-haiku-5-5', 20_000, 300, 0, 0, 70_000), row('claude-fable-5-1', 1, 2, 3, 4, 5), row(null, 10, 10, 0, 0, 0)];
+  for (const r of rows) {
+    const sql = d.prepare(`SELECT ${repriceSql(r.model)} AS c FROM (SELECT ? input_tokens, ? output_tokens, ? cache_write_5m, ? cache_write_1h, ? cache_read)`)
+      .get(r.input_tokens, r.output_tokens, r.cache_write_5m, r.cache_write_1h, r.cache_read).c;
+    const js = costOf(r.model, { input: r.input_tokens, output: r.output_tokens, cacheWrite5m: r.cache_write_5m, cacheWrite1h: r.cache_write_1h, cacheRead: r.cache_read });
+    assert.ok(Math.abs(sql - js) < 1e-12, `${r.model}: ${sql} vs ${js}`);
+  }
 });
 
 test('context-window suffixes do not change the rate', () => {

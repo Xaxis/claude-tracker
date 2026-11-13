@@ -94,10 +94,10 @@ test('a running session shows its main thread’s context, its subagents at work
   `);
   assert.equal(r.context.tokens, 600_002);
   assert.equal(r.context.compactAt, 967_000);
-  assert.ok(Math.abs(r.context.perTurn - 0.300001) < 1e-6, `re-reading 600k on Opus costs $0.30, not ${r.context.perTurn}`);
+  assert.ok(Math.abs(r.context.perTurn - 0.1200004) < 1e-6, `re-reading 600k on Opus 5.5 costs $0.12, not ${r.context.perTurn}`);
   assert.deepEqual(r.agents, ['translate'], 'only subagents seen in the last 15 minutes, named from their meta');
   assert.equal(r.recache.turns, 1);
-  assert.ok(Math.abs(r.recache.cost - 490_000 * 6.25e-6) < 1e-6, 'priced as a 5-minute cache write');
+  assert.ok(Math.abs(r.recache.cost - 490_000 * 5e-6) < 1e-6, 'priced as a 5-minute cache write');
   assert.deepEqual(r.leases, [], 'no GPU or CPU pool on this machine');
 });
 
@@ -230,8 +230,8 @@ test('re-written caches are counted for subagents and the main thread apart, and
   assert.equal(before.day.turns, 1);
   assert.equal(before.week.sub.turns, 1);
   assert.equal(before.week.main.turns, 1);
-  assert.ok(Math.abs(before.week.sub.cost - 500_000 * 6.25e-6) < 1e-6);
-  assert.ok(Math.abs(before.week.main.cost - 300_000 * 10e-6) < 1e-6, 'an hour-long write is priced at twice input');
+  assert.ok(Math.abs(before.week.sub.cost - 500_000 * 5e-6) < 1e-6);
+  assert.ok(Math.abs(before.week.main.cost - 300_000 * 8e-6) < 1e-6, 'an hour-long write is priced at twice input');
   assert.deepEqual(before.ttl, { sub: '5m', main: '1h' });
   assert.equal(before.hint?.setting, 'subagentPromptCacheTtl');
   assert.equal(before.week.share, before.week.cost / before.week.spend);
