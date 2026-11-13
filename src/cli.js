@@ -6,7 +6,8 @@ import {
   listAccounts, accountLabel, resolveAccountEmails, setLabel, attributeEvents,
 } from './accounts.js';
 import { calibrateAll, verifyWindowModel } from './calibrate.js';
-import { overview, modelBreakdown, liveSessions, inUse, boxes, versionOf } from './api.js';
+import { overview, modelBreakdown, liveSessions, inUse, boxes, versionOf, machineOnce, storagePanel, surveyNow } from './api.js';
+import { setPriority, runNext, priorities, TIERS } from './machine.js';
 import { cacheSummary } from './context.js';
 import { LIMIT_TYPES, resetWindowCache, earliestCachedChain } from './windows.js';
 import { invalidateAggregates, aggregatesCutoff } from './aggregates.js';
@@ -946,6 +947,124 @@ async function cmdSync(action, args, flags) {
   console.log();
 }
 
+/* --- this machine ---------------------------------------------------------- */
+
+const gb = (n) => (n == null ? '—' : n >= 2 ** 40 ? `${(n / 2 ** 40).toFixed(1)} TB` : n >= 2 ** 30 ? `${(n / 2 ** 30).toFixed(1)} GB` : `${Math.round(n / 2 ** 20)} MB`);
+const cores = (n) => (n == null ? '—' : n < 0.05 ? '0' : n < 10 ? n.toFixed(1) : String(Math.round(n)));
+const procs = (top) => top.map((t) => `${t.comm}${t.n > 1 ? ` ×${t.n}` : ''}${t.cores >= 0.05 ? ` ${cores(t.cores)}` : ''}`).join(', ');
+const TIER_COLOR = { high: 'cyan', normal: 'reset', low: 'dim', paused: 'yellow' };
+
+/** What uses this machine now: each project's cores, memory, sessions, jobs and waiting jobs, and why they wait. */
+async function cmdMachine(flags) {
+  const v = await machineOnce();
+  if (!v) { console.log('Only on Linux: this machine has no /proc to read.'); return; }
+  if (flags.json) { console.log(JSON.stringify(v, null, 2)); return; }
+  const now = Date.now();
+  const cpu = v.cpu;
+  console.log(`\n${c.bold}This machine${c.reset} ${c.dim}· ${new Date(v.at).toLocaleTimeString()}${c.reset}`);
+  console.log(`  CPU     ${c.bold}${cores(cpu.busy)}${c.reset} of ${cpu.cores} cores busy · ${Math.round(cpu.demand)} threads want one${cpu.gate != null ? ` (the pool starts jobs under ${Math.round(cpu.gate)})` : ''}`);
+  console.log(`  Memory  ${c.bold}${gb(v.mem.used)}${c.reset} of ${gb(v.mem.total)}${v.mem.swapUsed > 2 ** 28 ? ` · ${gb(v.mem.swapUsed)} in swap` : ''}`);
+  if (v.gpu) console.log(`  GPU     ${c.bold}${v.gpu.busy ?? '—'}%${c.reset} busy${v.gpu.vramTotal ? ` · ${gb(v.gpu.vramUsed)} of ${gb(v.gpu.vramTotal)} video memory` : ''}`);
+  if (cpu.slots) console.log(`  Pool    ${c.bold}${cpu.held}${c.reset} of ${cpu.slots} slots${cpu.waiting ? ` · ${cpu.waiting} waiting` : ''}`);
+  const pr = v.priority;
+  console.log(`\n${c.bold}Projects${c.reset} ${c.dim}· ${pr.set ? 'the owner\'s priorities' : 'no priorities set: first come, first served'}${c.reset}`);
+  for (const p of v.projects) {
+    const tier = `${c[TIER_COLOR[p.tier]] ?? ''}${pad(p.tier, 7)}${c.reset}`;
+    const bits = [`${cores(p.cores)} cores`, gb(p.mem)];
+    if (p.sessions.length) bits.push(`${p.sessions.length} session${p.sessions.length === 1 ? '' : 's'}`);
+    if (p.jobs.length) bits.push(`${p.jobs.length} job${p.jobs.length === 1 ? '' : 's'}`);
+    if (p.waits.length) bits.push(`${c.yellow}${p.waits.length} waiting${c.reset}`);
+    if (p.leftovers.length) bits.push(`${p.leftovers.length} left running`);
+    console.log(`  ${tier} ${c.bold}${pad(p.name, 18)}${c.reset} ${bits.join(' · ')}`);
+    for (const j of p.jobs) {
+      console.log(`           ${c.blue}■${c.reset} ${duration(now - j.since)} ${(j.cmd ?? `pid ${j.pid}`).slice(0, 70)} ${c.dim}· ${cores(j.cores)} cores, ${gb(j.mem)}${j.legacy ? ' · old share' : ''}${c.reset}`);
+    }
+    for (const w of p.waits.slice(0, flags.all ? undefined : 5)) {
+      console.log(`           ${c.yellow}▸${c.reset} ${duration(now - w.since)} ${c.dim}pid ${w.pid}${w.next ? ' · runs next' : ''}${c.reset} ${w.why ?? 'has not said why yet'}`);
+    }
+    if (!flags.all && p.waits.length > 5) console.log(`           ${c.dim}… ${p.waits.length - 5} more waiting (--all shows them)${c.reset}`);
+    for (const l of p.leftovers) {
+      console.log(`           ${c.dim}left running: ${l.orphan ? 'a killed job\'s processes' : `session ${l.sessionId?.slice(0, 8)} ended`} · ${procs(l.top)} · ${gb(l.mem)}${c.reset}`);
+    }
+  }
+  console.log(`\n${c.bold}Not in any project${c.reset}`);
+  for (const o of v.others) console.log(`  ${pad(o.name, 37)} ${pad(`${cores(o.cores)} cores`, 11)} ${o.mem ? gb(o.mem) : ''} ${c.dim}${procs(o.top ?? [])}${c.reset}`);
+  console.log(`\n${c.dim}Set who goes first: claude-tracker priority <project> high|normal|low|paused (the owner's to set).${c.reset}\n`);
+}
+
+/** The owner's priorities: show them, or set one project's. */
+function cmdPriority(args, flags) {
+  if (args.length === 0) {
+    const pr = priorities();
+    console.log(`\n${c.bold}Who goes first${c.reset} ${c.dim}· ${pr.file}${c.reset}`);
+    if (!pr.set) console.log(`  ${c.dim}None set: first come, first served, with heavy's own ranks below.${c.reset}`);
+    for (const [name, tier] of Object.entries(pr.ranks).sort((a, b) => TIERS.indexOf(a[1]) - TIERS.indexOf(b[1]))) {
+      console.log(`  ${c[TIER_COLOR[tier]] ?? ''}${pad(tier, 7)}${c.reset} ${name}`);
+    }
+    console.log(`  ${c.dim}normal  every other project${c.reset}\n`);
+    return;
+  }
+  const [project, tier] = args;
+  if (!project || !TIERS.includes(tier)) {
+    console.error(`usage: claude-tracker priority [<project> ${TIERS.join('|')}]`);
+    process.exitCode = 1;
+    return;
+  }
+  try {
+    setPriority(project, tier, flags.by ?? 'claude-tracker priority');
+    console.log(`${c.green}✓${c.reset} ${project} is ${tier}: its waiting jobs move within seconds, and its running jobs' share of the CPU changes now.`);
+  } catch (err) {
+    console.error(`${c.red}✗${c.reset} ${err.message}`);
+    process.exitCode = 1;
+  }
+}
+
+function cmdRunNext(args) {
+  const pid = Number(args[0]);
+  if (!Number.isInteger(pid) || pid <= 0) { console.error('usage: claude-tracker run-next <pid of a waiting heavy>  (claude-tracker machine lists them)'); process.exitCode = 1; return; }
+  try {
+    console.log(`${c.green}✓${c.reset} ${runNext(pid).replace(/^heavy: /, '')}`);
+  } catch (err) {
+    console.error(`${c.red}✗${c.reset} ${err.message}`);
+    process.exitCode = 1;
+  }
+}
+
+/** Who fills the disks, and what is left behind: from the last survey, or a fresh one with --rescan. */
+async function cmdStorage(flags) {
+  if (flags.rescan) {
+    console.log(`${c.dim}Measuring the disks at idle priority; this takes a few minutes…${c.reset}`);
+    await surveyNow();
+  }
+  const s = storagePanel();
+  if (!s) { console.log('Only on Linux.'); return; }
+  if (!s.at) { console.log('Not measured yet: the tracker measures a minute and a half after it starts, or run claude-tracker storage --rescan.'); return; }
+  if (flags.json) { console.log(JSON.stringify(s, null, 2)); return; }
+  console.log(`\n${c.bold}Disk space${c.reset} ${c.dim}· measured ${duration(Date.now() - s.at)} ago${c.reset}`);
+  for (const d of s.disks) {
+    const pct = Math.round((d.used / d.size) * 100);
+    console.log(`  ${pad(d.mount, 16)} ${bar(pct, 20)} ${pct}%  ${gb(d.used)} of ${gb(d.size)} · ${gb(d.avail)} free${d.grew != null && Math.abs(d.grew) >= 2 ** 30 ? ` · ${d.grew > 0 ? '+' : '-'}${gb(Math.abs(d.grew))} in a day` : ''}`);
+  }
+  console.log(`\n${c.bold}Who fills it${c.reset}`);
+  for (const o of s.owners.slice(0, flags.all ? undefined : 12)) {
+    const extra = [o.left > 0 ? `${c.yellow}${gb(o.left)} not cleaned up${c.reset}` : null,
+      o.grew != null && Math.abs(o.grew) >= 2 ** 28 ? `${o.grew > 0 ? '+' : '-'}${gb(Math.abs(o.grew))} in a day` : null].filter(Boolean).join(' · ');
+    console.log(`  ${pad(gb(o.bytes), 9)} ${pad(o.name, 22)} ${extra}`);
+  }
+  if (s.left.length) {
+    console.log(`\n${c.bold}Not cleaned up${c.reset} ${c.dim}· ${gb(s.leftTotal)} that what made it no longer uses${c.reset}`);
+    for (const l of s.left.slice(0, 8)) {
+      const o = s.owners.find((x) => x.key === l.key);
+      console.log(`  ${pad(gb(l.bytes), 9)} ${pad(l.name, 22)} ${c.dim}${[o?.counts.scratchpadsLeft ? `${o.counts.scratchpadsLeft} ended scratchpad${o.counts.scratchpadsLeft === 1 ? '' : 's'}` : null, o?.counts.worktreesLeft ? `${o.counts.worktreesLeft} idle worktree${o.counts.worktreesLeft === 1 ? '' : 's'}` : null].filter(Boolean).join(' · ')}${c.reset}`);
+    }
+  }
+  if (s.commands.length) {
+    console.log(`\n${c.bold}Clean up${c.reset}`);
+    for (const cmd of s.commands) console.log(`  ${cmd.cmd}\n    ${c.dim}${cmd.label}${c.reset}`);
+  }
+  console.log();
+}
+
 function help() {
   console.log(`
 ${c.bold}claude-tracker${c.reset} — local usage and rate-limit tracking for Claude accounts
@@ -956,6 +1075,10 @@ ${c.bold}claude-tracker${c.reset} — local usage and rate-limit tracking for Cl
   ${c.bold}tui${c.reset}                         terminal dashboard alone, no HTTP server
   ${c.bold}status${c.reset}                      one-shot limit status for every account
   ${c.bold}sessions${c.reset}                    what is running, its context a turn, who waits for the GPU or CPU
+  ${c.bold}machine${c.reset} [--all] [--json]     what uses this machine: cores, memory, jobs and waits, by project
+  ${c.bold}priority${c.reset} [<project> <tier>]   who goes first: high, normal, low or paused (the owner's to set)
+  ${c.bold}run-next${c.reset} <pid>                start one waiting job before the rest
+  ${c.bold}storage${c.reset} [--rescan] [--json]  who fills the disks, and what is left behind
   ${c.bold}ingest${c.reset} [--force]            read new transcript data
   ${c.bold}accounts${c.reset}                    list discovered accounts
         ${c.dim}export [file.csv]${c.reset}         every account as a spreadsheet (Downloads by default)
@@ -1032,6 +1155,10 @@ export async function runCli(argv) {
       case 'models': await refresh({ quiet: true }); cmdModels(Number(flags.days ?? 30)); break;
       case 'sessions': await refresh({ quiet: true }); cmdSessions(); break;
       case 'verify': await refresh({ quiet: true }); cmdVerify(); break;
+      case 'machine': await cmdMachine(flags); break;
+      case 'priority': cmdPriority(rest.slice(1), flags); break;
+      case 'run-next': cmdRunNext(rest.slice(1)); break;
+      case 'storage': await cmdStorage(flags); break;
       case 'where':
         console.log(`data dir : ${DATA_DIR}`);
         console.log(`database : ${DB_PATH}`);

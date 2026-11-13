@@ -15,6 +15,8 @@ import { getMeta } from './db.js';
 import { boxState, boxView, sessionLeases } from './box.js';
 import { mainContext, activeAgents, sessionRecaches, placeName } from './context.js';
 import { readConfig as slackConfig, bridgeStatus } from './bridge.js';
+import { machineView, startSampler, sampleNow } from './machine.js';
+import { storageView, startSurveys, survey } from './storage.js';
 
 const UNATTRIBUTED = '__unattributed__';
 
@@ -517,6 +519,49 @@ export function boxPanel(now = Date.now(), entries = null) {
   }
   return boxView(boxState(now), (id) => names.get(id) ?? null, placeName);
 }
+
+/** Running Claude sessions as the machine sampler and the storage survey want them. */
+function runningSessions() {
+  return [...runningEntries()].map(({ s }) => ({ sessionId: s.sessionId, parkedJobId: s.parkedJobId ?? null, pid: s.pid,
+    cwd: s.cwd, name: s.name ?? null, status: s.status ?? null }));
+}
+
+/** A session's name from any id it goes by, among the running ones. */
+function sessionNamer() {
+  const names = new Map();
+  for (const s of runningSessions()) for (const id of [s.sessionId, s.parkedJobId]) if (id && s.name) names.set(id, s.name);
+  return (id) => names.get(id) ?? null;
+}
+
+/** Sample what uses this machine every few seconds, and survey its disks a few times a day. */
+export function startMachineWatch({ surveys = true } = {}) {
+  startSampler(runningSessions);
+  if (surveys) startSurveys(storageContext);
+}
+
+/** What the storage survey needs: the running sessions, and every folder a session ran in this month. */
+function storageContext() {
+  const since = Date.now() - 30 * 86400e3;
+  const recentDirs = db().prepare('SELECT DISTINCT cwd FROM sessions WHERE last_ts >= ? AND cwd IS NOT NULL').all(since).map((r) => r.cwd);
+  return { sessions: runningSessions(), recentDirs };
+}
+
+/** This machine's cores, memory and GPU by project, session and job; null off Linux. */
+export function machinePanel() {
+  return machineView({ step: 60e3, nameOf: sessionNamer(), placeName });
+}
+
+/** The same, for a one-off look when no sampler is running (the CLI). */
+export async function machineOnce() {
+  await sampleNow(runningSessions);
+  return machinePanel();
+}
+
+/** Who fills the disks and who leaves things behind, from the last survey. */
+export const storagePanel = () => storageView();
+
+/** Survey the disks now (the dashboard's Rescan, the CLI); resolves when it is done. */
+export const surveyNow = () => survey(storageContext);
 
 /** Every machine's GPU and CPU pool: this one's, then each synced machine's as it last reported. */
 export function boxes(now = Date.now()) {

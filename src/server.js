@@ -3,7 +3,9 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { exec } from 'node:child_process';
-import { overview, history, sessions, modelBreakdown, liveSessions, windowHistory, localState, boxes, build } from './api.js';
+import { overview, history, sessions, modelBreakdown, liveSessions, windowHistory, localState, boxes, build,
+  machinePanel, storagePanel, surveyNow, startMachineWatch } from './api.js';
+import { setPriority, runNext } from './machine.js';
 import { cacheSummary } from './context.js';
 import { verifyWindowModel } from './calibrate.js';
 import { startWatcher } from './watcher.js';
@@ -79,6 +81,8 @@ function handleApi(req, res, url) {
     case '/api/models': return sendJson(res, modelBreakdown(days, account));
     case '/api/live': return sendJson(res, liveSessions());
     case '/api/box': return sendJson(res, boxes());
+    case '/api/machine': return sendJson(res, machinePanel() ?? { unavailable: true });
+    case '/api/storage': return sendJson(res, storagePanel() ?? { unavailable: true });
     case '/api/cache': return sendJson(res, cacheSummary());
     case '/api/accounts': return sendJson(res, listAccounts());
     case '/api/accounts.csv': {
@@ -98,6 +102,49 @@ function handleApi(req, res, url) {
       return sendJson(res, windowHistory(account, q.get('type') ?? 'five_hour', Math.min(60, Number(q.get('count') ?? 14))));
     default:
       return sendJson(res, { error: 'not found' }, 404);
+  }
+}
+
+/**
+ * The dashboard's only writes: the owner's priorities, "run this next", and a
+ * fresh disk survey. Every other route is a read. A page on another site can
+ * make a browser send a request here, so a write must come from this
+ * dashboard: the Host must be this loopback address (no DNS rebinding), any
+ * Origin must be the same, and the body must be JSON, which no plain form or
+ * cross-site fetch can send without asking first.
+ */
+async function handleWrite(req, res, url) {
+  const host = String(req.headers.host ?? '');
+  const local = /^(?:127\.0\.0\.1|localhost|\[::1\])(?::\d+)?$/i.test(host);
+  const origin = req.headers.origin;
+  if (!local || (origin && origin !== `http://${host}`) || !/^application\/json\b/i.test(String(req.headers['content-type'] ?? ''))) {
+    return sendJson(res, { error: 'writes come from the dashboard itself' }, 403);
+  }
+  let body = '';
+  for await (const chunk of req) {
+    body += chunk;
+    if (body.length > 4096) return sendJson(res, { error: 'too large' }, 413);
+  }
+  let msg;
+  try { msg = body ? JSON.parse(body) : {}; } catch { return sendJson(res, { error: 'not JSON' }, 400); }
+  try {
+    switch (url.pathname) {
+      case '/api/priority':
+        setPriority(msg.project, msg.tier, 'claude-tracker (dashboard)');
+        broadcast('machine', { at: Date.now() });
+        return sendJson(res, machinePanel() ?? {});
+      case '/api/run-next':
+        runNext(Number(msg.pid));
+        broadcast('machine', { at: Date.now() });
+        return sendJson(res, machinePanel() ?? {});
+      case '/api/storage/rescan':
+        surveyNow().then(() => broadcast('storage', { at: Date.now() }), (err) => console.error('storage survey:', err.message));
+        return sendJson(res, { started: true });
+      default:
+        return sendJson(res, { error: 'not found' }, 404);
+    }
+  } catch (err) {
+    return sendJson(res, { error: err.message }, 400);
   }
 }
 
@@ -152,6 +199,12 @@ export async function serve({ port = 4785, open = false, refresh, fastRefresh, a
     // A failing query must surface as a 500, never take the server down with it.
     try {
       if (url.pathname === '/events') return handleEvents(req, res);
+      if (req.method === 'POST' && url.pathname.startsWith('/api/')) {
+        return handleWrite(req, res, url).catch((err) => {
+          console.error(`${url.pathname}:`, err.message);
+          if (!res.headersSent) sendJson(res, { error: err.message }, 500); else res.end();
+        });
+      }
       if (url.pathname.startsWith('/api/')) return handleApi(req, res, url);
       return serveStatic(req, res, url.pathname);
     } catch (err) {
@@ -208,6 +261,10 @@ export async function serve({ port = 4785, open = false, refresh, fastRefresh, a
       }
     }
   }
+
+  // What uses this machine: sampled by whichever process shows it, and its disks
+  // surveyed by the one that serves the port.
+  if (web || tui) startMachineWatch({ surveys: web });
 
   let ui = null;
   let sync = null;

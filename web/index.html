@@ -20,7 +20,7 @@
       <span id="live-label">connecting…</span>
     </span>
     <button id="detail-toggle" class="ghost-btn" type="button" aria-pressed="false"
-            title="Context per turn, agents, the GPU and CPU pool, re-written caches (d)">Detail</button>
+            title="Context per turn, agents, other machines' GPU and CPU pools, re-written caches (d)">Detail</button>
     <button id="theme-toggle" class="ghost-btn" type="button" aria-label="Switch colour theme">
       <span id="theme-label">Auto</span>
     </button>
@@ -65,6 +65,71 @@
       <p class="panel-note" id="live-count"></p>
     </div>
     <div id="live-sessions" class="session-list live-grid"></div>
+  </section>
+
+  <section class="panel" id="machine" hidden>
+    <div class="panel-head">
+      <h2>This machine</h2>
+      <div class="controls">
+        <p class="panel-note" id="machine-note"></p>
+        <button class="ghost-btn" id="machine-table-toggle" type="button" aria-pressed="false">Table</button>
+      </div>
+    </div>
+    <div class="stat-grid machine-stats" id="machine-stats"></div>
+    <div class="cores">
+      <div class="cores-top">
+        <h3 class="sub-h">Who has the cores now</h3>
+        <span class="panel-note" id="cores-sub"></span>
+      </div>
+      <div class="cores-bar" id="cores-bar" role="img"></div>
+      <div class="legend cores-legend" id="cores-legend"></div>
+    </div>
+    <h3 class="sub-h">The last hour</h3>
+    <div class="chart-wrap">
+      <div id="cores-chart" class="chart" role="img" aria-label="Cores in use by project over the last hour, a column a minute"></div>
+    </div>
+    <div id="machine-table" class="table-wrap" hidden></div>
+
+    <div class="projects-head">
+      <h3 class="sub-h">Projects and who goes first</h3>
+      <p class="panel-note" id="priority-note"></p>
+    </div>
+    <p class="tier-help" id="tier-help">
+      <strong>High</strong> starts its jobs first and gets 4&times; the CPU when the cores run out.
+      <strong>Low</strong> waits while others want a slot and gets a fifth.
+      <strong>Paused</strong> starts nothing new; what runs goes on, on idle CPU only.
+      A change reaches running jobs at once, and waiting ones within seconds.
+    </p>
+    <p class="callout" id="priority-error" hidden></p>
+    <div id="projects" class="project-list"></div>
+    <details class="others" id="others-wrap">
+      <summary>Not in any project: <span id="others-sum"></span></summary>
+      <div id="others" class="session-list"></div>
+    </details>
+  </section>
+
+  <section class="panel" id="storage" hidden>
+    <div class="panel-head">
+      <h2>Disk space</h2>
+      <div class="controls">
+        <p class="panel-note" id="storage-note"></p>
+        <button class="ghost-btn" id="storage-rescan" type="button">Rescan</button>
+      </div>
+    </div>
+    <div id="disks" class="disk-list"></div>
+    <div class="panel-row storage-row">
+      <div class="storage-col">
+        <h3 class="sub-h">Who fills it</h3>
+        <div class="legend" id="owners-legend"></div>
+        <div id="owners" class="owner-list"></div>
+      </div>
+      <div class="storage-col">
+        <h3 class="sub-h">Not cleaned up</h3>
+        <p class="panel-note" id="left-note"></p>
+        <div id="leftovers" class="owner-list"></div>
+      </div>
+    </div>
+    <div id="cleanup" class="cleanup"></div>
   </section>
 
   <section class="panel" id="box" hidden>

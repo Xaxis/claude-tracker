@@ -77,6 +77,10 @@ Run it from any directory once linked:
 | `claude-tracker serve --no-tui` | web only, good for leaving running |
 | `claude-tracker status` | one-shot summary — fine for a shell prompt |
 | `claude-tracker sessions` | what is running, the context each carries, who waits for the GPU or CPU |
+| `claude-tracker machine` | what uses this machine: cores, memory and jobs by project, and why jobs wait |
+| `claude-tracker priority my-app high` | who goes first on the shared CPU pool: high, normal, low or paused |
+| `claude-tracker run-next 12345` | start one waiting job before all the others |
+| `claude-tracker storage` | who fills the disks, and what nobody cleaned up |
 | `claude-tracker models --days 7` | where the spend went |
 | `claude-tracker verify` | check the window model against your own resets |
 | `claude-tracker accounts` | list accounts and their UUIDs |
@@ -597,6 +601,60 @@ it last reported it.
 A Mac has no `/proc` to read an environment from, so there jobs are listed by
 project. A machine without either tool shows neither.
 
+### This machine: who has the cores, and who goes first
+
+Seven sessions sharing one box each see only their own work. The **This machine**
+panel shows all of it: cores busy, memory, the GPU and the job pool, a bar of
+who has the cores right now, the last hour a column a minute, and every project
+with what it uses. Open a project to see its sessions (with the processes doing
+the work: `vitest`, not `node`), its jobs in the pool, its jobs waiting and the
+reason each gives (`gives way to my-app, higher in the owner's priorities`,
+`waits for the load: 41 threads want a CPU, gate 30`), and what it left running:
+processes of a session that has ended, or of a job whose `heavy` was killed.
+What belongs to no project (the desktop, the browser, this tracker, short-lived
+processes) folds into one line. The sampler reads `/proc` and each job's cgroup
+every 3 s, and costs about 50 ms of one core each time.
+
+Each project has four choices, which set its priority on claude-core's `heavy`
+pool for every session at once:
+
+| | Starts its jobs | Share of the cores when they run out |
+|---|---|---|
+| **High** | before other projects' waiting jobs, and may borrow slots | 4× normal |
+| **Normal** | first come, first served | 1× |
+| **Low** | after higher projects that want a slot | 1/5 |
+| **Paused** | nothing new | idle CPU only, for what already runs |
+
+The share applies to jobs that are running already: each project's jobs run in a
+systemd slice of their own, and the slice's `CPUWeight` changes the moment you
+click. A long benchmark is never killed to make room, only slowed. Waiting jobs
+take the new order within a poll (2 s). **Run next** on one waiting job starts it
+before every other as soon as a slot is free. `heavy` holds the rule
+(`~/.local/state/box/priority.json`); the dashboard, `claude-tracker priority`
+and `heavy --priority` all go through it, and agents are kept from setting
+priorities by claude-core's command guard.
+
+The dashboard's writes (priority, run next, rescan) only come from the dashboard
+itself: a loopback `Host`, the same `Origin`, and a JSON body, so no other page
+open in your browser can send one.
+
+### Disk space
+
+A few times a day, at idle disk priority, the tracker measures where the disks
+went and whose it is: each project's checkout, worktrees, scratchpads, temp
+folders and transcripts, the caches named for a project, the shared caches, and
+Claude Code's own folder. **Not cleaned up** ranks what nothing uses any more:
+scratchpads of sessions that ended days ago, worktrees no session has touched in
+a week, idle temp folders. Under it are the commands that clean up safely:
+`tmp-sweep`, `wt prune` per repository, and caches that only ever grow (Node's
+compile cache, npm's, uv's). The tracker deletes nothing itself. Each disk
+shows how much it grew in a day, and each owner too, so a runaway cache stands
+out. `claude-tracker storage --rescan` measures now.
+
+A temp folder counts as a project's when its name starts with the project's
+(`my-app-release-3`). Tools that use a short prefix instead (`ma-run-1`) can be
+named in `~/.claude/tracker/temp-prefixes.json`: `{"ma": "my-app"}`.
+
 ### Cache re-written after a pause
 
 Most of a turn's context is read from the prompt cache. The cache lapses after a
@@ -835,6 +893,8 @@ depend on your own usage history.
 | `src/api.js` | aggregation for both dashboards |
 | `src/context.js` | what each session carries per turn, and caches re-written after a pause |
 | `src/box.js` | the shared GPU lease and CPU pool, each job named by its session |
+| `src/machine.js` | what uses this machine: every process by project, session and job; the owner's priorities |
+| `src/storage.js` | who fills the disks, and what was left behind |
 | `src/tui.js` | terminal dashboard |
 | `src/server.js` | HTTP API, static files, live updates |
 | `web/` | browser dashboard |

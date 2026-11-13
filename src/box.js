@@ -78,21 +78,30 @@ function holder(dir, name, now) {
     since: info.since ? info.since * 1000 : null,
     heldMs: info.since ? Math.max(0, now - info.since * 1000) : null,
     cmd: info.cmd ?? null, cwd: ran.cwd ?? info.cwd ?? null, sessionId: ran.sessionId,
+    solo: !!info.solo, priority: !!info.priority,
   };
 }
 
-/** Live queue tickets, oldest first. A ticket is `<time ns>-<pid>[-<start>]`, holding the project. */
+/**
+ * Live queue tickets, oldest first. A ticket is `<time ns>-<pid>[-<start>]`: its
+ * first line the project, then what it was started as (priority, solo, defer
+ * ...). heavy notes why each waits in why/<ticket>, and the owner's "run next"
+ * in next/<ticket>.
+ */
 function queue(dir, now) {
   const out = [];
+  const next = new Set(list(path.join(dir, 'next')) ?? []);
   for (const name of list(path.join(dir, 'queue')) ?? []) {
-    const [ns, pid, start] = name.split('-');
+    const [ns, pid, start] = name.replace(/^0/, '').split('-');
     if (!/^\d+$/.test(ns ?? '') || !/^\d+$/.test(pid ?? '')) continue;
     if (!alive(Number(pid), start)) continue;
-    let project = null;
-    try { project = fs.readFileSync(path.join(dir, 'queue', name), 'utf8').trim() || null; } catch { continue; }
+    let lines;
+    try { lines = fs.readFileSync(path.join(dir, 'queue', name), 'utf8').split('\n').map((l) => l.trim()); } catch { continue; }
     const since = Math.floor(Number(ns) / 1e6);
     const who = whoRan(Number(pid));
-    out.push({ project, pid: Number(pid), since, waitedMs: Math.max(0, now - since), sessionId: who.sessionId, cwd: who.cwd });
+    out.push({ ticket: name, project: lines[0] || null, pid: Number(pid), since, waitedMs: Math.max(0, now - since),
+      sessionId: who.sessionId, cwd: who.cwd, priority: lines.includes('priority'), solo: lines.includes('solo'),
+      why: readJson(path.join(dir, 'why', name))?.why ?? null, next: next.has(name) });
   }
   return out;
 }
@@ -153,6 +162,9 @@ export function boxState(now = Date.now()) {
 function config(dir) {
   try { return JSON.parse(fs.readFileSync(path.join(dir, 'config.json'), 'utf8')) ?? {}; } catch { return {}; }
 }
+
+/** heavy's live settings: slots, shares, the load gate, where the owner's priorities live. */
+export const poolConfig = () => config(HEAVY_DIR());
 
 /** Threads that want a CPU right now, the number heavy gates on (/proc/loadavg's runnable
  *  count); the 1-minute load where there is no /proc. */

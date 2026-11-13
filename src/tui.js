@@ -1,5 +1,5 @@
 import { spawn } from 'node:child_process';
-import { overview, liveSessions, modelBreakdown, windowHistory, inUse, boxes } from './api.js';
+import { overview, liveSessions, modelBreakdown, windowHistory, inUse, boxes, machinePanel } from './api.js';
 import { cacheSummary } from './context.js';
 import { getMeta, setMeta } from './db.js';
 import { plan, setFailover, failoverSettings, spares, switchProfile, headroom, MIN_ROOM } from './failover.js';
@@ -255,6 +255,40 @@ function boxLines(list, inner, rule, now) {
   return L;
 }
 
+const gbText = (n) => (n >= 2 ** 30 ? `${(n / 2 ** 30).toFixed(1)} GB` : `${Math.round(n / 2 ** 20)} MB`);
+const coreText = (n) => (n < 0.05 ? '0' : n < 10 ? n.toFixed(1) : String(Math.round(n)));
+const TIER_TONE = { high: C.accent, normal: '', low: C.muted, paused: C.warning };
+
+/** This machine: each project's rank, cores and memory, its jobs and how long its oldest has waited, and why. */
+function machineLines(v, inner, rule, now) {
+  if (!v) return [];
+  const L = [];
+  const cpu = v.cpu;
+  L.push(rule(`THIS MACHINE · ${coreText(cpu.busy ?? 0)} of ${cpu.cores} cores · ${gbText(v.mem.used)} of ${gbText(v.mem.total)}` +
+    (cpu.slots ? ` · pool ${cpu.held} of ${cpu.slots}${cpu.waiting ? `, ${cpu.waiting} waiting` : ''}` : '')));
+  const barW = Math.max(6, Math.min(16, inner - 70));
+  const nameW = 18;
+  const active = v.projects.filter((p) => p.cores >= 0.05 || p.jobs.length || p.waits.length).sort((a, b) => b.cores - a.cores);
+  for (const p of active.slice(0, 10)) {
+    const bits = [];
+    if (p.jobs.length) bits.push(`${p.jobs.length} job${p.jobs.length === 1 ? '' : 's'}`);
+    let why = '';
+    if (p.waits.length) {
+      const oldest = p.waits.reduce((a, w) => (w.since < a.since ? w : a));
+      bits.push(`${waitColor(now - oldest.since)}${p.waits.length} waiting, ${duration(now - oldest.since)}${C.reset}`);
+      if (oldest.why) why = oldest.why;
+    }
+    L.push(`  ${TIER_TONE[p.tier] ?? ''}${padEnd(p.tier, 7)}${C.reset} ${padEnd(truncate(p.name, nameW), nameW + 1)}` +
+      `${meterBar((p.cores / cpu.cores) * 100, barW, C.accent)} ${padEnd(`${coreText(p.cores)} cores`, 11)}${padEnd(gbText(p.mem), 9)}${C.muted}${bits.join(' · ')}${C.reset}`);
+    if (why) L.push(`  ${' '.repeat(8 + nameW + 1)}${C.muted}${truncate(why, Math.max(20, inner - nameW - 12))}${C.reset}`);
+  }
+  const rest = v.others.reduce((a, o) => a + o.cores, 0) + v.projects.filter((p) => !active.slice(0, 10).includes(p)).reduce((a, p) => a + p.cores, 0);
+  L.push(`  ${' '.repeat(8)}${padEnd('everything else', nameW + 1)}${meterBar((rest / cpu.cores) * 100, barW, C.muted)} ${coreText(rest)} cores`);
+  L.push(`    ${C.muted}who goes first: claude-tracker priority <project> high|normal|low|paused, or the web dashboard${C.reset}`);
+  L.push('');
+  return L;
+}
+
 /** Turns that re-wrote a lapsed cache: last day and week, subagents and main thread apart. */
 function cacheLines(c, inner) {
   if (!c?.week?.turns) return [];
@@ -363,6 +397,7 @@ export function startTui({ webUrl, onQuit }) {
       // Worked out here, not the service's copy: a key pressed here shows at once.
       plan: plan(ov, live),
       boxes: boxes(),
+      machine: state.detail ? machinePanel() : null,
       cache: state.detail && (slow || !data.cache) ? cacheSummary() : data.cache,
       models: slow ? modelBreakdown(7, picked?.accountUuid ?? null) : data.models,
       windows: slow ? (focus ? windowHistory(focus.accountUuid, state.windowType, 24) : []) : data.windows,
@@ -526,6 +561,7 @@ export function startTui({ webUrl, onQuit }) {
 
     // ---- detail: the shared GPU and CPU pool, and re-written caches
     if (state.detail) {
+      for (const line of machineLines(data.machine, inner, ruleLine, now)) L.push(line);
       for (const line of boxLines(data.boxes ?? [], inner, ruleLine, now)) L.push(line);
       const cache = cacheLines(data.cache, inner);
       if (cache.length) {
