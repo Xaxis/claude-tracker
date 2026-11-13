@@ -817,7 +817,7 @@ function gb(n) {
 }
 /** Cores as 0, 0.4, 9.3, 12. */
 const coresOf = (n) => (n == null ? '—' : n < 0.05 ? '0' : n < 10 ? n.toFixed(1) : String(Math.round(n)));
-const plural = (n, one, many = `${one}s`) => `${n} ${n === 1 ? one : many}`;
+const plural = (n, one, many = `${one}s`) => `${typeof n === 'number' ? n.toLocaleString('en-US') : n} ${n === 1 ? one : many}`;
 
 const TIERS_SHOWN = ['high', 'normal', 'low', 'paused'];
 const TIER_LABEL = { high: 'High', normal: 'Normal', low: 'Low', paused: 'Paused' };
@@ -1366,6 +1366,7 @@ function leftWhy(i) {
   if (i.kind === 'scratchpad' && i.sessionId) return `scratchpad of a session that ended; untouched ${idle}`;
   if (i.kind === 'scratchpad') return `temp folder in Claude's scratch space, untouched ${idle}`;
   if (i.kind === 'worktree') return `worktree no session is in, untouched ${idle}`;
+  if (i.kind === 'temp' && i.count) return `small temp folders, the newest untouched ${idle}`;
   if (i.kind === 'temp') return `temp folder, untouched ${idle}`;
   return `untouched ${idle}`;
 }
@@ -1468,7 +1469,9 @@ function renderStorage(s) {
     const main = el('div', 'row-main');
     main.append(el('div', 'row-title', l.name));
     const n = o?.leftovers.length ?? 0;
-    main.append(el('div', 'row-sub', `${o?.counts.scratchpadsLeft ? `${plural(o.counts.scratchpadsLeft, 'ended scratchpad')}` : ''}${o?.counts.scratchpadsLeft && o?.counts.worktreesLeft ? ' · ' : ''}${o?.counts.worktreesLeft ? plural(o.counts.worktreesLeft, 'idle worktree') : ''}` || plural(n, 'folder')));
+    const what = [[o?.counts.scratchpadsLeft, 'ended scratchpad'], [o?.counts.worktreesLeft, 'idle worktree'], [o?.counts.tempLeft, 'idle temp folder']]
+      .filter(([k]) => k).map(([k, w]) => plural(k, w)).join(' · ');
+    main.append(el('div', 'row-sub', what || plural(n, 'folder')));
     sum.append(main, el('div', 'row-value', gb(l.bytes)));
     const bar = el('div', 'row-bar');
     const b = el('span');

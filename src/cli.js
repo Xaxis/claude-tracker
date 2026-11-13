@@ -1033,7 +1033,7 @@ function cmdRunNext(args) {
 /** Who fills the disks, and what is left behind: from the last survey, or a fresh one with --rescan. */
 async function cmdStorage(flags) {
   if (flags.rescan) {
-    console.log(`${c.dim}Measuring the disks at idle priority; this takes a few minutes…${c.reset}`);
+    console.error(`${c.dim}Measuring the disks at idle priority; this takes a few minutes…${c.reset}`);  // stdout stays the answer (--json)
     await surveyNow();
   }
   const s = storagePanel();
@@ -1052,10 +1052,12 @@ async function cmdStorage(flags) {
     console.log(`  ${pad(gb(o.bytes), 9)} ${pad(o.name, 22)} ${extra}`);
   }
   if (s.left.length) {
-    console.log(`\n${c.bold}Not cleaned up${c.reset} ${c.dim}· ${gb(s.leftTotal)} that what made it no longer uses${c.reset}`);
+    console.log(`\n${c.bold}Not cleaned up${c.reset} ${c.dim}· ${gb(s.leftTotal)} that nothing uses any more${c.reset}`);
     for (const l of s.left.slice(0, 8)) {
       const o = s.owners.find((x) => x.key === l.key);
-      console.log(`  ${pad(gb(l.bytes), 9)} ${pad(l.name, 22)} ${c.dim}${[o?.counts.scratchpadsLeft ? `${o.counts.scratchpadsLeft} ended scratchpad${o.counts.scratchpadsLeft === 1 ? '' : 's'}` : null, o?.counts.worktreesLeft ? `${o.counts.worktreesLeft} idle worktree${o.counts.worktreesLeft === 1 ? '' : 's'}` : null].filter(Boolean).join(' · ')}${c.reset}`);
+      const what = [[o?.counts.scratchpadsLeft, 'ended scratchpad'], [o?.counts.worktreesLeft, 'idle worktree'], [o?.counts.tempLeft, 'idle temp folder']]
+        .filter(([k]) => k).map(([k, w]) => `${k.toLocaleString('en-US')} ${w}${k === 1 ? '' : 's'}`).join(' · ');
+      console.log(`  ${pad(gb(l.bytes), 9)} ${pad(l.name, 22)} ${c.dim}${what}${c.reset}`);
     }
   }
   if (s.commands.length) {

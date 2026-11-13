@@ -281,15 +281,39 @@ async function walk({ sessions = [], recentDirs = [] }, now) {
       left: isSession ? status === 'ended' : idleDays(e.newest) >= LEFT_TEMP_DAYS });
   }
 
-  // The temp dir's own entries, by name.
+  // The temp dir's own entries, by name. Small ones add up, so each owner's are summed,
+  // idle and in use apart: on 2026-11-13 two projects' tests had left 4,586 folders of a
+  // few MB each, 664 MB that no single line was big enough to show.
+  const smalls = new Map();
   for (const e of tmpTop) {
-    if (depthOf(e.path, tmp) !== 1 || e.path === scratch || e.bytes < SMALL) continue;
+    if (depthOf(e.path, tmp) !== 1 || e.path === scratch) continue;
     const base = path.basename(e.path);
-    if (CACHES.test(base)) { add(cacheOwner(e.path), { kind: 'cache', path: e.path, bytes: e.bytes, newest: e.newest, idleDays: idleDays(e.newest) }); continue; }
+    if (CACHES.test(base)) {
+      if (e.bytes >= SMALL) add(cacheOwner(e.path), { kind: 'cache', path: e.path, bytes: e.bytes, newest: e.newest, idleDays: idleDays(e.newest) });
+      continue;
+    }
     const proj = nameOf(base);
     const idle = idleDays(e.newest);
-    add(proj ? owner('project', proj) : owner('temp', 'Unclaimed temp'),
-      { kind: 'temp', path: e.path, bytes: e.bytes, newest: e.newest, idleDays: idle, left: idle >= LEFT_TEMP_DAYS });
+    const left = idle >= LEFT_TEMP_DAYS;
+    if (e.bytes >= SMALL) {
+      add(proj ? owner('project', proj) : owner('temp', 'Unclaimed temp'),
+        { kind: 'temp', path: e.path, bytes: e.bytes, newest: e.newest, idleDays: idle, left });
+      continue;
+    }
+    const key = `${proj ?? ''}\0${left}`;
+    const g = smalls.get(key) ?? { proj, left, bytes: 0, count: 0, newest: 0, stems: new Map() };
+    g.bytes += e.bytes; g.count++; g.newest = Math.max(g.newest, e.newest ?? 0);
+    const stem = `${/^[^-_.]+[-_.]?/.exec(base)?.[0] ?? base}*`;
+    g.stems.set(stem, (g.stems.get(stem) ?? 0) + e.bytes);
+    smalls.set(key, g);
+  }
+  for (const g of smalls.values()) {
+    if (g.bytes < SMALL) continue;
+    const stems = [...g.stems].sort((a, b) => b[1] - a[1]).map(([s]) => s);
+    const named = `${stems.slice(0, 3).join(', ')}${stems.length > 3 ? ', …' : ''}`;
+    add(g.proj ? owner('project', g.proj) : owner('temp', 'Unclaimed temp'),
+      { kind: 'temp', path: `${path.join(tmp, named)} (${g.count.toLocaleString('en-US')} folders)`, count: g.count,
+        bytes: g.bytes, newest: g.newest || null, idleDays: idleDays(g.newest || null), left: g.left });
   }
 
   // Each repo: its checkout, by its biggest parts; its worktrees, each.
@@ -440,6 +464,7 @@ export function storageView(now = Date.now()) {
       worktreesLeft: o.items.filter((i) => i.kind === 'worktree' && i.left).length,
       scratchpads: o.items.filter((i) => i.kind === 'scratchpad').length,
       scratchpadsLeft: o.items.filter((i) => i.kind === 'scratchpad' && i.left).length,
+      tempLeft: o.items.filter((i) => i.kind === 'temp' && i.left).reduce((a, i) => a + (i.count ?? 1), 0),
     },
     items: o.items.slice(0, ITEMS).map(slim),
     leftovers: o.items.filter((i) => i.left).slice(0, ITEMS).map(slim),
@@ -477,5 +502,6 @@ function slim(i) {
   if (i.live) out.live = true;
   if (i.left) out.left = true;
   if (i.parts) out.parts = i.parts;
+  if (i.count) out.count = i.count;
   return out;
 }

@@ -190,16 +190,21 @@ test('the disk view: what is left behind, and caches that only grow', () => {
     owners: [
       { key: 'caches:Shared caches', kind: 'caches', name: 'Shared caches', bytes: 7 * G, left: 0,
         items: [{ kind: 'cache', path: '/tmp/node-compile-cache', bytes: 6 * G }, { kind: 'cache', path: '/home/x/.npm', bytes: G }] },
-      { key: 'project:alpha', kind: 'project', name: 'alpha', bytes: 9 * G, left: 3 * G,
+      { key: 'project:alpha', kind: 'project', name: 'alpha', bytes: 10 * G, left: 4 * G,
         items: [{ kind: 'worktree', path: '/r/alpha/.claude/worktrees/old', bytes: 3 * G, left: true, idleDays: 12, repo: '/r/alpha' },
-          { kind: 'repo', path: '/r/alpha', bytes: 6 * G }] },
+          { kind: 'repo', path: '/r/alpha', bytes: 6 * G },
+          { kind: 'temp', path: '/tmp/al-*, alpha-* (1,200 folders)', count: 1200, bytes: G, left: true, idleDays: 4 },
+          { kind: 'temp', path: '/tmp/alpha-big', bytes: 200 * 2 ** 20, left: true, idleDays: 5 }] },
       { key: 'project:tiny', kind: 'project', name: 'tiny', bytes: G, left: 1024, items: [{ kind: 'temp', path: '/tmp/tiny', bytes: 1024, left: true, idleDays: 9 }] },
     ],
   }));
   const s = storageView(now);
   assert.equal(s.disks[0].other, 10 * G, 'what the survey did not reach');
   assert.deepEqual(s.left.map((l) => l.name), ['alpha'], 'a few bytes left behind is not worth a line');
-  assert.equal(s.owners.find((o) => o.name === 'alpha').counts.worktreesLeft, 1);
+  const alpha = s.owners.find((o) => o.name === 'alpha');
+  assert.equal(alpha.counts.worktreesLeft, 1);
+  assert.equal(alpha.counts.tempLeft, 1201, 'small temp folders, summed into one line, still count one by one');
+  assert.equal(alpha.leftovers.find((i) => i.count)?.count, 1200);
   const cmds = s.commands.map((c) => c.cmd);
   assert.ok(cmds.includes('rm -rf /tmp/node-compile-cache'), 'a cache nothing prunes, past 5 GB');
   assert.ok(!cmds.includes('npm cache clean --force'), 'a small one is left alone');
