@@ -648,7 +648,7 @@ that machine's `heavy`, so the Mac's dashboard ranks the Linux box's projects an
 the other way round. A machine that stops sending shows when it was last heard
 from, and its buttons wait until it is back.
 
-The dashboard's writes (priority, run next, rescan) only come from the dashboard
+The dashboard's writes (priority, run next, rescan, cleanups, plan prices) only come from the dashboard
 itself: a loopback `Host`, the same `Origin`, and a JSON body, so no other page
 open in your browser can send one.
 
@@ -661,9 +661,16 @@ Claude Code's own folder. **Not cleaned up** ranks what nothing uses any more:
 scratchpads of sessions that ended days ago, worktrees no session has touched in
 a week, idle temp folders. Under it are the commands that clean up safely:
 `tmp-sweep`, `wt prune` per repository, and caches that only ever grow (Node's
-compile cache, npm's, uv's). The tracker deletes nothing itself. Each disk
-shows how much it grew in a day, and each owner too, so a runaway cache stands
-out. `claude-tracker storage --rescan` measures now.
+compile cache, npm's, uv's). Each disk shows how much it grew in a day, and each
+owner too, so a runaway cache stands out. `claude-tracker storage --rescan`
+measures now.
+
+Each cleanup has a **Clean up…** button. It shows what would go first (the
+tool's own dry run, or the folder and its size), and deletes only when you then
+press **Delete**. It runs at idle priority, says how much space it freed, and
+measures the disks again so the list catches up. The tracker runs only a
+cleanup the latest survey recommends, by its id, never a command it was sent.
+On another machine's view the button runs it there, over the sync connection.
 
 On a Mac the survey uses BSD `du` (or Homebrew's `gdu`) at background priority,
 covers both `/tmp` and the per-user temp folder, counts `~/Library`'s caches,

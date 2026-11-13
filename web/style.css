@@ -459,7 +459,7 @@ body:not(.detail) #cache { display: none !important; }
 .owner-item .why { grid-column: 1 / -1; color: var(--text-muted); margin-top: -2px; }
 .cleanup { display: flex; flex-direction: column; gap: 8px; margin-top: 16px; }
 .cleanup-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; font-size: 12px; color: var(--text-secondary); }
-.cleanup-row .command { font-size: 12px; padding: 6px 10px; }
+.cleanup-row .command { font-size: 12px; padding: 6px 10px; white-space: normal; overflow-wrap: anywhere; text-align: left; }
 
 @media (max-width: 560px) {
   .seg button { padding: 4px 8px; }
@@ -494,3 +494,25 @@ body:not(.detail) #cache { display: none !important; }
 .plan-worth strong { color: var(--text-primary); font-variant-numeric: tabular-nums; }
 .plan-worth.is-under { color: var(--text-primary); }
 .plan-worth.is-under::before { content: "▲ "; color: var(--warning); }
+
+/* --- cleanups run from the dashboard --- */
+.cleanup-go { margin-left: auto; }
+.cleanup-state { margin-left: auto; color: var(--text-primary); font-variant-numeric: tabular-nums; }
+.cleanup-done { font-size: 12px; color: var(--text-secondary); padding: 8px 10px; border: 1px solid var(--border); border-radius: 8px; }
+.cleanup-done strong { color: var(--text-primary); }
+.cleanup-done.is-failed strong { color: var(--critical); }
+.cleanup-done details { margin-top: 6px; }
+.cleanup-done summary { cursor: pointer; }
+.cleanup-when { color: var(--text-muted); }
+.cleanup-out { max-height: 260px; overflow: auto; margin: 6px 0 0; padding: 8px 10px; font-size: 11px; line-height: 1.45;
+  white-space: pre-wrap; word-break: break-all; background: var(--gridline); border-radius: 6px; color: var(--text-primary); }
+.cleanup-dialog { max-width: min(720px, calc(100vw - 32px)); width: 100%; border: 1px solid var(--border); border-radius: 12px;
+  padding: 18px 20px; background: var(--page); color: var(--text-primary); }
+.cleanup-dialog::backdrop { background: rgba(0, 0, 0, 0.4); }
+.cleanup-dialog h3 { margin: 0 0 6px; font-size: 16px; }
+.cleanup-dialog p { margin: 6px 0; font-size: 13px; }
+.cleanup-dialog-note { color: var(--text-secondary); }
+.cleanup-dialog-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 14px; }
+.danger-btn { font: inherit; font-size: 12px; font-weight: 600; color: #fff; background: var(--critical); border: 1px solid var(--critical);
+  border-radius: 7px; padding: 5px 14px; cursor: pointer; }
+.danger-btn:disabled { opacity: 0.6; cursor: default; }

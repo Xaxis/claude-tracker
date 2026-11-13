@@ -1656,8 +1656,13 @@ function renderStorage(s) {
 
   const cleanup = $('#cleanup');
   cleanup.textContent = '';
-  if (s.commands.length) {
-    cleanup.append(el('h3', 'sub-h', s.remote ? `Clean up: run these on ${s.remote.name}` : 'Clean up'));
+  const jobs = s.cleanups ?? [];
+  const running = new Map(jobs.filter((j) => j.state === 'running').map((j) => [j.id, j]));
+  // Each can run from here (a tracker from before cleanups offers only the command to copy).
+  const canRun = (c) => !!c.id && (!s.remote || s.remote.online);
+  if (s.commands.length || jobs.length) {
+    cleanup.append(el('h3', 'sub-h', s.remote ? `Clean up on ${s.remote.name}` : 'Clean up'));
+    for (const j of jobs.filter((x) => x.state !== 'running')) cleanup.append(cleanupResult(j));
     for (const c of s.commands) {
       const row = el('div', 'cleanup-row');
       const b = el('button', 'command', c.cmd);
@@ -1665,9 +1670,87 @@ function renderStorage(s) {
       b.title = 'Copy command';
       b.addEventListener('click', () => copyCommand(b));
       row.append(b, el('span', null, c.label));
+      const job = running.get(c.id);
+      if (job) row.append(el('span', 'cleanup-state', `Running · ${duration(Date.now() - job.startedAt)}`));
+      else if (canRun(c)) {
+        const go = el('button', 'ghost-btn cleanup-go', 'Clean up…');
+        go.type = 'button';
+        go.title = 'See what it would delete, then delete it';
+        go.addEventListener('click', () => previewCleanup(c, go, s.remote?.name ?? null));
+        row.append(go);
+      }
       cleanup.append(row);
     }
   }
+}
+
+/** A cleanup that finished: what it freed, and its output when it failed or was asked for. */
+function cleanupResult(j) {
+  const row = el('div', `cleanup-done${j.state === 'failed' ? ' is-failed' : ''}`);
+  const head = el('div', 'cleanup-done-head');
+  head.append(el('strong', null, j.state === 'failed' ? 'Failed' : `Freed ${gb(j.freed)}`));
+  head.append(el('span', null, ` · ${j.what}`));
+  head.append(el('span', 'cleanup-when', ` · ${j.remeasured ? 'measured again' : 'measuring again…'} · ${duration(Date.now() - j.endedAt)} ago`));
+  row.append(head);
+  if (j.error || j.output) {
+    const d = el('details');
+    d.append(el('summary', null, j.error ?? 'What it printed'), el('pre', 'cleanup-out', j.output || '(nothing)'));
+    row.append(d);
+  }
+  return row;
+}
+
+let cleanupDialog = null;
+/** Show what a cleanup would delete - the tool's own dry run - and delete it only when the owner says so. */
+async function previewCleanup(c, button, onName) {
+  button.disabled = true;
+  const label = button.textContent;
+  button.textContent = 'Checking…';
+  let p;
+  try {
+    const r = await fetch('/api/cleanup', { method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ id: c.id, step: 'preview', machine: machineState.on }) });
+    p = await r.json();
+    if (!r.ok) throw new Error(p.error ?? r.statusText);
+  } catch (err) {
+    alert(`Could not check it: ${err.message}`);
+    return;
+  } finally { button.disabled = false; button.textContent = label; }
+
+  if (!cleanupDialog) {
+    cleanupDialog = document.createElement('dialog');
+    cleanupDialog.className = 'cleanup-dialog';
+    document.body.append(cleanupDialog);
+  }
+  const d = cleanupDialog;
+  d.textContent = '';
+  d.append(el('h3', null, onName ? `Delete this on ${onName}?` : 'Delete this?'), el('p', null, p.what));
+  if (p.dryRun != null) {
+    d.append(el('p', 'cleanup-dialog-note', p.ok ? 'Its own dry run says it would do this:' : 'Its dry run did not finish cleanly:'));
+    d.append(el('pre', 'cleanup-out', p.dryRun));
+  }
+  d.append(el('p', 'cleanup-dialog-note', `Runs ${p.cmd}${p.dryRun != null ? ' --yes' : ''} at idle priority. It cannot be undone.`));
+  const actions = el('div', 'cleanup-dialog-actions');
+  const cancel = el('button', 'ghost-btn', 'Cancel');
+  cancel.type = 'button';
+  cancel.addEventListener('click', () => d.close());
+  const del = el('button', 'danger-btn', 'Delete');
+  del.type = 'button';
+  del.addEventListener('click', async () => {
+    del.disabled = true;
+    try {
+      const r = await fetch('/api/cleanup', { method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ id: c.id, step: 'run', machine: machineState.on }) });
+      const j = await r.json();
+      if (!r.ok) throw new Error(j.error ?? r.statusText);
+      d.close();
+      loadStorage();
+    } catch (err) { del.disabled = false; alert(`It did not start: ${err.message}`); }
+  });
+  actions.append(cancel, del);
+  d.append(actions);
+  d.showModal();
+  cancel.focus();
 }
 
 async function copyCommand(btn) {

@@ -18,6 +18,7 @@ import { mainContext, activeAgents, sessionRecaches, placeName } from './context
 import { readConfig as slackConfig, bridgeStatus } from './bridge.js';
 import { machineView, startSampler, sampleNow } from './machine.js';
 import { storageView, startSurveys, survey } from './storage.js';
+import { cleanupState } from './cleanup.js';
 
 const UNATTRIBUTED = '__unattributed__';
 
@@ -575,7 +576,13 @@ export async function machineOnce() {
 }
 
 /** Who fills the disks and who leaves things behind, from the last survey. */
-export const storagePanel = () => storageView();
+// The disks as last surveyed, with the cleanups run from the dashboard since.
+export const storagePanel = () => {
+  const v = storageView();
+  if (!v?.at) return v;
+  const c = cleanupState();
+  return { ...v, cleanups: c.jobs, rev: c.rev };
+};
 
 /** Survey the disks now (the dashboard's Rescan, the CLI); resolves when it is done. */
 export const surveyNow = () => survey(storageContext);

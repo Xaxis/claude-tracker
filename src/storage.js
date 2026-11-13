@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import crypto from 'node:crypto';
 import { spawn, execFileSync } from 'node:child_process';
 import { DATA_DIR, HOME, discoverProfiles } from './paths.js';
 import { gitTop, encodedProject, SYSTEM_PATH } from './machine.js';
@@ -23,8 +24,9 @@ import { gitTop, encodedProject, SYSTEM_PATH } from './machine.js';
  * ended session's scratchpad, a worktree no session has touched for a week, a
  * project's temp folder idle three days.
  *
- * Read only: it never deletes. Where a tool cleans up safely (tmp-sweep, wt
- * prune), it says which command does.
+ * The survey itself never deletes. Where a tool cleans up safely (tmp-sweep, wt
+ * prune, a cache's own prune), it recommends the command, and the owner can run
+ * it from the dashboard (cleanup.js) after seeing its dry run.
  *
  * On macOS du is BSD's (GNU's gdu where Homebrew put it), mounts come from
  * `mount`, and the folders macOS asks the owner before opening (Desktop,
@@ -52,11 +54,11 @@ const isDir = (p) => { try { return fs.statSync(p).isDirectory(); } catch { retu
 /* --- du ---------------------------------------------------------------------- */
 
 // Tools are found on the system's own folders too: a macOS service starts with a short PATH.
-const toolEnv = () => ({ ...process.env, PATH: SYSTEM_PATH() });
+export const toolEnv = () => ({ ...process.env, PATH: SYSTEM_PATH() });
 const works = (cmd, args) => { try { execFileSync(cmd, args, { stdio: 'ignore', timeout: 3000, env: toolEnv() }); return true; } catch { return false; } };
 const memo = (fn) => { let v; return () => (v ??= fn()); };
 // Idle disk priority: ionice on Linux, macOS's background policy (throttled disk and CPU) there.
-const lowPriority = memo(() => (MAC()
+export const lowPriority = memo(() => (MAC()
   ? works('taskpolicy', ['-b', 'true']) ? ['taskpolicy', '-b', 'nice', '-n', '19'] : ['nice', '-n', '19']
   : works('ionice', ['-c3', 'true']) ? ['ionice', '-c3', 'nice', '-n', '19'] : ['nice', '-n', '19']));
 // GNU du says how fresh each folder is; on macOS that is Homebrew's gdu, when it is there.
@@ -181,7 +183,15 @@ let timer = null;
  * {sessions: [{sessionId, parkedJobId, cwd, name}], projectOf(dir)} at the moment
  * the survey starts. One survey at a time; a second ask joins the first.
  */
+let lastContext = () => ({ sessions: [], recentDirs: [] });
+/** Survey again, after any survey already under way, with the context the last one had (after a cleanup). */
+export async function resurvey() {
+  if (running) await running.catch(() => {});
+  return survey(lastContext);
+}
+
 export function survey(context) {
+  lastContext = context;
   if (running) return running;
   running = (async () => {
     const t0 = Date.now();
@@ -506,10 +516,19 @@ function remember(r) {
 // Caches nothing ever prunes, and how to empty one: each rebuilds what it needs on its next use.
 const GROWS_ONLY_FLAG = 5 * 2 ** 30;
 const GROWS_ONLY = [
-  { re: /\/node-compile-cache$/, what: 'Node\'s compile cache', why: 'a file for every script node has compiled, and nothing prunes it', cmd: (p) => `rm -rf ${p}` },
-  { re: /\/\.cache\/uv$/, what: 'uv\'s cache', why: 'every package version uv fetched', cmd: () => 'uv cache prune' },
-  { re: /\/\.npm$/, what: 'npm\'s cache', why: 'every package version npm fetched', cmd: () => 'npm cache clean --force' },
+  { re: /\/node-compile-cache$/, what: 'Node\'s compile cache', why: 'a file for every script node has compiled, and nothing prunes it',
+    cmd: (p) => `rm -rf ${p}`, run: (p) => ({ remove: p }), says: 'Node writes it again as scripts are compiled.' },
+  { re: /\/\.cache\/uv$/, what: 'uv\'s cache', why: 'every package version uv fetched',
+    cmd: () => 'uv cache prune', run: () => ({ argv: ['uv', 'cache', 'prune'] }), tool: 'uv', says: 'uv removes what no environment needs; it fetches anything else again when asked.' },
+  { re: /\/\.npm$/, what: 'npm\'s cache', why: 'every package version npm fetched',
+    cmd: () => 'npm cache clean --force', run: () => ({ argv: ['npm', 'cache', 'clean', '--force'] }), tool: 'npm', says: 'npm fetches packages again the next time an install needs them.' },
 ];
+
+// The owner's cleanup tools, where this machine has them.
+const coreTool = (name) => { const p = path.join(HOME, '.claude', 'claude-core', 'bin', name); return exists(p) ? p : null; };
+const onPath = (name) => works(name, ['--version']);
+/** A recommendation the dashboard can run: named by what it does, so its id holds while that stays the same. */
+const offer = (c) => ({ ...c, id: crypto.createHash('sha1').update(JSON.stringify([c.run, c.cwd ?? null])).digest('hex').slice(0, 12) });
 
 const ITEMS = 8;
 
@@ -539,18 +558,24 @@ export function storageView(now = Date.now()) {
   const left = owners.filter((o) => o.left >= SMALL / 4).sort((a, b) => b.left - a.left);
   const commands = [];
   const leftScratch = owners.reduce((a, o) => a + o.counts.scratchpadsLeft, 0);
-  if (leftScratch || owners.some((o) => o.leftovers.some((i) => i.kind === 'temp'))) {
-    commands.push({ cmd: '~/.claude/claude-core/bin/tmp-sweep', label: 'See what tmp-sweep would delete: ended sessions\' scratchpads and known leaks, idle and unused (add --yes to delete)' });
+  const sweep = coreTool('tmp-sweep');
+  if (sweep && (leftScratch || owners.some((o) => o.leftovers.some((i) => i.kind === 'temp')))) {
+    commands.push(offer({ cmd: '~/.claude/claude-core/bin/tmp-sweep', label: 'See what tmp-sweep would delete: ended sessions\' scratchpads and known leaks, idle and unused (add --yes to delete)',
+      what: 'Ended sessions\' scratchpads and leaked temp folders, idle and unused', preview: { argv: [sweep] }, run: { argv: [sweep, '--yes'] } }));
   }
   // Caches that only grow: nothing prunes them, and each rebuilds what it needs on the next run.
   for (const o of r.owners) for (const i of o.items) {
     const grow = i.kind === 'cache' && GROWS_ONLY.find((g) => g.re.test(i.path));
-    if (grow && i.bytes >= GROWS_ONLY_FLAG) commands.push({ cmd: grow.cmd(i.path), label: `${grow.what}: ${Math.round(i.bytes / 2 ** 30)} GB, ${grow.why}` });
+    if (!grow || i.bytes < GROWS_ONLY_FLAG || (grow.tool && !onPath(grow.tool))) continue;
+    commands.push(offer({ cmd: grow.cmd(i.path), label: `${grow.what}: ${Math.round(i.bytes / 2 ** 30)} GB, ${grow.why}`,
+      what: `${grow.what}, ${Math.round(i.bytes / 2 ** 30)} GB at ${i.path.replace(HOME, '~')}. ${grow.says}`, path: i.path, bytes: i.bytes, run: grow.run(i.path) }));
   }
+  const wt = coreTool('wt');
   for (const o of owners) {
-    if (!o.counts.worktreesLeft) continue;
+    if (!wt || !o.counts.worktreesLeft) continue;
     const repo = r.owners.find((x) => x.key === o.key)?.items.find((i) => i.kind === 'worktree')?.repo;
-    if (repo) commands.push({ cmd: `cd ${repo} && ~/.claude/claude-core/bin/wt prune`, label: `${o.name}: list its stale worktrees (wt prune --yes removes them)` });
+    if (repo) commands.push(offer({ cmd: `cd ${repo} && ~/.claude/claude-core/bin/wt prune`, label: `${o.name}: list its stale worktrees (wt prune --yes removes them)`,
+      what: `${o.name}'s worktrees whose branch is merged, or has nothing of its own and is old, with nothing uncommitted`, cwd: repo, preview: { argv: [wt, 'prune'] }, run: { argv: [wt, 'prune', '--yes'] } }));
   }
   return {
     at: r.at, took: r.took ?? null, surveying: surveying(), next: r.at + EVERY,

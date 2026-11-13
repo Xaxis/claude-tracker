@@ -21,6 +21,7 @@ import { startBridge, bridgeStatus, readConfig as slackConfig } from './bridge.j
 import { machine } from './replica.js';
 import { useLinks, onPanel, panelOf, ask, onBoxControl } from './fleet.js';
 import { setPlanPrice } from './plans.js';
+import { previewCleanup, runCleanup, onCleanupChange } from './cleanup.js';
 
 const WEB_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'web');
 
@@ -148,6 +149,13 @@ async function handleWrite(req, res, url) {
         setPlanPrice(msg.account, msg.usd ?? null);
         broadcast('update', { reason: 'plan-price', at: Date.now(), newEvents: 0 });
         return sendJson(res, { ok: true });
+      case '/api/cleanup': {
+        // A cleanup the survey recommends, by its id: first what it would do, then, when the owner says so, done.
+        const step = msg.step === 'run' ? 'run' : 'preview';
+        const id = String(msg.id ?? '');
+        if (there) return sendJson(res, await ask(there, { k: 'cleanup', cleanup: id, step }, step === 'run' ? 25_000 : 150_000));
+        return sendJson(res, step === 'run' ? runCleanup(id) : await previewCleanup(id));
+      }
       case '/api/storage/rescan':
         surveyNow().then(() => broadcast('storage', { at: Date.now() }), (err) => console.error('storage survey:', err.message));
         return sendJson(res, { started: true });
@@ -341,6 +349,11 @@ export async function serve({ port = 4785, open = false, refresh, fastRefresh, a
       onPanel,
     });
     useLinks(() => sync?.links() ?? []);
+    // A cleanup started or finished, here or for another machine's dashboard: every dashboard hears now.
+    onCleanupChange(() => {
+      broadcast('storage', { at: Date.now() });
+      for (const l of sync?.links() ?? []) l.nudgePanel?.();
+    });
     server.on('upgrade', (req, socket, head) => sync.accept(req, socket, head, advert.token));
   }
 

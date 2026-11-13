@@ -200,7 +200,8 @@ export function openLink({ input, output, serial, admit = () => null, onRows = (
     try { p = localPanel(); } catch { return; }
     if (!p) return;
     const msg = { t: 'panel', v: 1, machine: p.machine ?? null };
-    const measured = p.storage?.at ?? null;
+    // Measured again, or a cleanup run from a dashboard moved on.
+    const measured = p.storage ? `${p.storage.at}|${p.storage.rev ?? ''}` : null;
     if (force || measured !== storageSent) { msg.storage = p.storage ?? null; storageSent = measured; }
     await write(msg);
   }

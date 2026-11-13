@@ -1,6 +1,7 @@
 import crypto from 'node:crypto';
 import { machine } from './replica.js';
 import { setPriority, runNext } from './machine.js';
+import { previewCleanup, runCleanup } from './cleanup.js';
 
 /**
  * Every synced machine's cores and disks, and the owner's priorities set on
@@ -60,13 +61,17 @@ export function panelOf(kind, on, local, now = Date.now()) {
   return { ...(p[kind] ?? { unavailable: true }), machines: list, on, remote: { name: p.name, online, at: p.at } };
 }
 
-/** Ask machine `id` to do `req` ({k: 'prio', project, tier} or {k: 'next', pid}); resolves once it has. */
+/**
+ * Ask machine `id` to do `req` ({k: 'prio', project, tier}, {k: 'next', pid} or
+ * {k: 'cleanup', cleanup, step}); resolves with what it answered once it has.
+ * `id` is the request's own, so a request names nothing else by it.
+ */
 export function ask(id, req, ms = 25_000) {
   const link = links().find((l) => l.peer?.id === id && !l.closed);
   if (!link) return Promise.reject(new Error('that machine is not connected now'));
   const rid = crypto.randomUUID();
   return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => { asked.delete(rid); reject(new Error('no answer from that machine in 25 s')); }, ms);
+    const timer = setTimeout(() => { asked.delete(rid); reject(new Error(`no answer from that machine in ${Math.round(ms / 1000)} s`)); }, ms);
     asked.set(rid, { resolve, reject, timer });
     link.send({ t: 'ctl', ...req, id: rid });
   });
@@ -80,13 +85,16 @@ export function ask(id, req, ms = 25_000) {
 export async function onBoxControl(link, msg, changed = () => {}) {
   switch (msg?.k) {
     case 'prio':
-    case 'next': {
+    case 'next':
+    case 'cleanup': {
       link.heardCtl = true;
       let reply;
       try {
+        let result = null;
         if (msg.k === 'prio') setPriority(msg.project, msg.tier, `claude-tracker on ${String(link.peer?.name ?? 'another machine').slice(0, 60)}`);
-        else runNext(Number(msg.pid));
-        reply = { ok: true };
+        else if (msg.k === 'next') runNext(Number(msg.pid));
+        else result = msg.step === 'run' ? runCleanup(String(msg.cleanup)) : await previewCleanup(String(msg.cleanup));
+        reply = { ok: true, result };
         changed();
       } catch (err) { reply = { ok: false, error: err.message }; }
       await link.nudgePanel?.();
@@ -99,7 +107,7 @@ export async function onBoxControl(link, msg, changed = () => {}) {
       if (a) {
         asked.delete(msg.id);
         clearTimeout(a.timer);
-        if (msg.ok) a.resolve(); else a.reject(new Error(String(msg.error ?? 'it failed there').slice(0, 300)));
+        if (msg.ok) a.resolve(msg.result ?? null); else a.reject(new Error(String(msg.error ?? 'it failed there').slice(0, 300)));
       }
       return true;
     }
