@@ -254,9 +254,12 @@ function renderAccounts(data, live = []) {
       track.append(fill);
       row.append(track);
 
-      row.append(el('div', 'panel-note',
-        `${money(b.spend.cost)} used this period · ${b.assumption}`));
-      row.title = `Subscription started ${new Date(b.subscriptionStart).toLocaleDateString()}`;
+      row.append(planValue(a, b));
+      row.title = `Subscription started ${new Date(b.subscriptionStart).toLocaleDateString()} · ${b.assumption}`;
+      card.append(row);
+    } else {
+      const row = el('div', 'billing');
+      row.append(planValue(a, null));
       card.append(row);
     }
 
@@ -268,6 +271,67 @@ function renderAccounts(data, live = []) {
     note.push(`${data.unattributed.events.toLocaleString()} events (${money(data.unattributed.cost)}) not tied to an account`);
   }
   $('#accounts-note').textContent = note.join(' · ');
+}
+
+/**
+ * An account's use this billing period at API prices beside what its plan costs,
+ * and whether it is on pace to be worth its price. The price can be set here.
+ */
+function planValue(a, b) {
+  const box = el('div', 'plan-value');
+  const p = a.plan ?? { usd: null };
+  const line = el('div', 'plan-line');
+  if (b) line.append(el('span', null, `${money(b.spend.cost)} at API prices this period`));
+  const price = el('button', 'plan-price', p.usd == null ? 'Set plan price' : `plan ${money(p.usd)}/mo${p.source === 'owner' ? '' : ' (list)'}`);
+  price.type = 'button';
+  price.title = p.usd == null ? 'What this account\'s plan costs you each month, to compare its use against'
+    : p.source === 'owner' ? 'The price you set. Click to change it, or clear it to use the list price'
+    : `${p.plan ?? 'This plan'}'s list price. Click to set what you actually pay`;
+  price.addEventListener('click', () => editPlanPrice(a, price));
+  line.append(price);
+  box.append(line);
+  if (b && p.usd > 0) {
+    const times = b.spend.cost / p.usd;
+    const pace = b.percentElapsed >= 5 ? b.spend.cost / (b.percentElapsed / 100) : null;
+    const worth = el('div', 'plan-worth');
+    worth.append(el('strong', null, `${times >= 10 ? Math.round(times) : times.toFixed(1)}×`), document.createTextNode(' its price so far'));
+    if (pace != null && pace < p.usd) {
+      worth.classList.add('is-under');
+      worth.append(document.createTextNode(` · on pace for ${money(pace)} by renewal, less than it costs`));
+    }
+    box.append(worth);
+  }
+  return box;
+}
+
+/** Turn the price into a field: Enter saves, Escape leaves it, an empty field goes back to the list price. */
+function editPlanPrice(a, button) {
+  const input = el('input', 'plan-input');
+  input.type = 'number'; input.min = '0'; input.step = '1'; input.inputMode = 'decimal';
+  input.placeholder = 'list price';
+  input.value = a.plan?.source === 'owner' ? String(a.plan.usd) : '';
+  input.setAttribute('aria-label', `What ${a.label ?? 'this account'}'s plan costs you each month, in dollars`);
+  button.replaceWith(input);
+  input.focus();
+  let done = false;
+  const finish = async (save) => {
+    if (done) return;
+    done = true;
+    if (save) {
+      const v = input.value.trim();
+      try {
+        const r = await fetch('/api/plan-price', { method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ account: a.accountUuid, usd: v === '' ? null : Number(v) }) });
+        const j = await r.json();
+        if (!r.ok) throw new Error(j.error ?? r.statusText);
+      } catch (err) { alert(`The price was not saved: ${err.message}`); }
+      loadFast().catch(() => {});
+      loadSlow().catch(() => {});
+    }
+    input.replaceWith(button);
+  };
+  input.addEventListener('keydown', (ev) => { if (ev.key === 'Enter') finish(true); else if (ev.key === 'Escape') finish(false); });
+  input.addEventListener('blur', () => finish(true));
 }
 
 /** Which account to use right now, and the exact command that uses it. */
@@ -341,16 +405,39 @@ const svgEl = (tag, attrs = {}) => {
 function niceMax(v) {
   if (v <= 0) return 1;
   const mag = 10 ** Math.floor(Math.log10(v));
-  for (const step of [1, 2, 2.5, 5, 10]) {
+  // Each divides into four ticks that read cleanly: 12k is 3k a tick, 16k is 4k.
+  for (const step of [1, 1.2, 1.6, 2, 2.5, 3, 4, 5, 6, 8, 10]) {
     if (v <= mag * step) return mag * step;
   }
   return mag * 10;
 }
 
+/** The range's use at API prices beside what its subscriptions cost, and how many times over. */
+function renderDailySummary(rows) {
+  const host = $('#daily-summary');
+  host.textContent = '';
+  const value = rows.reduce((a, r) => a + r.cost, 0);
+  const paid = rows.reduce((a, r) => a + (r.paid ?? 0), 0);
+  if (!value && !paid) return;
+  const stat = (label, v, cls) => {
+    const s = el('span', `daily-stat${cls ? ` ${cls}` : ''}`);
+    s.append(el('span', 'daily-stat-label', label), el('strong', null, v));
+    return s;
+  };
+  host.append(stat('At API prices', money(value)));
+  if (paid > 0) {
+    host.append(stat('Subscriptions', money(paid)));
+    host.append(stat('Value', `${value / paid >= 10 ? Math.round(value / paid) : (value / paid).toFixed(1)}× what you paid`, 'daily-stat-strong'));
+  }
+  host.title = 'API prices: what the same calls would cost on the API. Subscriptions: each plan\'s monthly price spread over its days '
+    + '(list price unless you set your own on the account). Accounts without a known price count as nothing.';
+}
+
 function renderDaily(rows) {
   const host = $('#daily-chart');
   host.textContent = '';
-  if (!rows.length) { host.append(el('p', 'empty', 'No usage in this range.')); return; }
+  renderDailySummary(rows);
+  if (!rows.some((r) => r.cost > 0)) { host.append(el('p', 'empty', 'No usage in this range.')); $('#daily-legend').textContent = ''; return; }
 
   // Rank models by total spend; keep the top 7 and fold the rest into Other so
   // categorical slots are never cycled.
@@ -370,7 +457,7 @@ function renderDaily(rows) {
     for (const [m, c] of Object.entries(r.models)) {
       parts[keep.includes(m) ? m : 'Other'] = (parts[keep.includes(m) ? m : 'Other'] ?? 0) + c;
     }
-    return { day: r.day, total: r.cost, events: r.events, tokens: r.tokens, parts };
+    return { day: r.day, total: r.cost, events: r.events, tokens: r.tokens, paid: r.paid ?? 0, parts };
   });
 
   const W = 900, H = 260;
@@ -426,7 +513,8 @@ function renderDaily(rows) {
         `<div class="tooltip-row"><span><span class="dot" style="background:${colorOf(n)}"></span> ${n}</span><span>${money(s.parts[n])}</span></div>`).join('');
       showTip(
         `<div class="tooltip-title">${dayOf(new Date(s.day + 'T00:00:00'))}</div>${lines}` +
-        `<div class="tooltip-row" style="margin-top:4px"><span>Total</span><span>${money(s.total)}</span></div>` +
+        `<div class="tooltip-row" style="margin-top:4px"><span>At API prices</span><span>${money(s.total)}</span></div>` +
+        (s.paid ? `<div class="tooltip-row"><span>Subscriptions</span><span>${money(s.paid)}</span></div>` : '') +
         `<div class="tooltip-row"><span>Calls</span><span>${compact(s.events)}</span></div>`,
         ev.clientX, ev.clientY,
       );
@@ -451,17 +539,29 @@ function renderDaily(rows) {
     y1: pad.top + plotH, y2: pad.top + plotH,
   }));
 
+  // What the subscriptions cost a day, on the same scale: how far the bars stand above it.
+  const paidNow = series.at(-1)?.paid ?? 0;
+  if (paidNow > 0) {
+    const y = pad.top + plotH - Math.min(1, paidNow / maxY) * plotH;
+    svg.append(svgEl('line', { class: 'paid-line', x1: pad.left, x2: W - pad.right, y1: y, y2: y }));
+  }
+
   host.append(svg);
 
   // Legend is always present for two or more series.
   const legend = $('#daily-legend');
   legend.textContent = '';
-  if (names.length >= 2) {
+  if (names.length >= 2 || paidNow > 0) {
     for (const n of names) {
       const item = el('span', 'legend-item');
       const sw = el('span', 'legend-swatch');
       sw.style.background = colorOf(n);
       item.append(sw, document.createTextNode(n));
+      legend.append(item);
+    }
+    if (paidNow > 0) {
+      const item = el('span', 'legend-item');
+      item.append(el('span', 'legend-swatch legend-swatch-dash'), document.createTextNode(`Subscriptions, ${money(paidNow)} a day`));
       legend.append(item);
     }
   }
@@ -477,7 +577,8 @@ function renderDailyTable(series, names) {
   const hr = el('tr');
   hr.append(el('th', null, 'Day'));
   for (const n of names) hr.append(el('th', null, n));
-  hr.append(el('th', null, 'Total'));
+  hr.append(el('th', null, 'At API prices'));
+  hr.append(el('th', null, 'Subscriptions'));
   hr.append(el('th', null, 'Calls'));
   thead.append(hr);
   table.append(thead);
@@ -488,6 +589,7 @@ function renderDailyTable(series, names) {
     tr.append(el('td', null, s.day));
     for (const n of names) tr.append(el('td', null, s.parts[n] ? money(s.parts[n]) : '—'));
     tr.append(el('td', null, money(s.total)));
+    tr.append(el('td', null, s.paid ? money(s.paid) : '—'));
     tr.append(el('td', null, s.events.toLocaleString()));
     tbody.append(tr);
   }

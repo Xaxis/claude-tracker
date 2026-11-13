@@ -20,6 +20,7 @@ import { startPanes } from './panes.js';
 import { startBridge, bridgeStatus, readConfig as slackConfig } from './bridge.js';
 import { machine } from './replica.js';
 import { useLinks, onPanel, panelOf, ask, onBoxControl } from './fleet.js';
+import { setPlanPrice } from './plans.js';
 
 const WEB_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'web');
 
@@ -143,6 +144,10 @@ async function handleWrite(req, res, url) {
         else runNext(Number(msg.pid));
         broadcast('machine', { at: Date.now() });
         return sendJson(res, panelOf('machine', there, machinePanel));
+      case '/api/plan-price':
+        setPlanPrice(msg.account, msg.usd ?? null);
+        broadcast('update', { reason: 'plan-price', at: Date.now(), newEvents: 0 });
+        return sendJson(res, { ok: true });
       case '/api/storage/rescan':
         surveyNow().then(() => broadcast('storage', { at: Date.now() }), (err) => console.error('storage survey:', err.message));
         return sendJson(res, { started: true });

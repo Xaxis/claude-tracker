@@ -95,6 +95,29 @@ test('stored calls are repriced in SQL exactly as costOf prices a new one', () =
   }
 });
 
+test('a plan costs its list price until the owner says otherwise, spread over the days it was paid for', async () => {
+  const { planPrice, setPlanPrice, paidOn, perDay, resetPlans } = await import('../src/plans.js');
+  resetPlans();
+  const max = { account_uuid: 'acct-max', rate_limit_tier: 'default_claude_max_20x', subscription_at: '2026-10-26T09:00:00Z', last_seen: Date.UTC(2026, 10, 13) };
+  const org = { account_uuid: 'acct-org', rate_limit_tier: 'default_raven', subscription_at: '2024-12-21T22:00:00Z', last_seen: Date.UTC(2026, 10, 13) };
+  assert.deepEqual(planPrice(max), { usd: 200, plan: 'Max 20x', source: 'list' });
+  assert.deepEqual(planPrice(org), { usd: null, plan: null, source: null }, 'an organization seat has no list price');
+  const day = (y, m, d) => new Date(y, m - 1, d).getTime();
+  assert.equal(paidOn([max, org], day(2026, 10, 25)), 0, 'nothing before the subscription began');
+  assert.ok(Math.abs(paidOn([max, org], day(2026, 11, 1)) - 200 * 12 / 365.25) < 1e-9);
+  assert.equal(paidOn([max], day(2027, 1, 1)), 0, 'nor long after the tracker last saw it');
+  setPlanPrice('acct-org', 150);
+  setPlanPrice('acct-max', 0);
+  assert.deepEqual(planPrice(org), { usd: 150, plan: null, source: 'owner' });
+  assert.equal(planPrice(max).usd, 0, 'a seat someone else pays for is free to the owner');
+  assert.ok(Math.abs(paidOn([max, org], day(2026, 11, 1)) - perDay(150)) < 1e-9);
+  setPlanPrice('acct-max', null);
+  assert.equal(planPrice(max).source, 'list', 'clearing it goes back to the list price');
+  assert.throws(() => setPlanPrice('acct-max', -5), /0 or more/);
+  assert.throws(() => setPlanPrice('../x', 5), /not an account/);
+  setPlanPrice('acct-org', null);
+});
+
 test('context-window suffixes do not change the rate', () => {
   assert.equal(costOf('claude-opus-5[1m]', { input: 1_000_000 }), costOf('claude-opus-5', { input: 1_000_000 }));
   assert.equal(modelLabel('claude-opus-5[1m]'), 'Opus 5');

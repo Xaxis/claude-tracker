@@ -8,6 +8,7 @@ import { capacityFor } from './calibrate.js';
 import { LIMIT_TYPES, currentWindow, burnRate, recentWindows, sumBetween } from './windows.js';
 import { modelLabel } from './pricing.js';
 import { billingPeriod, periodSpend } from './billing.js';
+import { planPrice, paidOn } from './plans.js';
 import { accountAggregates } from './aggregates.js';
 import { machine, remoteMachines, listPeers, machineNameOf } from './replica.js';
 import { failoverSettings, recentSwitches, spares, SPARE_PREFIX } from './failover.js';
@@ -226,6 +227,7 @@ export function overview(now = Date.now()) {
       limits,
       available,
       billing: period ? { ...period, spend: periodSpend(d, a.account_uuid, period) } : null,
+      plan: planPrice(a),
     };
   });
 
@@ -275,7 +277,10 @@ function accountFilter(accountUuid, prefix = 'AND') {
   return { clause: `${prefix} e.account_uuid = @acct`, params: { acct: accountUuid } };
 }
 
-/** Daily totals for the trailing `days`, split by model. */
+/**
+ * Daily totals for the trailing `days`, split by model, and what the subscriptions
+ * of the accounts shown cost that day (`paid`), to set beside it.
+ */
 export function history(days = 30, accountUuid = null) {
   const since = Date.now() - days * 86400000;
   const { clause: where, params } = accountFilter(accountUuid);
@@ -297,7 +302,19 @@ export function history(days = 30, accountUuid = null) {
     const name = modelLabel(r.model);
     e.models[name] = (e.models[name] ?? 0) + r.cost;
   }
-  return [...byDay.values()];
+  const accounts = db().prepare('SELECT * FROM accounts').all()
+    .filter((a) => !accountUuid || accountUuid === 'all' || a.account_uuid === accountUuid);
+  // Every day of the range, the quiet ones too: a subscription is paid for either way.
+  const out = [];
+  const day = new Date(since);
+  day.setHours(0, 0, 0, 0);
+  for (; day.getTime() <= Date.now(); day.setDate(day.getDate() + 1)) {
+    const key = `${day.getFullYear()}-${String(day.getMonth() + 1).padStart(2, '0')}-${String(day.getDate()).padStart(2, '0')}`;
+    const e = byDay.get(key) ?? { day: key, cost: 0, tokens: 0, events: 0, models: {} };
+    e.paid = paidOn(accounts, day.getTime());
+    out.push(e);
+  }
+  return out;
 }
 
 /** Recent sessions with their cost and owning account. */

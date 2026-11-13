@@ -8,6 +8,7 @@ import {
 import { calibrateAll, verifyWindowModel } from './calibrate.js';
 import { overview, modelBreakdown, liveSessions, inUse, boxes, versionOf, machineOnce, storagePanel, surveyNow } from './api.js';
 import { setPriority, runNext, priorities, TIERS } from './machine.js';
+import { setPlanPrice } from './plans.js';
 import { cacheSummary } from './context.js';
 import { LIMIT_TYPES, resetWindowCache, earliestCachedChain } from './windows.js';
 import { invalidateAggregates, aggregatesCutoff } from './aggregates.js';
@@ -180,7 +181,14 @@ function cmdStatus() {
         console.log(`    ${' '.repeat(14)} ${c.yellow}↳ at current burn, full in ${duration(l.exhaustsAt - o.now)}${c.reset}`);
       }
     }
+    const value = planLine(a);
+    if (value) console.log(`    ${pad('This period', 14)} ${value}`);
     console.log();
+  }
+  const plans = o.accounts.filter((a) => a.plan?.usd > 0);
+  if (plans.length) {
+    console.log(`  ${c.dim}Plans: ${money(plans.reduce((x, a) => x + a.plan.usd, 0))} a month across ${plans.length} account${plans.length === 1 ? '' : 's'}`
+      + ` (list prices unless set with claude-tracker plan).${c.reset}`);
   }
 
   if (o.unattributed.events) {
@@ -992,6 +1000,40 @@ async function cmdMachine(flags) {
   console.log(`\n${c.dim}Set who goes first: claude-tracker priority <project> high|normal|low|paused (the owner's to set).${c.reset}\n`);
 }
 
+/** An account's use this billing period at API prices against what its plan costs, or null. */
+function planLine(a) {
+  const b = a.billing, p = a.plan;
+  if (!b || !(p?.usd > 0)) return null;
+  const times = b.spend.cost / p.usd;
+  const pace = b.percentElapsed >= 5 ? b.spend.cost / (b.percentElapsed / 100) : null;
+  const under = pace != null && pace < p.usd ? ` ${c.yellow}on pace for ${money(pace)} by renewal, less than it costs${c.reset}` : '';
+  return `${money(b.spend.cost)} at API prices, ${c.bold}${times >= 10 ? Math.round(times) : times.toFixed(1)}×${c.reset} its ${money(p.usd)} plan${under}`;
+}
+
+/** What each plan costs you: show them, or set one account's (`list` goes back to the list price). */
+function cmdPlan(args, o) {
+  if (!args.length) {
+    for (const a of o.accounts) {
+      const p = a.plan ?? {};
+      const price = p.usd == null ? `${c.dim}no price: claude-tracker plan ${a.email ?? a.accountUuid} <dollars>${c.reset}`
+        : `${money(p.usd)} a month ${c.dim}(${p.source === 'owner' ? 'set by you' : `${p.plan ?? ''} list price`})${c.reset}`;
+      console.log(`  ${pad(a.label, 34)} ${price}`);
+      const value = planLine(a);
+      if (value) console.log(`  ${' '.repeat(34)} ${c.dim}this period:${c.reset} ${value}`);
+    }
+    return;
+  }
+  const [who, what] = args;
+  const want = String(who).toLowerCase();
+  const hits = o.accounts.filter((a) => [a.email, a.label, a.accountUuid].some((x) => x && String(x).toLowerCase() === want))
+    .concat(o.accounts.filter((a) => a.accountUuid.startsWith(who)));
+  const a = hits[0];
+  if (!a || new Set(hits.map((h) => h.accountUuid)).size > 1) { console.error(`No single account matches ${who}.`); process.exitCode = 1; return; }
+  if (what == null) { console.error('Give a monthly price in dollars, or "list" for the list price.'); process.exitCode = 1; return; }
+  setPlanPrice(a.accountUuid, what === 'list' ? null : Number(what));
+  console.log(what === 'list' ? `${a.label}: back to the list price.` : `${a.label}: ${money(Number(what))} a month.`);
+}
+
 /** The owner's priorities: show them, or set one project's. */
 function cmdPriority(args, flags) {
   if (args.length === 0) {
@@ -1081,6 +1123,7 @@ ${c.bold}claude-tracker${c.reset} — local usage and rate-limit tracking for Cl
   ${c.bold}priority${c.reset} [<project> <tier>]   who goes first: high, normal, low or paused (the owner's to set)
   ${c.bold}run-next${c.reset} <pid>                start one waiting job before the rest
   ${c.bold}storage${c.reset} [--rescan] [--json]  who fills the disks, and what is left behind
+  ${c.bold}plan${c.reset} [<account> <dollars|list>] what each plan costs you, against its use at API prices
   ${c.bold}ingest${c.reset} [--force]            read new transcript data
   ${c.bold}accounts${c.reset}                    list discovered accounts
         ${c.dim}export [file.csv]${c.reset}         every account as a spreadsheet (Downloads by default)
@@ -1159,6 +1202,7 @@ export async function runCli(argv) {
       case 'verify': await refresh({ quiet: true }); cmdVerify(); break;
       case 'machine': await cmdMachine(flags); break;
       case 'priority': cmdPriority(rest.slice(1), flags); break;
+      case 'plan': await refresh({ quiet: true }); cmdPlan(rest.slice(1), overview()); break;
       case 'run-next': cmdRunNext(rest.slice(1)); break;
       case 'storage': await cmdStorage(flags); break;
       case 'where':

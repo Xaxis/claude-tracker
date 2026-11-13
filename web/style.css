@@ -474,3 +474,23 @@ body:not(.detail) #cache { display: none !important; }
 @media (max-width: 560px) {
   .project-sum { white-space: normal; }
 }
+
+/* --- use at API prices beside what the subscriptions cost --- */
+.daily-summary { display: flex; flex-wrap: wrap; gap: 6px 22px; margin: 0 0 10px; font-size: 13px; color: var(--text-secondary); }
+.daily-summary:empty { display: none; }
+.daily-stat { display: inline-flex; align-items: baseline; gap: 6px; }
+.daily-stat-label { font-size: 12px; color: var(--text-muted); }
+.daily-stat strong { color: var(--text-primary); font-variant-numeric: tabular-nums; font-weight: 600; }
+.daily-stat-strong strong { font-size: 15px; }
+.paid-line { stroke: var(--text-secondary); stroke-width: 1.5; stroke-dasharray: 4 3; pointer-events: none; }
+.legend-swatch-dash { background: none !important; border-top: 2px dashed var(--text-secondary); height: 0; align-self: center; }
+.plan-value { display: flex; flex-direction: column; gap: 3px; font-size: 12px; color: var(--text-secondary); }
+.plan-line { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: baseline; gap: 4px 10px; }
+.plan-price { font: inherit; font-size: 12px; color: var(--text-secondary); background: none; border: 0; padding: 0;
+  text-decoration: underline dotted; text-underline-offset: 3px; cursor: pointer; }
+.plan-price:hover, .plan-price:focus-visible { color: var(--text-primary); }
+.plan-input { font: inherit; font-size: 12px; width: 7em; padding: 1px 4px; color: var(--text-primary);
+  background: var(--page); border: 1px solid var(--border); border-radius: 4px; }
+.plan-worth strong { color: var(--text-primary); font-variant-numeric: tabular-nums; }
+.plan-worth.is-under { color: var(--text-primary); }
+.plan-worth.is-under::before { content: "▲ "; color: var(--warning); }

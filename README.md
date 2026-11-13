@@ -81,6 +81,7 @@ Run it from any directory once linked:
 | `claude-tracker priority my-app high` | who goes first on the shared CPU pool: high, normal, low or paused |
 | `claude-tracker run-next 12345` | start one waiting job before all the others |
 | `claude-tracker storage` | who fills the disks, and what nobody cleaned up |
+| `claude-tracker plan` | what each plan costs you, against its use at API prices |
 | `claude-tracker models --days 7` | where the spend went |
 | `claude-tracker verify` | check the window model against your own resets |
 | `claude-tracker accounts` | list accounts and their UUIDs |
@@ -762,6 +763,27 @@ This is an estimate and is labelled as one. It assumes a monthly cycle, so an
 annual plan will read wrong, and it cannot see a plan that was cancelled, paused,
 or switched. The renewal date is only as good as the subscription start date on
 disk.
+
+### What you pay, beside what it would cost
+
+Every cost the tracker shows is the API price of the same calls: what they would
+cost on the API, at each model's own rates (cache reads and writes, fast mode,
+web searches, and Haiku 5.5's higher rate past 100K tokens of prompt). Beside it
+goes what the subscriptions cost:
+
+- **Daily usage** shows the range at API prices, what the plans cost over the
+  same days, and how many times over the use repaid them. The dashed line on the
+  chart is the plans' cost per day.
+- **Each account** shows its use this billing period at API prices against its
+  plan, and warns when it is on pace to be worth less than it costs by renewal.
+
+Claude Code says which plan an account is on but not what you pay, so the list
+price stands in: $200 a month for Max 20x, $100 for Max 5x, $20 for Pro. Click
+the price on an account to set your own (another currency, tax, a discount, or 0
+for a seat someone else pays for), or run `claude-tracker plan <account>
+<dollars>`; `claude-tracker plan <account> list` goes back to the list price. An
+organization's seat has no list price until you give it one. Prices you set are
+kept on each machine in `~/.claude/tracker/plan-prices.json`.
 
 ### Why some accounts show a UUID instead of an email
 
