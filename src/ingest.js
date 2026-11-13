@@ -93,7 +93,14 @@ function prepare(d) {
                         thinking_tokens, cache_write_5m, cache_write_1h, cache_read, web_search,
                         service_tier, speed, cost_usd, is_sidechain, config_dir)
     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-    ON CONFLICT(call_id) DO NOTHING`);
+    ON CONFLICT(call_id) DO UPDATE SET
+      input_tokens = MAX(input_tokens, excluded.input_tokens), output_tokens = MAX(output_tokens, excluded.output_tokens),
+      thinking_tokens = MAX(thinking_tokens, excluded.thinking_tokens), cache_write_5m = MAX(cache_write_5m, excluded.cache_write_5m),
+      cache_write_1h = MAX(cache_write_1h, excluded.cache_write_1h), cache_read = MAX(cache_read, excluded.cache_read),
+      web_search = MAX(web_search, excluded.web_search), cost_usd = MAX(cost_usd, excluded.cost_usd)
+    WHERE excluded.output_tokens > events.output_tokens OR excluded.input_tokens > events.input_tokens
+       OR excluded.cache_read > events.cache_read OR excluded.cache_write_5m > events.cache_write_5m
+       OR excluded.cache_write_1h > events.cache_write_1h OR excluded.web_search > events.web_search`);
   STMT.limit ||= d.prepare(`
     INSERT INTO limit_events (ts, session_id, account_uuid, limit_type, resets_at, status, overage, config_dir)
     VALUES (?,?,?,?,?,?,?,?)
@@ -213,8 +220,10 @@ function handleLine(line, ctx) {
   if (total <= 0) return 0;
 
   // Identify the API response, not the transcript line: a multi-block response
-  // is written as several lines that each repeat the same usage totals, and only
-  // one of them represents real spend. message.id names the response directly;
+  // is written as several lines, and only one of them represents real spend. They
+  // nearly always repeat the same totals, but not quite always (13 November 2026: one
+  // response in 168k said 16 output tokens on its first line and 2,586 on its last),
+  // so a repeat that says more raises the stored call to it. message.id names the response directly;
   // requestId names the HTTP call that produced it; the line uuid is the last
   // resort for records that carry neither.
   const callId = msg.id || d.requestId || d.uuid || `${ts}:${model}`;
@@ -224,8 +233,8 @@ function handleLine(line, ctx) {
     u.input, u.output, u.thinking, u.cacheWrite5m, u.cacheWrite1h, u.cacheRead,
     u.webSearch, u.serviceTier, u.speed, cost, d.isSidechain ? 1 : 0, ctx.configDir,
   );
-  // A repeat of a response we already have contributes nothing; report only
-  // rows actually stored so the ingest count means what it says.
+  // A repeat of a response we already have contributes nothing unless it said more;
+  // report only rows actually stored or raised, so the ingest count means what it says.
   const stored = res.changes > 0 ? 1 : 0;
   if (stored) ctx.minNewTs = Math.min(ctx.minNewTs ?? Infinity, ts);
 

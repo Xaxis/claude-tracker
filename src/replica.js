@@ -218,7 +218,7 @@ const IMPORT = {
   events(r) {
     // Priced here, by this machine's table, so every call is priced the same way.
     const cost = costOf(r.model, { input: r.input_tokens, output: r.output_tokens,
-      cacheWrite5m: r.cache_write_5m, cacheWrite1h: r.cache_write_1h, cacheRead: r.cache_read });
+      cacheWrite5m: r.cache_write_5m, cacheWrite1h: r.cache_write_1h, cacheRead: r.cache_read, webSearch: r.web_search, speed: r.speed });
     const res = stmt(`INSERT INTO events (call_id, uuid, ts, session_id, request_id, model, input_tokens,
         output_tokens, thinking_tokens, cache_write_5m, cache_write_1h, cache_read, web_search,
         service_tier, speed, cost_usd, is_sidechain, config_dir)

@@ -19,6 +19,10 @@
  */
 
 const M = 1_000_000;
+// Fast mode doubles every token's price on each model that offers it (Opus 5.5 $8 / $40,
+// Fable 5.2 $16 / $80); a server-side web search is $10 per thousand.
+const FAST = 2;
+const SEARCH = 0.01;
 
 /**
  * base = input, out = output, cr = cache read (overrides the 0.1x default).
@@ -87,7 +91,7 @@ export function modelLabel(modelId) {
 /**
  * USD cost of a single API response.
  * @param {string} modelId
- * @param {{input?:number,output?:number,cacheWrite5m?:number,cacheWrite1h?:number,cacheRead?:number}} t
+ * @param {{input?:number,output?:number,cacheWrite5m?:number,cacheWrite1h?:number,cacheRead?:number,webSearch?:number,speed?:string}} t
  */
 export function costOf(modelId, t) {
   const info = modelInfo(modelId);
@@ -97,9 +101,8 @@ export function costOf(modelId, t) {
   const w1h = t.cacheWrite1h ?? 0;
   const read = t.cacheRead ?? 0;
   const i = info.long && input + w5 + w1h + read > info.long.over ? info.long : info;
-  return (
-    (input * i.base + output * i.out + w5 * i.base * 1.25 + w1h * i.base * 2 + read * i.cr) / M
-  );
+  const tokens = (input * i.base + output * i.out + w5 * i.base * 1.25 + w1h * i.base * 2 + read * i.cr) / M;
+  return tokens * (t.speed === 'fast' ? FAST : 1) + (t.webSearch ?? 0) * SEARCH;
 }
 
 /** What costOf computes, as SQL over an events row, for one model's calls. */
@@ -108,12 +111,13 @@ export function repriceSql(modelId) {
   const n = (x) => String(Number(x));
   const linear = (i) => `(input_tokens * ${n(i.base)} + output_tokens * ${n(i.out)} + cache_write_5m * ${n(i.base)} * 1.25`
     + ` + cache_write_1h * ${n(i.base)} * 2 + cache_read * ${n(i.cr)}) / ${M}.0`;
-  return info.long
+  const tokens = info.long
     ? `CASE WHEN input_tokens + cache_write_5m + cache_write_1h + cache_read > ${n(info.long.over)} THEN ${linear(info.long)} ELSE ${linear(info)} END`
     : linear(info);
+  return `(${tokens}) * (CASE WHEN speed = 'fast' THEN ${FAST} ELSE 1 END) + web_search * ${SEARCH}`;
 }
 
 /** Changes whenever any rate in the table does: stored costs priced by another table are stale. */
-export const PRICING_ID = JSON.stringify([UNKNOWN, ...MODELS.map((m) => [m.match.source, m.base, m.out, m.cr ?? null, m.long ?? null])]);
+export const PRICING_ID = JSON.stringify([FAST, SEARCH, UNKNOWN, ...MODELS.map((m) => [m.match.source, m.base, m.out, m.cr ?? null, m.long ?? null])]);
 
 export const KNOWN_MODELS = MODELS.map((m) => m.name);

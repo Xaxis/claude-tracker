@@ -85,12 +85,12 @@ test('Haiku 5.5 costs five times as much once a prompt passes 100K tokens', () =
 test('stored calls are repriced in SQL exactly as costOf prices a new one', () => {
   const d = db();
   const row = (model, i, o, w5, w1, r) => ({ model, input_tokens: i, output_tokens: o, cache_write_5m: w5, cache_write_1h: w1, cache_read: r });
-  const rows = [row('claude-opus-5-5[1m]', 1234, 5678, 910, 1112, 131415), row('claude-haiku-5-5', 20_000, 300, 0, 0, 90_000),
+  const rows = [row('claude-opus-5-5[1m]', 1234, 5678, 910, 1112, 131415), { ...row('claude-opus-5-5', 10, 20, 0, 0, 30), speed: 'fast', web_search: 2 }, row('claude-haiku-5-5', 20_000, 300, 0, 0, 90_000),
     row('claude-haiku-5-5', 20_000, 300, 0, 0, 70_000), row('claude-fable-5-1', 1, 2, 3, 4, 5), row(null, 10, 10, 0, 0, 0)];
   for (const r of rows) {
-    const sql = d.prepare(`SELECT ${repriceSql(r.model)} AS c FROM (SELECT ? input_tokens, ? output_tokens, ? cache_write_5m, ? cache_write_1h, ? cache_read)`)
-      .get(r.input_tokens, r.output_tokens, r.cache_write_5m, r.cache_write_1h, r.cache_read).c;
-    const js = costOf(r.model, { input: r.input_tokens, output: r.output_tokens, cacheWrite5m: r.cache_write_5m, cacheWrite1h: r.cache_write_1h, cacheRead: r.cache_read });
+    const sql = d.prepare(`SELECT ${repriceSql(r.model)} AS c FROM (SELECT ? input_tokens, ? output_tokens, ? cache_write_5m, ? cache_write_1h, ? cache_read, ? speed, ? web_search)`)
+      .get(r.input_tokens, r.output_tokens, r.cache_write_5m, r.cache_write_1h, r.cache_read, r.speed ?? null, r.web_search ?? 0).c;
+    const js = costOf(r.model, { input: r.input_tokens, output: r.output_tokens, cacheWrite5m: r.cache_write_5m, cacheWrite1h: r.cache_write_1h, cacheRead: r.cache_read, speed: r.speed, webSearch: r.web_search });
     assert.ok(Math.abs(sql - js) < 1e-12, `${r.model}: ${sql} vs ${js}`);
   }
 });
@@ -383,6 +383,41 @@ test('a multi-block response is billed once, not once per content block', async 
   assert.equal(row.n, 1, `${blocks.length} lines are one API response`);
   assert.equal(row.cr, 500_000, 'usage counted once, not multiplied by block count');
   fs.rmSync(root, { recursive: true, force: true });
+});
+
+test('a response whose later line says more is counted at what it said last', async () => {
+  reset();
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ct-profile-'));
+  const proj = path.join(root, 'projects', '-tmp-demo');
+  fs.mkdirSync(proj, { recursive: true });
+  fs.writeFileSync(path.join(root, 'settings.json'), '{}');
+  const line = (i, output, extra = {}) => JSON.stringify({
+    type: 'assistant', uuid: `line-${i}`, timestamp: '2026-09-01T10:00:00.000Z', sessionId: 'sess-1', requestId: 'req_1', cwd: '/tmp/demo',
+    message: { id: 'msg_1', model: 'claude-opus-5-5', content: [{ type: 'text' }],
+      usage: { input_tokens: 2, output_tokens: output, cache_read_input_tokens: 197_086, cache_creation_input_tokens: 4631, ...extra } },
+  });
+  // As seen on 2026-11-13: 16 output tokens on the first line, 2,586 on the last.
+  const file = path.join(proj, 'sess-1.jsonl');
+  fs.writeFileSync(file, [line(0, 16), line(1, 2586), line(2, 16)].join('\n') + '\n');
+  const { ingestAll } = await import('../src/ingest.js');
+  const profiles = [{ dir: root, name: 'demo', projectsDir: path.join(root, 'projects') }];
+  await ingestAll({ profiles });
+  const row = () => db().prepare('SELECT COUNT(*) n, output_tokens o, cost_usd c FROM events').get();
+  assert.equal(row().n, 1);
+  assert.equal(row().o, 2586, 'the larger count stands, and a smaller repeat after it does not lower it');
+  assert.ok(Math.abs(row().c - costOf('claude-opus-5-5', { input: 2, output: 2586, cacheRead: 197_086, cacheWrite5m: 4631 })) < 1e-12);
+  // A later line that adds web searches adds their price.
+  fs.appendFileSync(file, line(3, 2586, { server_tool_use: { web_search_requests: 3 } }) + '\n');
+  await ingestAll({ profiles });
+  assert.ok(Math.abs(row().c - costOf('claude-opus-5-5', { input: 2, output: 2586, cacheRead: 197_086, cacheWrite5m: 4631, webSearch: 3 })) < 1e-12,
+    'a repeat that adds web searches raises the call by them');
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test('fast mode costs double and a web search a cent', () => {
+  assert.equal(costOf('claude-opus-5-5', { input: 1_000_000, speed: 'fast' }), 8);
+  assert.equal(costOf('claude-opus-5-5', { output: 1_000_000, speed: 'fast' }), 40);
+  assert.equal(costOf('claude-opus-5-5', { webSearch: 1000 }), 10);
 });
 
 test('history is never attributed backwards to a newly signed-in account', () => {
