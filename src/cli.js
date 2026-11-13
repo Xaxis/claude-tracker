@@ -957,14 +957,14 @@ const TIER_COLOR = { high: 'cyan', normal: 'reset', low: 'dim', paused: 'yellow'
 /** What uses this machine now: each project's cores, memory, sessions, jobs and waiting jobs, and why they wait. */
 async function cmdMachine(flags) {
   const v = await machineOnce();
-  if (!v) { console.log('Only on Linux: this machine has no /proc to read.'); return; }
+  if (!v) { console.log('This machine cannot be read: it needs Linux with /proc, or macOS.'); return; }
   if (flags.json) { console.log(JSON.stringify(v, null, 2)); return; }
   const now = Date.now();
   const cpu = v.cpu;
   console.log(`\n${c.bold}This machine${c.reset} ${c.dim}· ${new Date(v.at).toLocaleTimeString()}${c.reset}`);
   console.log(`  CPU     ${c.bold}${cores(cpu.busy)}${c.reset} of ${cpu.cores} cores busy · ${Math.round(cpu.demand)} threads want one${cpu.gate != null ? ` (the pool starts jobs under ${Math.round(cpu.gate)})` : ''}`);
   console.log(`  Memory  ${c.bold}${gb(v.mem.used)}${c.reset} of ${gb(v.mem.total)}${v.mem.swapUsed > 2 ** 28 ? ` · ${gb(v.mem.swapUsed)} in swap` : ''}`);
-  if (v.gpu) console.log(`  GPU     ${c.bold}${v.gpu.busy ?? '—'}%${c.reset} busy${v.gpu.vramTotal ? ` · ${gb(v.gpu.vramUsed)} of ${gb(v.gpu.vramTotal)} video memory` : ''}`);
+  if (v.gpu) console.log(`  GPU     ${c.bold}${v.gpu.busy ?? '—'}%${c.reset} busy${v.gpu.vramTotal ? ` · ${gb(v.gpu.vramUsed)} of ${gb(v.gpu.vramTotal)} video memory` : v.gpu.vramUsed ? ` · ${gb(v.gpu.vramUsed)} of memory in use` : ''}`);
   if (cpu.slots) console.log(`  Pool    ${c.bold}${cpu.held}${c.reset} of ${cpu.slots} slots${cpu.waiting ? ` · ${cpu.waiting} waiting` : ''}`);
   const pr = v.priority;
   console.log(`\n${c.bold}Projects${c.reset} ${c.dim}· ${pr.set ? 'the owner\'s priorities' : 'no priorities set: first come, first served'}${c.reset}`);
@@ -1037,7 +1037,7 @@ async function cmdStorage(flags) {
     await surveyNow();
   }
   const s = storagePanel();
-  if (!s) { console.log('Only on Linux.'); return; }
+  if (!s) { console.log('The disks are surveyed only on Linux and macOS.'); return; }
   if (!s.at) { console.log('Not measured yet: the tracker measures a minute and a half after it starts, or run claude-tracker storage --rescan.'); return; }
   if (flags.json) { console.log(JSON.stringify(s, null, 2)); return; }
   console.log(`\n${c.bold}Disk space${c.reset} ${c.dim}· measured ${duration(Date.now() - s.at)} ago${c.reset}`);

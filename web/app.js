@@ -855,12 +855,55 @@ function holdColors(names) {
 
 const machineState = {
   view: null,
+  on: (() => { try { return localStorage.getItem('ct-machine-on') || null; } catch { return null; } })(),  // the machine shown; null: this one
   open: new Set(JSON.parse(localStorage.getItem('ct-open-projects') || '[]')),
   pending: new Map(),   // project -> tier asked for, until the server says it took
   rows: new Map(),      // project -> its row, kept so a refresh never steals a click or focus
   table: false,
   allWaits: new Set(),  // projects whose whole queue shows
 };
+
+/** Which machine the two panels show, and the buttons to pick another: shown once there are two. */
+function renderPicker(host, v) {
+  const list = v?.machines ?? [];
+  host.hidden = list.length < 2;
+  if (host.hidden) return;
+  const key = list.map((m) => `${m.id}:${m.online}:${m.id === v.on}`).join('|');
+  if (host.dataset.key === key) return;
+  host.dataset.key = key;
+  host.textContent = '';
+  for (const m of list) {
+    const b = el('button', m.online ? null : 'is-offline', m.self ? `${m.name} (this one)` : m.name);
+    b.type = 'button';
+    b.setAttribute('aria-pressed', String(m.id === v.on));
+    b.title = m.self ? 'This machine' : m.online ? `${m.name}, as it reports over sync` : `${m.name} is not reporting now`;
+    b.addEventListener('click', () => pickMachine(m.self ? null : m.id));
+    host.append(b);
+  }
+}
+
+function pickMachine(id) {
+  if ((machineState.on ?? null) === id) return;
+  machineState.on = id;
+  try { if (id) localStorage.setItem('ct-machine-on', id); else localStorage.removeItem('ct-machine-on'); } catch { /* private mode */ }
+  // Another machine's projects: no row, click or open queue carries over.
+  machineState.rows.clear();
+  machineState.pending.clear();
+  $('#projects').textContent = '';
+  loadMachine();
+  loadStorage();
+}
+
+/** Whether the owner can change the picked machine's priorities now: heavy there, and it reporting. */
+const canSet = (v) => !!v.priority?.canSet && (!v.remote || v.remote.online);
+
+const onParam = () => (machineState.on ? `?on=${encodeURIComponent(machineState.on)}` : '');
+
+/** A synced machine's panel says so: its name, and how fresh it is. */
+function remoteNote(v) {
+  if (!v.remote) return '';
+  return v.remote.online ? ` · as ${v.remote.name} reports it` : ` · ${v.remote.name} last reported ${duration(Date.now() - v.remote.at)} ago`;
+}
 
 async function postJson(url, body) {
   const r = await fetch(url, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
@@ -871,8 +914,19 @@ async function postJson(url, body) {
 
 function renderMachine(v) {
   const box = $('#machine');
-  if (!v || v.unavailable) { box.hidden = true; machineState.view = null; return; }
+  // The machine picked is gone from the list: back to this one.
+  if (v?.gone) { pickMachine(null); return; }
+  const many = (v?.machines?.length ?? 0) > 1;
+  if (!v || (v.unavailable && !many)) { box.hidden = true; machineState.view = null; return; }
   box.hidden = false;
+  renderPicker($('#machine-pick'), v);
+  $('#machine-title').textContent = v.remote ? v.remote.name : many ? `${v.machines[0].name} (this machine)` : 'This machine';
+  box.classList.toggle('is-empty', !!v.unavailable);
+  if (v.unavailable) {
+    machineState.view = null;
+    $('#machine-note').textContent = v.remote ? `${v.remote.name} does not sample its cores yet: update its tracker` : 'Cores are not sampled on this machine';
+    return;
+  }
   machineState.view = v;
 
   // The projects that get a colour: the busiest over the hour, and now.
@@ -884,7 +938,7 @@ function renderMachine(v) {
   const rest = cssVar('--text-muted');
   const colorOf = (k) => (top.includes(k) ? cssVar(SERIES[colorSlots[k].slot]) : rest);
 
-  $('#machine-note').textContent = `Sampled every 3 s · ${timeOf(v.at)}`;
+  $('#machine-note').textContent = `Sampled every 3 s · ${timeOf(v.at)}${remoteNote(v)}`;
   renderMachineStats(v);
   renderCoresNow(v, top, colorOf);
   renderCoresHour(v, top, colorOf);
@@ -927,7 +981,7 @@ function renderMachineStats(v) {
     const g = v.gpu;
     const l = g.leases;
     host.append(statTile('GPU', g.busy != null ? `${Math.round(g.busy)}%` : '—', 'busy',
-      [g.vramTotal ? `${gb(g.vramUsed)} of ${gb(g.vramTotal)} video memory` : null,
+      [g.vramTotal ? `${gb(g.vramUsed)} of ${gb(g.vramTotal)} video memory` : g.vramUsed ? `${gb(g.vramUsed)} of memory in use` : null,
        l ? `${l.held} of ${l.slots} leases held${l.waiting ? `, ${l.waiting} waiting` : ''}` : null].filter(Boolean).join(' · '),
       g.busy, null));
   }
@@ -1093,7 +1147,7 @@ async function choosePriority(project, tier) {
   try {
     for (;;) {
       const want = machineState.pending.get(project);
-      const v = await postJson('/api/priority', { project, tier: want });
+      const v = await postJson('/api/priority', { project, tier: want, machine: machineState.on });
       if (machineState.pending.get(project) !== want) continue;
       machineState.pending.delete(project);
       err.hidden = true;
@@ -1116,7 +1170,7 @@ async function runNextJob(btn, pid) {
   btn.textContent = 'Asking…';
   const err = $('#priority-error');
   try {
-    const v = await postJson('/api/run-next', { pid });
+    const v = await postJson('/api/run-next', { pid, machine: machineState.on });
     err.hidden = true;
     btn.blur();  // the details refresh only while the owner is not in them
     if (v?.projects) renderMachine(v);
@@ -1135,7 +1189,8 @@ function renderProjects(v, top, colorOf) {
   const host = $('#projects');
   const pr = v.priority;
   const note = $('#priority-note');
-  if (!pr.canSet) note.textContent = 'heavy is not installed here, so priorities cannot be set';
+  if (v.remote && !v.remote.online) note.textContent = `${v.remote.name} is not reporting, so its priorities cannot be set now`;
+  else if (!pr.canSet) note.textContent = `heavy is not installed ${v.remote ? `on ${v.remote.name}` : 'here'}, so priorities cannot be set`;
   else if (pr.broken) note.textContent = 'The priority file does not read as JSON: set any project to rewrite it';
   else if (pr.set) note.textContent = `Last set ${pr.updated ? `${duration(Date.now() - pr.updated)} ago` : ''}${pr.by ? ` from ${pr.by}` : ''}`;
   else note.textContent = 'None set yet: first come, first served, with heavy\'s own ranks';
@@ -1223,7 +1278,7 @@ function fillProject(row, p, v, colorOf, force = false) {
   for (const b of seg.children) {
     b.setAttribute('aria-checked', String(b.dataset.tier === tier));
     b.tabIndex = b.dataset.tier === tier ? 0 : -1;
-    b.disabled = !v.priority.canSet;
+    b.disabled = !canSet(v);
   }
   const body = row.querySelector('.project-body');
   body.hidden = !machineState.open.has(p.name);
@@ -1281,7 +1336,7 @@ function waitRow(w, v) {
   row.append(main);
   const side = el('div', 'row-value');
   side.append(sinceSpan(w.since));
-  if (!w.next && v.priority.canSet) {
+  if (!w.next && canSet(v)) {
     const b = el('button', 'small-btn', 'Run next');
     b.type = 'button';
     b.title = 'Start this job before every other waiting job, as soon as a slot is free';
@@ -1383,20 +1438,31 @@ function itemLine(i, why) {
 function renderStorage(s) {
   const box = $('#storage');
   storageView = s;
-  if (!s || s.unavailable) { box.hidden = true; return; }
+  if (s?.gone) { pickMachine(null); return; }
+  const many = (s?.machines?.length ?? 0) > 1;
+  if (!s || (s.unavailable && !many)) { box.hidden = true; return; }
   box.hidden = false;
+  renderPicker($('#storage-pick'), s);
+  $('#storage-title').textContent = s.remote ? `Disk space on ${s.remote.name}` : 'Disk space';
+  box.classList.toggle('is-empty', !!s.unavailable);
   const btn = $('#storage-rescan');
+  btn.hidden = !!s.remote;  // a survey is that machine's own to start
   btn.disabled = !!s.surveying;
   btn.textContent = s.surveying ? 'Surveying…' : 'Rescan';
   const note = $('#storage-note');
+  if (s.unavailable) {
+    note.textContent = s.remote ? `${s.remote.name} does not measure its disks yet: update its tracker` : 'Disks are not measured on this machine';
+    return;
+  }
   $('#storage .storage-row').hidden = !s.at;
   if (!s.at) {
     note.textContent = s.surveying ? 'Measuring the disks for the first time; this takes a few minutes'
+      : s.remote ? `${s.remote.name} has not measured its disks yet`
       : 'Not measured yet: the first survey starts a minute and a half after the tracker does, or press Rescan';
     for (const id of ['#disks', '#owners', '#leftovers', '#cleanup', '#owners-legend']) $(id).textContent = '';
     return;
   }
-  note.textContent = `Measured ${duration(Date.now() - s.at)} ago${s.took ? `, in ${duration(s.took)}` : ''} · next in ${duration(Math.max(0, s.next - Date.now()))}`;
+  note.textContent = `Measured ${duration(Date.now() - s.at)} ago${s.took ? `, in ${duration(s.took)}` : ''} · next in ${duration(Math.max(0, s.next - Date.now()))}${remoteNote(s)}`;
 
   const disks = $('#disks');
   disks.textContent = '';
@@ -1489,7 +1555,7 @@ function renderStorage(s) {
   const cleanup = $('#cleanup');
   cleanup.textContent = '';
   if (s.commands.length) {
-    cleanup.append(el('h3', 'sub-h', 'Clean up'));
+    cleanup.append(el('h3', 'sub-h', s.remote ? `Clean up: run these on ${s.remote.name}` : 'Clean up'));
     for (const c of s.commands) {
       const row = el('div', 'cleanup-row');
       const b = el('button', 'command', c.cmd);
@@ -1514,10 +1580,10 @@ let machineBusy = false;
 async function loadMachine() {
   if (machineBusy) return;
   machineBusy = true;
-  try { renderMachine(await getJson('/api/machine')); } catch { /* the next tick tries again */ } finally { machineBusy = false; }
+  try { renderMachine(await getJson(`/api/machine${onParam()}`)); } catch { /* the next tick tries again */ } finally { machineBusy = false; }
 }
 async function loadStorage() {
-  try { renderStorage(await getJson('/api/storage')); } catch { /* the next tick tries again */ }
+  try { renderStorage(await getJson(`/api/storage${onParam()}`)); } catch { /* the next tick tries again */ }
 }
 setInterval(() => { if (document.visibilityState === 'visible') loadMachine(); }, 3000);
 setInterval(() => { if (document.visibilityState === 'visible') loadStorage(); }, 60e3);

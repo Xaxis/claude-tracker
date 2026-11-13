@@ -69,8 +69,9 @@
 
   <section class="panel" id="machine" hidden>
     <div class="panel-head">
-      <h2>This machine</h2>
+      <h2 id="machine-title">This machine</h2>
       <div class="controls">
+        <div class="seg machine-pick" id="machine-pick" role="group" aria-label="Machine" hidden></div>
         <p class="panel-note" id="machine-note"></p>
         <button class="ghost-btn" id="machine-table-toggle" type="button" aria-pressed="false">Table</button>
       </div>
@@ -110,8 +111,9 @@
 
   <section class="panel" id="storage" hidden>
     <div class="panel-head">
-      <h2>Disk space</h2>
+      <h2 id="storage-title">Disk space</h2>
       <div class="controls">
+        <div class="seg machine-pick" id="storage-pick" role="group" aria-label="Machine" hidden></div>
         <p class="panel-note" id="storage-note"></p>
         <button class="ghost-btn" id="storage-rescan" type="button">Rescan</button>
       </div>

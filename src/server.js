@@ -19,6 +19,7 @@ import { accountsCsv, exportFileName } from './export.js';
 import { startPanes } from './panes.js';
 import { startBridge, bridgeStatus, readConfig as slackConfig } from './bridge.js';
 import { machine } from './replica.js';
+import { useLinks, onPanel, panelOf, ask, onBoxControl } from './fleet.js';
 
 const WEB_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'web');
 
@@ -81,8 +82,9 @@ function handleApi(req, res, url) {
     case '/api/models': return sendJson(res, modelBreakdown(days, account));
     case '/api/live': return sendJson(res, liveSessions());
     case '/api/box': return sendJson(res, boxes());
-    case '/api/machine': return sendJson(res, machinePanel() ?? { unavailable: true });
-    case '/api/storage': return sendJson(res, storagePanel() ?? { unavailable: true });
+    // This machine's, or with ?on=<machine id> a synced machine's as it last sent it.
+    case '/api/machine': return sendJson(res, panelOf('machine', q.get('on'), machinePanel));
+    case '/api/storage': return sendJson(res, panelOf('storage', q.get('on'), storagePanel));
     case '/api/cache': return sendJson(res, cacheSummary());
     case '/api/accounts': return sendJson(res, listAccounts());
     case '/api/accounts.csv': {
@@ -127,16 +129,20 @@ async function handleWrite(req, res, url) {
   }
   let msg;
   try { msg = body ? JSON.parse(body) : {}; } catch { return sendJson(res, { error: 'not JSON' }, 400); }
+  // Another machine's priorities go to the tracker beside its heavy, over the sync link.
+  const there = typeof msg.machine === 'string' && msg.machine !== machine().id ? msg.machine : null;
   try {
     switch (url.pathname) {
       case '/api/priority':
-        setPriority(msg.project, msg.tier, 'claude-tracker (dashboard)');
+        if (there) await ask(there, { k: 'prio', project: msg.project, tier: msg.tier });
+        else setPriority(msg.project, msg.tier, 'claude-tracker (dashboard)');
         broadcast('machine', { at: Date.now() });
-        return sendJson(res, machinePanel() ?? {});
+        return sendJson(res, panelOf('machine', there, machinePanel));
       case '/api/run-next':
-        runNext(Number(msg.pid));
+        if (there) await ask(there, { k: 'next', pid: Number(msg.pid) });
+        else runNext(Number(msg.pid));
         broadcast('machine', { at: Date.now() });
-        return sendJson(res, machinePanel() ?? {});
+        return sendJson(res, panelOf('machine', there, machinePanel));
       case '/api/storage/rescan':
         surveyNow().then(() => broadcast('storage', { at: Date.now() }), (err) => console.error('storage survey:', err.message));
         return sendJson(res, { started: true });
@@ -322,7 +328,14 @@ export async function serve({ port = 4785, open = false, refresh, fastRefresh, a
           .catch((err) => (ui ? ui.reportError(err.message) : console.error('sync failed:', err.message)));
       }, 1000);
     };
-    sync = startSync({ serial, onRows, localState, onControl: (link, msg) => control?.(link, msg), onLink: (link) => drive?.linked(link) });
+    sync = startSync({
+      serial, onRows, localState, onLink: (link) => drive?.linked(link),
+      // A priority set from another machine's dashboard is answered here; the rest is Slack's.
+      onControl: async (link, msg) => (await onBoxControl(link, msg, () => broadcast('machine', { at: Date.now() }))) || control?.(link, msg),
+      localPanel: () => ({ machine: machinePanel(), storage: storagePanel() }),
+      onPanel,
+    });
+    useLinks(() => sync?.links() ?? []);
     server.on('upgrade', (req, socket, head) => sync.accept(req, socket, head, advert.token));
   }
 

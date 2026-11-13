@@ -51,9 +51,14 @@ function machine(name, port, account) {
     pid: process.pid, sessionId: session, cwd: `/work/${name}`, name: `${name}-task`, status: 'busy',
     startedAt: start, updatedAt: Date.now(),
   }));
+  // A stand-in heavy that keeps the owner's ranks where the tracker reads them, and notes what it was asked.
+  const heavy = path.join(home, 'heavy');
+  fs.writeFileSync(heavy, `#!/bin/sh\necho "$@ by=$BOX_PRIORITY_BY" >> '${path.join(home, 'heavy.log')}'\n`
+    + `[ "$1" = --priority ] && printf '{"version":1,"projects":{"%s":"%s"},"updated":1,"by":"x"}' "$2" "$3" > "$BOX_PRIORITY_FILE"\nexit 0\n`, { mode: 0o755 });
   const env = { ...process.env, HOME: home, CLAUDE_TRACKER_DIR: data, CLAUDE_TRACKER_NOTIFY: '0', CLAUDE_TRACKER_SSH: process.env.CT_TEST_SSH || fakeSsh, NO_COLOR: '1',
-    // Each its own GPU lease and CPU pool, none of them the machine's real ones.
-    BOX_GPU_DIR: path.join(home, 'box-gpu'), BOX_HEAVY_DIR: path.join(home, 'box-heavy'), BOX_GPU_STATE: path.join(home, 'gpu-state') };
+    // Each its own GPU lease, CPU pool and priorities, none of them the machine's real ones.
+    BOX_GPU_DIR: path.join(home, 'box-gpu'), BOX_HEAVY_DIR: path.join(home, 'box-heavy'), BOX_GPU_STATE: path.join(home, 'gpu-state'),
+    BOX_HEAVY_BIN: heavy, BOX_PRIORITY_FILE: path.join(home, 'priority.json'), BOX_HEAVY_SLICE: '' };
   delete env.CLAUDE_CONFIG_DIR;
   delete env.CLAUDE_TRACKER_EXTRA_DIRS;
   const cli = (...args) => spawnSync(process.execPath, [CLI, ...args], { env, encoding: 'utf8', timeout: 60_000 });
@@ -75,6 +80,13 @@ function machine(name, port, account) {
       this.proc.stderr.on('data', (b) => { this.log += b; });
     },
     async get(p) { return (await fetch(`http://127.0.0.1:${port}${p}`)).json(); },
+    /** A write as the dashboard makes it. */
+    async post(p, body) {
+      const r = await fetch(`http://127.0.0.1:${port}${p}`, { method: 'POST', body: JSON.stringify(body),
+        headers: { 'content-type': 'application/json', origin: `http://127.0.0.1:${port}` } });
+      return { status: r.status, body: await r.json() };
+    },
+    heavyLog: () => { try { return fs.readFileSync(path.join(home, 'heavy.log'), 'utf8'); } catch { return ''; } },
     count(sql) {
       const d = new DatabaseSync(path.join(data, 'tracker.db'), { readOnly: true });
       try { return d.prepare(sql).get().n; } finally { d.close(); }
@@ -183,6 +195,41 @@ test('two trackers sync both ways over one connection, live, without echoes pili
   const status = laptop.cli('sync');
   assert.match(status.stdout, new RegExp(`${quoted(HOST)}\\s+connected`));
   assert.match(status.stdout, /devbox\s+online · 1 session running/);
+});
+
+test('each machine shows the other\'s cores, and sets the other\'s priorities through the other\'s heavy', { timeout: 60_000 }, async () => {
+  if (!fs.existsSync('/proc/self/stat')) return;   // the sampler here is Linux's or macOS's
+  // The laptop dialed the devbox; the devbox, which cannot dial back, still sees the laptop.
+  const list = await until('the laptop to have the devbox\'s panel', async () => {
+    const m = await laptop.get('/api/machine');
+    return m.machines?.find((x) => x.name === 'devbox' && x.hasMachine) ? m.machines : null;
+  });
+  assert.deepEqual(list.map((x) => [x.name, x.self]), [['laptop', true], ['devbox', false]]);
+  const devboxId = list[1].id;
+  await until('the devbox to have the laptop\'s panel', async () =>
+    (await devbox.get('/api/machine')).machines?.find((x) => x.name === 'laptop' && x.hasMachine));
+
+  const there = await laptop.get(`/api/machine?on=${devboxId}`);
+  assert.equal(there.remote.name, 'devbox');
+  assert.equal(there.remote.online, true);
+  assert.ok(there.cpu.cores >= 1, 'the devbox\'s own cores');
+  // Its own pool and priorities, not the laptop's (a session's process may sit in a job's cgroup when the tests run under heavy).
+  assert.equal(there.priority.file, devbox.env.BOX_PRIORITY_FILE);
+  assert.equal(there.gpu?.leases?.waiting, 1, 'the devbox\'s GPU queue');
+  assert.equal((await laptop.get('/api/machine')).gpu?.leases?.waiting ?? 0, 0, 'which is not the laptop\'s');
+
+  // A click on the laptop's dashboard reaches the devbox's heavy, and the answer carries the change.
+  const r = await laptop.post('/api/priority', { machine: devboxId, project: 'render', tier: 'high' });
+  assert.equal(r.status, 200, JSON.stringify(r.body));
+  assert.match(devbox.heavyLog(), /--priority render high by=claude-tracker on laptop/);
+  assert.equal(laptop.heavyLog(), '', 'the laptop\'s own heavy was not asked');
+  assert.equal(r.body.projects.find((p) => p.name === 'render')?.tier, 'high', 'the devbox\'s panel came back first');
+  const next = await laptop.post('/api/run-next', { machine: devboxId, pid: 4242 });
+  assert.equal(next.status, 200, JSON.stringify(next.body));
+  assert.match(devbox.heavyLog(), /--run-next 4242/);
+  const bad = await laptop.post('/api/priority', { machine: 'nope00000000', project: 'render', tier: 'low' });
+  assert.equal(bad.status, 400);
+  assert.match(bad.body.error, /not connected/);
 });
 
 test('a session resumed on the other machine moves only itself, and a copied profile lists nothing twice', { timeout: 120_000 }, async () => {

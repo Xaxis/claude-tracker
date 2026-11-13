@@ -431,7 +431,7 @@ body:not(.detail) #cache { display: none !important; }
 }
 .seg button:hover:not(:disabled) { color: var(--text-primary); }
 .seg button:focus-visible { outline: 2px solid var(--series-1); outline-offset: 1px; }
-.seg button[aria-checked="true"] { background: var(--surface-1); color: var(--text-primary); font-weight: 600; box-shadow: 0 0 0 1px var(--border); }
+.seg button[aria-checked="true"], .seg button[aria-pressed="true"] { background: var(--surface-1); color: var(--text-primary); font-weight: 600; box-shadow: 0 0 0 1px var(--border); }
 .seg button[data-tier="high"][aria-checked="true"] { background: var(--track-accent); box-shadow: none; }
 .seg button[data-tier="paused"][aria-checked="true"] { background: var(--track-warning); box-shadow: none; }
 .seg button:disabled { cursor: default; }
@@ -466,6 +466,10 @@ body:not(.detail) #cache { display: none !important; }
   .project-open { flex-basis: 100%; }
 }
 .storage-row[hidden], .project-body[hidden] { display: none; }
+/* A machine with nothing to show (not sampled, or not measured) keeps only its heading and picker. */
+#machine.is-empty > :not(.panel-head), #storage.is-empty > :not(.panel-head) { display: none; }
+.machine-pick[hidden] { display: none; }
+.machine-pick .is-offline { opacity: .6; }
 .more-btn { margin-top: 8px; }
 @media (max-width: 560px) {
   .project-sum { white-space: normal; }

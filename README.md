@@ -634,6 +634,19 @@ before every other as soon as a slot is free. `heavy` holds the rule
 and `heavy --priority` all go through it, and agents are kept from setting
 priorities by claude-core's command guard.
 
+On a Mac the sampler reads `ps`, `vm_stat`, `sysctl` and `ioreg` instead. With
+no cgroups there, a job is its `heavy` process and everything under it, and the
+GPU shows how busy it is and how much of the shared memory it holds.
+
+**Every synced machine.** Machines that sync (see *Syncing machines*) send each
+other these panels every few seconds, and the disk survey whenever it runs again.
+The panel's title has a switch with each machine's name: pick one to see its
+cores and disks from here. A priority or **Run next** set for another machine
+goes over the sync connection to the tracker running there, which sets it with
+that machine's `heavy`, so the Mac's dashboard ranks the Linux box's projects and
+the other way round. A machine that stops sending shows when it was last heard
+from, and its buttons wait until it is back.
+
 The dashboard's writes (priority, run next, rescan) only come from the dashboard
 itself: a loopback `Host`, the same `Origin`, and a JSON body, so no other page
 open in your browser can send one.
@@ -650,6 +663,12 @@ a week, idle temp folders. Under it are the commands that clean up safely:
 compile cache, npm's, uv's). The tracker deletes nothing itself. Each disk
 shows how much it grew in a day, and each owner too, so a runaway cache stands
 out. `claude-tracker storage --rescan` measures now.
+
+On a Mac the survey uses BSD `du` (or Homebrew's `gdu`) at background priority,
+covers both `/tmp` and the per-user temp folder, counts `~/Library`'s caches,
+logs and developer tools as caches, and never opens Desktop, Documents,
+Downloads, Pictures, Movies, Music or the rest of `~/Library`, since macOS would
+ask you in a dialog first.
 
 A temp folder counts as a project's when its name starts with the project's
 (`my-app-release-3`). Tools that use a short prefix instead (`ma-run-1`) can be

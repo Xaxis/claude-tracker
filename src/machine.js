@@ -18,7 +18,11 @@ import { boxState, poolConfig } from './box.js';
  * cgroup says whose), a running Claude session (by its environment, or by
  * descent from the session's own process), a process an ended session left
  * running, this tracker, and everything else (the desktop, your browser, the
- * system). Linux only; elsewhere there is no view.
+ * system).
+ *
+ * On macOS there is no /proc and no cgroup: ps gives every process's CPU time,
+ * memory and parent, vm_stat and sysctl the memory, ioreg the GPU, and a heavy
+ * job is its heavy's process and everything under it.
  */
 
 const PROC = () => process.env.CLAUDE_TRACKER_PROC || '/proc';
@@ -34,6 +38,20 @@ try { PAGE = Number(execFileSync('getconf', ['PAGESIZE'], { encoding: 'utf8', ti
 
 const read = (f) => { try { return fs.readFileSync(f, 'utf8'); } catch { return null; } };
 export const hasProc = () => fs.existsSync(`${PROC()}/self/stat`) && process.platform === 'linux';
+// The platform, which a test may set to read macOS tools' output on any machine.
+const MAC = () => (process.env.CLAUDE_TRACKER_PLATFORM || process.platform) === 'darwin';
+/** Whether this machine can be sampled: Linux with /proc, or macOS. */
+export const canSample = () => MAC() || hasProc();
+// Where macOS keeps ps, sysctl, ioreg and lsof, for a service started with a short PATH.
+export const SYSTEM_PATH = () => `${process.env.PATH ?? ''}:/usr/bin:/bin:/usr/sbin:/sbin`;
+// A macOS tool's output, in the C locale so dates read the same everywhere. What it printed even
+// when it then failed (ps -p fails when one of its pids has just exited); null when it printed nothing.
+const run = (cmd, args) => {
+  try {
+    return execFileSync(cmd, args, { encoding: 'utf8', timeout: 5000, stdio: ['ignore', 'pipe', 'ignore'],
+      maxBuffer: 64 * 2 ** 20, env: { ...process.env, LC_ALL: 'C', PATH: SYSTEM_PATH() } });
+  } catch (err) { return typeof err.stdout === 'string' && err.stdout ? err.stdout : null; }
+};
 
 /* --- the machine as a whole ----------------------------------------------- */
 
@@ -81,6 +99,84 @@ function gpuNow() {
   return null;
 }
 
+/* --- macOS --------------------------------------------------------------------- */
+
+/** Busy and total CPU time across every core, as Node reads it (milliseconds). */
+function osCpuTimes() {
+  let busy = 0, total = 0;
+  for (const c of os.cpus()) {
+    const t = c.times;
+    busy += t.user + t.nice + t.sys + t.irq;
+    total += t.user + t.nice + t.sys + t.irq + t.idle;
+  }
+  return total ? { busy, total } : null;
+}
+
+/** "1-02:03:04.56", "02:03.45": ps's CPU time, in seconds. */
+function psSeconds(t) {
+  const [d, rest] = t.includes('-') ? t.split('-') : ['0', t];
+  return rest.split(':').map(Number).reduce((a, n) => a * 60 + n, 0) + Number(d) * 86400;
+}
+
+/** Every process, from ps: the same fields /proc gives, CPU time in /proc's ticks. */
+function macProcs() {
+  const out = run('ps', ['-axww', '-o', 'pid=,ppid=,uid=,rss=,time=,lstart=,comm=']);
+  if (out == null) return null;
+  const procs = [];
+  for (const line of out.split('\n')) {
+    const m = /^\s*(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+([\d:.-]+)\s+(\w{3}\s+\w{3}\s+\d+\s+[\d:]+\s+\d{4})\s+(.*)$/.exec(line);
+    if (!m) continue;
+    procs.push({ pid: Number(m[1]), ppid: Number(m[2]), uid: Number(m[3]), rss: Number(m[4]) * 1024,
+      cpu: psSeconds(m[5]) * TICK, start: m[6], exe: m[7], comm: path.basename(m[7]).slice(0, 40), threads: 0 });
+  }
+  return procs;
+}
+
+/** The command lines of the pids asked for (one ps for all of them). */
+function macArgs(pids) {
+  const out = new Map();
+  if (!pids.length) return out;
+  const text = run('ps', ['-ww', '-o', 'pid=,args=', '-p', pids.join(',')]) ?? '';
+  for (const line of text.split('\n')) {
+    const m = /^\s*(\d+)\s+(.*)$/.exec(line);
+    if (m) out.set(Number(m[1]), m[2]);
+  }
+  return out;
+}
+
+/** What vm_stat and sysctl say of memory: what apps could still have, and swap. */
+function macMemory() {
+  const total = os.totalmem();
+  const vm = run('vm_stat', []) ?? '';
+  const page = Number(/page size of (\d+) bytes/.exec(vm)?.[1] ?? 4096);
+  const pages = (k) => Number(new RegExp(`^Pages ${k}:\\s+(\\d+)`, 'm').exec(vm)?.[1] ?? 0);
+  const free = (pages('free') + pages('inactive') + pages('speculative') + pages('purgeable')) * page;
+  const available = vm ? Math.min(total, free) : os.freemem();
+  const swap = run('sysctl', ['-n', 'vm.swapusage']) ?? '';
+  const size = (k) => {
+    const m = new RegExp(`${k} = ([\\d.]+)([KMG])`).exec(swap);
+    return m ? Number(m[1]) * { K: 2 ** 10, M: 2 ** 20, G: 2 ** 30 }[m[2]] : 0;
+  };
+  return { total, available, used: total - available, swapUsed: size('used'), swapTotal: size('total') };
+}
+
+/** The GPU's busy share and the memory it holds, from ioreg (Apple silicon shares memory: no total). */
+function macGpu() {
+  const out = run('ioreg', ['-r', '-d', '1', '-w', '0', '-c', 'IOAccelerator']);
+  const busy = /"Device Utilization %"=(\d+)/.exec(out ?? '');
+  if (!busy) return null;
+  const used = /"In use system memory"=(\d+)/.exec(out);
+  return { busy: Number(busy[1]), vramUsed: used ? Number(used[1]) : null, vramTotal: null };
+}
+
+/** Which bucket outside every project a macOS process belongs to, from its executable and owner. */
+function macOtherKind(exe, uid) {
+  if (/\/(?:Google Chrome|Chromium|Safari|Firefox|Arc|Brave Browser|Microsoft Edge|Orion)[^/]*\.app\/|com\.apple\.WebKit\./.test(exe)) return 'browser';
+  if (/(?:^|\/)(?:WindowServer|Dock|Finder|SystemUIServer|ControlCenter|loginwindow|NotificationCenter|Spotlight|coreaudiod)$|\/CoreServices\//.test(exe)) return 'desktop';
+  if (uid !== process.getuid?.() || /^\/(?:System|usr\/libexec|usr\/sbin|sbin)\//.test(exe)) return 'system';
+  return 'other';
+}
+
 /* --- processes ------------------------------------------------------------- */
 
 /** One process from /proc/<pid>/stat: its name, parent, CPU time and resident memory. */
@@ -99,10 +195,22 @@ function procStat(pid) {
 // What never changes for a process - its cgroup, environment and command line -
 // is read once, keyed by pid and start time, since pids are reused.
 const fixed = new Map();
-function fixedOf(p) {
+function fixedOf(p, args) {
   const key = `${p.pid}:${p.start}`;
   let f = fixed.get(key);
   if (f) return f;
+  if (MAC()) {
+    // No environment to read: whose it is comes from its ancestry, a session's own process, or heavy.
+    const argv = (args?.get(p.pid) ?? p.exe ?? '').split(' ').filter(Boolean);
+    // The installer's binary is named for its version (…/claude/versions/2.1.0): what it was run as says.
+    const claude = p.comm === 'claude' || path.basename(argv[0] ?? '') === 'claude' || /\/claude\/versions\/[^/]+$/.test(p.exe ?? '');
+    let cwd = null;
+    if (claude) cwd = /^n(.+)$/m.exec(run('lsof', ['-a', '-p', String(p.pid), '-d', 'cwd', '-Fn']) ?? '')?.[1] ?? null;
+    const tracker = argv.slice(1, 3).some((a) => /(?:^|\/)claude-tracker(?:\/bin\/cli\.js)?$/.test(a));
+    f = { cg: '', sessionId: null, pwd: null, cwd, claude, tracker, exe: p.exe, cmd: argv.join(' ').slice(0, 300), label: procLabel(p.comm, argv) };
+    fixed.set(key, f);
+    return f;
+  }
   const cg = (read(`${PROC()}/${p.pid}/cgroup`) ?? '').split('\n').find((l) => l.startsWith('0::'))?.slice(3) ?? '';
   let sessionId = null, pwd = null;
   const env = read(`${PROC()}/${p.pid}/environ`);
@@ -331,21 +439,32 @@ function otherKind(cg, uid) {
  * sessions: [{sessionId, parkedJobId, pid, cwd, name, status}].
  */
 export function sample(sessions = [], now = Date.now()) {
-  if (!hasProc()) return null;
-  const times = cpuTimes();
+  if (!canSample()) return null;
+  const mac = MAC();
+  const times = mac ? osCpuTimes() : cpuTimes();
   const dt = prev ? (now - prev.at) / 1000 : 0;
 
   // Every live process, once.
   const procs = new Map();
-  let names = [];
-  try { names = fs.readdirSync(PROC()); } catch { return null; }
-  for (const n of names) {
-    if (n.charCodeAt(0) < 48 || n.charCodeAt(0) > 57) continue;
-    const p = procStat(Number(n));
-    if (p) procs.set(p.pid, p);
+  let args = null;
+  if (mac) {
+    const list = macProcs();
+    if (!list) return null;
+    for (const p of list) procs.set(p.pid, p);
+    // Command lines only for processes not seen before: they never change.
+    args = macArgs(list.filter((p) => !fixed.has(`${p.pid}:${p.start}`)).map((p) => p.pid));
+  } else {
+    let names = [];
+    try { names = fs.readdirSync(PROC()); } catch { return null; }
+    for (const n of names) {
+      if (n.charCodeAt(0) < 48 || n.charCodeAt(0) > 57) continue;
+      const p = procStat(Number(n));
+      if (p) procs.set(p.pid, p);
+    }
   }
   const uids = new Map();
   const uidOf = (pid) => {
+    if (procs.get(pid)?.uid != null) return procs.get(pid).uid;
     if (!uids.has(pid)) { try { uids.set(pid, fs.statSync(`${PROC()}/${pid}`).uid); } catch { uids.set(pid, -1); } }
     return uids.get(pid);
   };
@@ -368,10 +487,12 @@ export function sample(sessions = [], now = Date.now()) {
     if (owner.has(pid)) return owner.get(pid);
     const p = procs.get(pid);
     if (!p) return null;
-    const f = fixedOf(p);
+    const f = fixedOf(p, args);
     let o = null;
     const job = /\/(heavy-[^/]*-(\d+)-(\d+)\.scope)(?:\/|$)/.exec(f.cg);
     if (job) o = { kind: 'job', scope: f.cg.slice(0, job.index + job[1].length + 1), unit: job[1], holder: Number(job[2]) };
+    // Without cgroups a job is its heavy's process and what runs under it.
+    else if (mac && holders.has(pid)) o = { kind: 'job', scope: `pid:${pid}`, unit: `heavy-${holders.get(pid).project}`, holder: pid };
     else if (pid === process.pid) o = { kind: 'tracker' };
     else if (byPid.has(pid)) o = { kind: 'session', s: byPid.get(pid) };
     else if (f.sessionId && bySid.has(f.sessionId)) o = { kind: 'session', s: bySid.get(f.sessionId) };
@@ -383,10 +504,10 @@ export function sample(sessions = [], now = Date.now()) {
     else if (depth < 64 && p.ppid > 1 && procs.has(p.ppid)) {
       // A child is its parent's only when the parent is someone's: systemd and the terminal are no one's.
       const up = ownerOf(p.ppid, depth + 1);
-      if (up && (up.kind === 'session' || up.kind === 'leftover' || up.kind === 'tracker')) o = up;
+      if (up && (up.kind === 'session' || up.kind === 'leftover' || up.kind === 'tracker' || (mac && up.kind === 'job'))) o = up;
     }
     if (!o && f.sessionId) o = { kind: 'leftover', sessionId: f.sessionId, project: projectOf(f.pwd) };
-    if (!o) o = { kind: otherKind(f.cg, uidOf(pid)) };
+    if (!o) o = { kind: mac ? macOtherKind(f.exe ?? '', uidOf(pid)) : otherKind(f.cg, uidOf(pid)) };
     owner.set(pid, o);
     return o;
   };
@@ -410,7 +531,7 @@ export function sample(sessions = [], now = Date.now()) {
     return b;
   };
   const addComm = (map, p, cores) => {
-    const label = fixedOf(p).label;
+    const label = fixedOf(p, args).label;
     const c = map.get(label) ?? { comm: label, cores: 0, mem: 0, n: 0 };
     c.cores += cores; c.mem += p.rss; c.n++;
     map.set(label, c);
@@ -460,10 +581,10 @@ export function sample(sessions = [], now = Date.now()) {
   const scopeUse = new Map();
   for (const j of scopes.values()) {
     const dir = path.join(CGROUP(), j.scope);
-    const usage = Number(/usage_usec (\d+)/.exec(read(path.join(dir, 'cpu.stat')) ?? '')?.[1] ?? NaN);
-    const stat = read(path.join(dir, 'memory.stat')) ?? '';
+    const usage = mac ? NaN : Number(/usage_usec (\d+)/.exec(read(path.join(dir, 'cpu.stat')) ?? '')?.[1] ?? NaN);
+    const stat = mac ? '' : read(path.join(dir, 'memory.stat')) ?? '';
     const field = (k) => Number(new RegExp(`^${k} (\\d+)`, 'm').exec(stat)?.[1] ?? 0);
-    const current = Number(read(path.join(dir, 'memory.current')) ?? NaN);
+    const current = mac ? NaN : Number(read(path.join(dir, 'memory.current')) ?? NaN);
     // What the job holds, not the page cache its reads left behind, which the kernel drops at need.
     const mem = Number.isFinite(current) ? Math.max(0, current - field('active_file') - field('inactive_file')) : null;
     scopeUse.set(j.scope, usage);
@@ -487,16 +608,17 @@ export function sample(sessions = [], now = Date.now()) {
 
   const busy = times && prev?.times && times.total > prev.times.total
     ? ((times.busy - prev.times.busy) / (times.total - prev.times.total)) * os.cpus().length : null;
-  const loadavg = (read(`${PROC()}/loadavg`) ?? '').split(' ');
+  const loadavg = mac ? os.loadavg().map(String) : (read(`${PROC()}/loadavg`) ?? '').split(' ');
   const s = {
     at: now, dt,
     cpu: {
       cores: os.cpus().length || 1, busy,
-      demand: Number(loadavg[3]?.split('/')[0]) || 0,
+      // macOS has no count of runnable threads: its 1-minute load is the nearest.
+      demand: mac ? Number(loadavg[0]) || 0 : Number(loadavg[3]?.split('/')[0]) || 0,
       load: [Number(loadavg[0]) || 0, Number(loadavg[1]) || 0, Number(loadavg[2]) || 0],
-      pressure: pressure(),
+      pressure: mac ? { cpu: null, memory: null, io: null } : pressure(),
     },
-    mem: memory(), gpu: gpuNow(), buckets, box,
+    mem: mac ? macMemory() : memory(), gpu: mac ? macGpu() : gpuNow(), buckets, box,
   };
   prev = { at: now, times, procs, scopeUse };
   for (const k of fixed.keys()) {
@@ -519,7 +641,7 @@ let timer = null;
 
 /** Sample every few seconds in the background, with the running sessions `sessions()` gives. */
 export function startSampler(sessions) {
-  if (timer || !hasProc()) return;
+  if (timer || !canSample()) return;
   const tick = () => { try { sample(sessions()); } catch (err) { console.error('machine sample:', err.message); } };
   tick();
   timer = setInterval(tick, STEP);
@@ -533,7 +655,7 @@ export function stopSampler() {
 
 /** Two samples a moment apart, for a one-off look (the CLI), when no sampler runs. */
 export async function sampleNow(sessions, gapMs = 1000) {
-  if (!hasProc()) return null;
+  if (!canSample()) return null;
   if (latest && Date.now() - latest.at < STEP * 2) return latest;
   sample(sessions());
   await new Promise((r) => setTimeout(r, gapMs));

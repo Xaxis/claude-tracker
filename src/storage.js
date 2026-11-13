@@ -3,7 +3,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawn, execFileSync } from 'node:child_process';
 import { DATA_DIR, HOME, discoverProfiles } from './paths.js';
-import { gitTop, encodedProject } from './machine.js';
+import { gitTop, encodedProject, SYSTEM_PATH } from './machine.js';
 
 /**
  * Who is filling the disks, and who leaves things behind.
@@ -25,6 +25,11 @@ import { gitTop, encodedProject } from './machine.js';
  *
  * Read only: it never deletes. Where a tool cleans up safely (tmp-sweep, wt
  * prune), it says which command does.
+ *
+ * On macOS du is BSD's (GNU's gdu where Homebrew put it), mounts come from
+ * `mount`, and the folders macOS asks the owner before opening (Desktop,
+ * Documents, Downloads, other apps' data) are left alone: a background survey
+ * must never pop up a dialog.
  */
 
 const FILE = () => path.join(DATA_DIR, 'storage.json');
@@ -37,19 +42,34 @@ const LEFT_WORKTREE_DAYS = 7;
 const LEFT_TEMP_DAYS = 3;
 const SMALL = 50 * 2 ** 20;        // below this a folder is not worth a line
 
+// The platform, which a test may set to survey as macOS would on any machine.
+const MAC = () => (process.env.CLAUDE_TRACKER_PLATFORM || process.platform) === 'darwin';
+const canSurvey = () => MAC() || process.platform === 'linux';
 const exists = (p) => { try { fs.accessSync(p); return true; } catch { return false; } };
 const real = (p) => { try { return fs.realpathSync(p); } catch { return p; } };
 const isDir = (p) => { try { return fs.statSync(p).isDirectory(); } catch { return false; } };
 
 /* --- du ---------------------------------------------------------------------- */
 
-let ionice = null;
-function lowPriority() {
-  if (ionice === null) {
-    ionice = false;
-    try { execFileSync('ionice', ['-c3', 'true'], { stdio: 'ignore', timeout: 3000 }); ionice = true; } catch { /* none */ }
-  }
-  return ionice ? ['ionice', '-c3', 'nice', '-n', '19'] : ['nice', '-n', '19'];
+// Tools are found on the system's own folders too: a macOS service starts with a short PATH.
+const toolEnv = () => ({ ...process.env, PATH: SYSTEM_PATH() });
+const works = (cmd, args) => { try { execFileSync(cmd, args, { stdio: 'ignore', timeout: 3000, env: toolEnv() }); return true; } catch { return false; } };
+const memo = (fn) => { let v; return () => (v ??= fn()); };
+// Idle disk priority: ionice on Linux, macOS's background policy (throttled disk and CPU) there.
+const lowPriority = memo(() => (MAC()
+  ? works('taskpolicy', ['-b', 'true']) ? ['taskpolicy', '-b', 'nice', '-n', '19'] : ['nice', '-n', '19']
+  : works('ionice', ['-c3', 'true']) ? ['ionice', '-c3', 'nice', '-n', '19'] : ['nice', '-n', '19']));
+// GNU du says how fresh each folder is; on macOS that is Homebrew's gdu, when it is there.
+const gnuDu = memo(() => (!MAC() ? 'du' : works('gdu', ['--version']) ? 'gdu' : null));
+
+/** The latest change to a folder or anything directly in it: BSD du's stand-in for GNU's --time. */
+function newestIn(dir) {
+  let newest = 0;
+  try { newest = fs.statSync(dir).mtimeMs; } catch { return null; }
+  let names = [];
+  try { names = fs.readdirSync(dir).slice(0, 500); } catch { return newest; }
+  for (const n of names) { try { newest = Math.max(newest, fs.lstatSync(path.join(dir, n)).mtimeMs); } catch { /* gone */ } }
+  return newest;
 }
 
 /**
@@ -64,20 +84,30 @@ function du(dirs, depth, timeoutMs = 30 * 60e3) {
   return new Promise((resolve) => {
     const out = [];
     let rest = '';
-    const child = spawn(cmd, [...pre, 'du', '-x', '--block-size=1', '--time', '--time-style=+%s', `--max-depth=${depth}`, '--', ...dirs],
-      { stdio: ['ignore', 'pipe', 'ignore'] });
+    const gnu = gnuDu();
+    const args = gnu
+      ? [gnu, '-x', '--block-size=1', '--time', '--time-style=+%s', `--max-depth=${depth}`, '--', ...dirs]
+      : ['du', '-x', '-k', '-d', String(depth), '--', ...dirs];
+    const child = spawn(cmd, [...pre, ...args], { stdio: ['ignore', 'pipe', 'ignore'], env: toolEnv() });
     const timer = setTimeout(() => child.kill('SIGTERM'), timeoutMs);
     child.stdout.setEncoding('utf8');
     child.stdout.on('data', (chunk) => {
       const lines = (rest + chunk).split('\n');
       rest = lines.pop();
       for (const l of lines) {
-        const m = /^(\d+)\t(\d+)\t(.*)$/.exec(l);
-        if (m) out.push({ path: m[3], bytes: Number(m[1]), newest: Number(m[2]) * 1000 });
+        const m = gnu ? /^(\d+)\t(\d+)\t(.*)$/.exec(l) : /^(\d+)\t(.*)$/.exec(l);
+        if (!m) continue;
+        if (gnu) out.push({ path: m[3], bytes: Number(m[1]), newest: Number(m[2]) * 1000 });
+        else out.push({ path: m[2], bytes: Number(m[1]) * 1024, newest: null });
       }
     });
-    child.on('error', () => { clearTimeout(timer); resolve(out); });
-    child.on('close', () => { clearTimeout(timer); resolve(out); });
+    const done = () => {
+      clearTimeout(timer);
+      if (!gnu) for (const e of out) e.newest = newestIn(e.path);
+      resolve(out);
+    };
+    child.on('error', done);
+    child.on('close', done);
   });
 }
 
@@ -172,7 +202,7 @@ export const surveying = () => !!running;
 
 /** Survey in the background: soon after start, then every few hours. */
 export function startSurveys(context) {
-  if (timer || process.platform !== 'linux') return;
+  if (timer || !canSurvey()) return;
   const go = () => survey(context).catch((err) => console.error('storage survey:', err.message));
   const last = readJson(FILE());
   const wait = last?.at ? Math.max(FIRST, last.at + EVERY - Date.now()) : FIRST;
@@ -210,10 +240,14 @@ const repoTop = gitTop;
 
 async function walk({ sessions = [], recentDirs = [] }, now) {
   const uid = process.getuid?.() ?? 0;
-  const tmp = real(os.tmpdir() === '/tmp' || !isDir('/tmp') ? os.tmpdir() : '/tmp');
+  const top = process.env.CLAUDE_TRACKER_TMP || '/tmp';
+  const shared = real(os.tmpdir() === top || !isDir(top) ? os.tmpdir() : top);
+  // macOS has two: /tmp, and each user's own (/var/folders/…/T) where Node keeps its caches.
+  const tmps = MAC() ? [...new Set([shared, real(os.tmpdir())])] : [shared];
+  const tmp = tmps.find((t) => isDir(path.join(t, `claude-${uid}`))) ?? shared;
   const scratch = path.join(tmp, `claude-${uid}`);
   const home = real(HOME);
-  const roots = projectRoots(sessions, recentDirs).filter((r) => !r.startsWith(tmp));
+  const roots = projectRoots(sessions, recentDirs).filter((r) => !tmps.some((t) => r.startsWith(t)));
   const profiles = discoverProfiles();
 
   // The repos in each projects folder, and every worktree under them.
@@ -238,7 +272,7 @@ async function walk({ sessions = [], recentDirs = [] }, now) {
 
   // du, one place at a time: the second look at a tree finds its inodes cached.
   const [tmpTop, scratchAll, homeTop, transcripts, rootsTop, worktrees] = [
-    await du([tmp], 1), await du([scratch], 2), await du([home], 2),
+    await du(tmps, 1), await du([scratch], 2), MAC() ? await macHome(home) : await du([home], 2),
     await du(profiles.map((p) => path.join(p.dir, 'projects')), 1),
     await du(roots, 2), await du(worktreeDirs, 1),
   ];
@@ -286,7 +320,8 @@ async function walk({ sessions = [], recentDirs = [] }, now) {
   // few MB each, 664 MB that no single line was big enough to show.
   const smalls = new Map();
   for (const e of tmpTop) {
-    if (depthOf(e.path, tmp) !== 1 || e.path === scratch) continue;
+    const dir = path.dirname(e.path);
+    if (!tmps.includes(dir) || e.path === scratch) continue;
     const base = path.basename(e.path);
     if (CACHES.test(base)) {
       if (e.bytes >= SMALL) add(cacheOwner(e.path), { kind: 'cache', path: e.path, bytes: e.bytes, newest: e.newest, idleDays: idleDays(e.newest) });
@@ -300,8 +335,8 @@ async function walk({ sessions = [], recentDirs = [] }, now) {
         { kind: 'temp', path: e.path, bytes: e.bytes, newest: e.newest, idleDays: idle, left });
       continue;
     }
-    const key = `${proj ?? ''}\0${left}`;
-    const g = smalls.get(key) ?? { proj, left, bytes: 0, count: 0, newest: 0, stems: new Map() };
+    const key = `${dir}\0${proj ?? ''}\0${left}`;
+    const g = smalls.get(key) ?? { dir, proj, left, bytes: 0, count: 0, newest: 0, stems: new Map() };
     g.bytes += e.bytes; g.count++; g.newest = Math.max(g.newest, e.newest ?? 0);
     const stem = `${/^[^-_.]+[-_.]?/.exec(base)?.[0] ?? base}*`;
     g.stems.set(stem, (g.stems.get(stem) ?? 0) + e.bytes);
@@ -312,7 +347,7 @@ async function walk({ sessions = [], recentDirs = [] }, now) {
     const stems = [...g.stems].sort((a, b) => b[1] - a[1]).map(([s]) => s);
     const named = `${stems.slice(0, 3).join(', ')}${stems.length > 3 ? ', …' : ''}`;
     add(g.proj ? owner('project', g.proj) : owner('temp', 'Unclaimed temp'),
-      { kind: 'temp', path: `${path.join(tmp, named)} (${g.count.toLocaleString('en-US')} folders)`, count: g.count,
+      { kind: 'temp', path: `${path.join(g.dir, named)} (${g.count.toLocaleString('en-US')} folders)`, count: g.count,
         bytes: g.bytes, newest: g.newest || null, idleDays: idleDays(g.newest || null), left: g.left });
   }
 
@@ -367,6 +402,10 @@ async function walk({ sessions = [], recentDirs = [] }, now) {
       if (e.bytes >= SMALL) add(owner('claude', 'Claude Code'), { kind: 'claude', path: e.path, bytes: e.bytes, newest: e.newest });
       continue;
     }
+    if (d === 2 && first === 'Library') {                                                 // macOS: caches, logs, Xcode's builds
+      if (e.bytes >= SMALL) add(owner('caches', 'Shared caches'), { kind: 'cache', path: e.path, bytes: e.bytes, newest: e.newest, idleDays: idleDays(e.newest) });
+      continue;
+    }
     if (d !== 1 || e.bytes < SMALL) continue;
     if (CACHES.test(first) || rel === '.local') {
       add(owner('caches', 'Shared caches'), { kind: 'cache', path: e.path, bytes: e.bytes, newest: e.newest, idleDays: idleDays(e.newest) });
@@ -392,7 +431,7 @@ async function walk({ sessions = [], recentDirs = [] }, now) {
     const m = mountOf(mounts, it.path);
     counted.set(m, (counted.get(m) ?? 0) + it.bytes);
   }
-  for (const p of [tmp, home, ...roots]) {
+  for (const p of [...tmps, home, ...roots]) {
     const m = mountOf(mounts, p);
     if (disks.has(m)) continue;
     try {
@@ -410,18 +449,46 @@ async function walk({ sessions = [], recentDirs = [] }, now) {
   return { at: now, version: 1, disks: [...disks.values()], owners: list, roots, tmp };
 }
 
+// Home on macOS, as du([home], 2) gives it elsewhere, without the folders macOS asks the
+// owner before a program may open (it would ask on the survey's behalf, in a dialog), and
+// with ~/Library's caches, logs and developer tools, which macOS does not guard.
+const MAC_ASKS = new Set(['Desktop', 'Documents', 'Downloads', 'Pictures', 'Movies', 'Music', 'Library', '.Trash']);
+const MAC_LIBRARY = ['Caches', 'Logs', 'Developer'];
+async function macHome(home) {
+  let names = [];
+  try { names = fs.readdirSync(home); } catch { return []; }
+  return [...await du(names.filter((n) => !MAC_ASKS.has(n)).map((n) => path.join(home, n)), 1),
+    ...await du(MAC_LIBRARY.map((n) => path.join(home, 'Library', n)), 0)];
+}
+
 /** Mount points, longest first. */
 function readMounts() {
   const out = [];
-  try {
-    for (const line of fs.readFileSync('/proc/self/mountinfo', 'utf8').split('\n')) {
-      const f = line.split(' ');
-      if (f[4]) out.push(f[4].replace(/\\040/g, ' '));
+  if (MAC()) {
+    // "/dev/disk3s5 on /System/Volumes/Data (apfs, local, journaled, nobrowse)"
+    let text = '';
+    try { text = execFileSync('mount', [], { encoding: 'utf8', timeout: 5000, stdio: ['ignore', 'pipe', 'ignore'], env: toolEnv() }); } catch { /* none */ }
+    for (const line of text.split('\n')) {
+      const m = / on (.+) \([^()]*\)$/.exec(line);
+      if (m) out.push(m[1]);
     }
-  } catch { out.push('/'); }
+    if (!out.length) out.push('/');
+  } else {
+    try {
+      for (const line of fs.readFileSync('/proc/self/mountinfo', 'utf8').split('\n')) {
+        const f = line.split(' ');
+        if (f[4]) out.push(f[4].replace(/\\040/g, ' '));
+      }
+    } catch { out.push('/'); }
+  }
   return out.sort((a, b) => b.length - a.length);
 }
-const mountOf = (mounts, p) => mounts.find((m) => m === '/' || p === m || p.startsWith(m + '/')) ?? '/';
+// macOS shows the owner's files under / but keeps them on the Data volume: all but the sealed system's own.
+const SYSTEM_ONLY = /^\/(?:System(?!\/Volumes\/Data(?:\/|$))|bin|sbin|usr(?!\/local(?:\/|$)))(?:\/|$)/;
+const mountOf = (mounts, p) => {
+  const m = mounts.find((x) => x === '/' || p === x || p.startsWith(x + '/')) ?? '/';
+  return m === '/' && MAC() && mounts.includes('/System/Volumes/Data') && !SYSTEM_ONLY.test(p) ? '/System/Volumes/Data' : m;
+};
 
 /* --- history ------------------------------------------------------------------------ */
 
@@ -453,7 +520,7 @@ const ITEMS = 8;
  */
 export function storageView(now = Date.now()) {
   const r = readJson(FILE());
-  if (!r) return process.platform === 'linux' ? { at: null, surveying: surveying() } : null;
+  if (!r) return canSurvey() ? { at: null, surveying: surveying() } : null;
   const h = readJson(HISTORY()) ?? [];
   const dayAgo = [...h].reverse().find((x) => x.at <= r.at - 20 * 3600e3) ?? null;
   const owners = r.owners.map((o) => ({
