@@ -379,6 +379,43 @@ test('an account\'s spend over a range counts every call in it, before the froze
   assert.deepEqual(accountSpend('acct', now - 3 * HOUR, now), { cost: 12, events: 2 });
 });
 
+test('the window read again on the next push is the one rebuilt from every call', async () => {
+  reset();
+  const { resetWindowCache } = await import('../src/windows.js');
+  const { accountAggregates, invalidateAggregates } = await import('../src/aggregates.js');
+  const t0 = Date.UTC(2026, 8, 3, 0, 0, 0);
+  db().prepare("INSERT INTO sessions (session_id, first_ts, account_uuid) VALUES ('w', ?, 'acct')").run(t0);
+  // Both windows read as the next push reads them, from what the last one kept; then rebuilt from nothing.
+  const step = (now) => {
+    const kept = { five: currentWindow('acct', 'five_hour', now), seven: currentWindow('acct', 'seven_day', now) };
+    resetWindowCache();
+    const rebuilt = { five: currentWindow('acct', 'five_hour', now), seven: currentWindow('acct', 'seven_day', now) };
+    assert.deepEqual(kept, rebuilt, `at +${(now - t0) / HOUR}h`);
+    return kept;
+  };
+  addEvent('w', t0 + HOUR + 7 * MIN, 1);
+  addEvent('w', t0 + 2 * HOUR, 2);
+  resetWindowCache();
+  invalidateAggregates();
+  accountAggregates(t0 + 4 * HOUR);              // part of each window frozen, part live
+  step(t0 + 3 * HOUR);
+
+  addEvent('w', t0 + 4 * HOUR, 4);              // inside the open window
+  const open = step(t0 + 4.5 * HOUR);
+  assert.equal(open.five.cost, 7);
+  assert.equal(open.five.start, t0 + HOUR);
+
+  addEvent('w', t0 + 7 * HOUR, 8);              // past its end: a new window opens
+  const next = step(t0 + 7.5 * HOUR);
+  assert.equal(next.five.start, t0 + 7 * HOUR);
+  assert.equal(next.five.cost, 8);
+  assert.equal(next.seven.cost, 15);
+
+  const lapsed = step(t0 + 13 * HOUR).five;     // no calls since: it lapsed
+  assert.equal(lapsed.active, false);
+  assert.equal(lapsed.lapsed, true);
+});
+
 test('attributing sessions again writes nothing until the answer moves, and then follows it', () => {
   reset();
   const t0 = Date.UTC(2026, 8, 2, 0, 0, 0);

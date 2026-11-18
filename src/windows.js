@@ -88,9 +88,11 @@ export function latestResetMs(accountUuid, type) {
      WHERE limit_type = ? AND account_uuid = ?`).get(type, accountUuid)?.r;
   // Status-line readings name it too - and once it passes, the next window
   // opens at the first call after it, not where reconstruction would put it.
+  // The newest first, by the index on reset times, stopping at the first dated inside its window.
   const read = db().prepare(`
-    SELECT MAX(resets_at) AS r FROM utilization
-     WHERE limit_type = ? AND account_uuid = ? AND ts >= resets_at - ?`).get(type, accountUuid, LIMIT_TYPES[type].span)?.r;
+    SELECT resets_at AS r FROM utilization
+     WHERE account_uuid = ? AND limit_type = ? AND resets_at IS NOT NULL AND ts >= resets_at - ?
+     ORDER BY resets_at DESC LIMIT 1`).get(accountUuid, type, LIMIT_TYPES[type].span)?.r;
   return Math.max(refused ? refused * 1000 : 0, read ?? 0) || null;
 }
 
@@ -144,7 +146,23 @@ export function currentWindow(accountUuid, type, now = Date.now()) {
   }
 
   const key = `${accountUuid}:${type}`;
-  const events = eventsFor(accountUuid, Math.max(anchor ?? 0, chainStart.get(key) ?? 0));
+  // While no call has fallen past the end of the window the chain last reached, that
+  // window is still the last one: its calls are those since it began. Re-reading a
+  // week of calls into a chain on every push, for every account, said the same.
+  const known = chainStart.get(key);
+  if (known != null && known >= (anchor ?? 0) && accountUuid != null && accountUuid !== '__all__') {
+    const r = db().prepare(`SELECT (SELECT MIN(ts) FROM events WHERE account_uuid = ?1 AND ts >= ?2) f,
+                                   (SELECT MAX(ts) FROM events WHERE account_uuid = ?1 AND ts >= ?2) l`).get(accountUuid, known);
+    const start = r.f == null ? null : floorTo(r.f, LIMIT_TYPES[type].grain);
+    if (start != null && r.l < start + span) {
+      // One window holds every call since: the chain below would build exactly this.
+      const { cost, events: n } = accountSpend(accountUuid, known, r.l);
+      chainStart.set(key, start);
+      if (now >= start + span) return { active: false, start, end: start + span, cost, events: n, lapsed: true };
+      return { active: true, start, end: start + span, cost, events: n, firstEvent: r.f, lastEvent: r.l };
+    }
+  }
+  const events = eventsFor(accountUuid, Math.max(anchor ?? 0, known ?? 0));
   const windows = buildWindows(events, type);
   const last = windows[windows.length - 1];
   if (!last) return { active: false, start: null, end: null, cost: 0, events: 0 };

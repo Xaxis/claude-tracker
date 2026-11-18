@@ -180,6 +180,7 @@ CREATE TABLE IF NOT EXISTS utilization (
   PRIMARY KEY (session_id, limit_type, ts)
 );
 CREATE INDEX IF NOT EXISTS idx_util_acct ON utilization(account_uuid, limit_type, ts);
+CREATE INDEX IF NOT EXISTS idx_util_reset ON utilization(account_uuid, limit_type, resets_at);
 
 -- Notifications already sent, so several tracker processes never repeat one.
 CREATE TABLE IF NOT EXISTS notifications (
