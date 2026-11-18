@@ -357,7 +357,7 @@ function syncMark(sync, now) {
   return parts.join(' ');
 }
 
-export function startTui({ webUrl, onQuit }) {
+export function startTui({ webUrl, onQuit, service = null }) {
   // The web dashboard's address, clickable where the terminal supports links.
   const url = /^https?:\/\/\S+/.exec(webUrl ?? '')?.[0] ?? null;
   const linkedUrl = url ? webUrl.replace(url, hyperlink(url, url)) : webUrl;
@@ -403,6 +403,29 @@ export function startTui({ webUrl, onQuit }) {
       windows: slow ? (focus ? windowHistory(focus.accountUuid, state.windowType, 24) : []) : data.windows,
       focus,
     };
+    if (slow) slowAt = Date.now();
+  }
+
+  /** The same, from the tracker serving `service`: worked out once there, for every dashboard. */
+  async function collectFrom(force = false) {
+    const get = async (p) => {
+      const r = await fetch(`${service}${p}`, { signal: AbortSignal.timeout(30_000) });
+      if (!r.ok) throw new Error(`${p}: ${(await r.json().catch(() => null))?.error ?? r.status}`);
+      return r.json();
+    };
+    const slow = force || Date.now() - slowAt > 10_000;
+    const [ov, live, bx, machine] = await Promise.all([get('/api/overview'), get('/api/live'), get('/api/box'),
+      state.detail ? get('/api/machine') : null]);
+    const accounts = ov.accounts;
+    const picked = state.accountIdx > 0 ? accounts[state.accountIdx - 1] : null;
+    const focus = picked ?? [...accounts].sort((a, b) => b.totalEvents - a.totalEvents)[0];
+    const q = (o) => new URLSearchParams(Object.entries(o).filter(([, v]) => v != null)).toString();
+    const [cache, models, windows] = await Promise.all([
+      state.detail && (slow || !data.cache) ? get('/api/cache') : data.cache,
+      slow ? get(`/api/models?${q({ days: 7, account: picked?.accountUuid })}`) : data.models,
+      slow ? (focus ? get(`/api/windows?${q({ account: focus.accountUuid, type: state.windowType, count: 24 })}`) : []) : data.windows,
+    ]);
+    data = { overview: ov, live, plan: plan(ov, live), boxes: bx, machine, cache, models, windows, focus };
     if (slow) slowAt = Date.now();
   }
 
@@ -722,7 +745,22 @@ export function startTui({ webUrl, onQuit }) {
     out.write(A.home + lines.join('\n') + A.reset);
   }
 
+  // From a service, one load at a time: pushes that come while one is under way
+  // are answered by one more load after it, with the latest of what they asked.
+  let loading = null, again = null;
   function refreshAndRender(force = false) {
+    if (service) {
+      if (loading) { again = (again ?? false) || force; return; }
+      loading = collectFrom(force)
+        .then(() => { state.error = null; state.lastRefresh = Date.now(); })
+        .catch((err) => { state.error = err.cause?.code ?? err.message; })
+        .finally(() => {
+          loading = null;
+          if (!done) render();
+          if (again !== null && !done) { const f = again; again = null; refreshAndRender(f); }
+        });
+      return;
+    }
     try {
       collect(force);
       state.error = null;

@@ -1,4 +1,5 @@
 import { db } from './db.js';
+import { accountSpend } from './aggregates.js';
 
 /**
  * Rate-limit window reconstruction.
@@ -95,9 +96,7 @@ export function latestResetMs(accountUuid, type) {
 
 /** Spend and call count strictly inside a time range - summed in SQL, not JS. */
 export function sumBetween(accountUuid, start, end) {
-  const r = db().prepare(`SELECT COUNT(*) n, COALESCE(SUM(cost_usd), 0) c FROM events
-    WHERE account_uuid = ? AND ts >= ? AND ts <= ?`).get(accountUuid, start, end);
-  return { cost: r.c, events: r.n };
+  return accountSpend(accountUuid, start, end);
 }
 
 /*

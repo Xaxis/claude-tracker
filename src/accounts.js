@@ -199,6 +199,39 @@ function blockedIntervals() {
 }
 
 /**
+ * Every observation, in time order, as profile timeline points (those that name a
+ * profile) and as global anchors (all of them). Read again only when the table
+ * changed, which the resolver's count says (db.js): reading and sorting a
+ * quarter-million rows, twice, on every sync batch was most of what attributing
+ * sessions cost.
+ */
+let obsCache = { d: null, rev: null, points: null, anchors: null };
+function observationsByTime(d) {
+  const rev = d.prepare("SELECT n FROM revs WHERE name = 'resolver'").get()?.n ?? 0;
+  if (obsCache.d === d && obsCache.rev === rev) return obsCache;
+  const rows = d.prepare('SELECT ts, config_dir, account_uuid FROM account_observations').all();
+  const points = [], anchors = [];
+  for (const r of rows) {
+    if (r.config_dir) points.push({ dir: r.config_dir, ts: r.ts, account: r.account_uuid });
+    anchors.push({ ts: r.ts, account: r.account_uuid });
+  }
+  obsCache = { d, rev, points: points.sort((a, b) => a.ts - b.ts), anchors: anchors.sort((a, b) => a.ts - b.ts) };
+  return obsCache;
+}
+
+/** Two time-ordered lists as one; at the same moment `a`'s come first when `aFirst`, else `b`'s. */
+function mergeByTime(a, b, aFirst) {
+  const out = new Array(a.length + b.length);
+  let i = 0, j = 0, k = 0;
+  while (i < a.length && j < b.length) {
+    out[k++] = (aFirst ? a[i].ts <= b[j].ts : a[i].ts < b[j].ts) ? a[i++] : b[j++];
+  }
+  while (i < a.length) out[k++] = a[i++];
+  while (j < b.length) out[k++] = b[j++];
+  return out;
+}
+
+/**
  * Assign an account to every session that lacks one.
  *
  * Anchors are moments we know the active account: bridge-attributed sessions and
@@ -222,21 +255,20 @@ export function attributeSessions() {
    * owner (a bridge record, or a recorded signed-in email) are dated evidence
    * about the same profile, and they reach back as far as the transcripts do.
    */
-  const points = [];
-  for (const r of d.prepare(
-      'SELECT ts, config_dir, account_uuid FROM account_observations').all()) {
-    if (r.config_dir) points.push({ dir: r.config_dir, ts: r.ts, account: r.account_uuid });
-  }
+  const obs = observationsByTime(d);
+  const sessionPoints = [];
   for (const r of d.prepare(`
       SELECT first_ts, last_ts, config_dir, account_uuid FROM sessions
        WHERE config_dir IS NOT NULL AND account_uuid IS NOT NULL
          AND account_source IN ('bridge', 'email') AND first_ts IS NOT NULL`).all()) {
-    points.push({ dir: r.config_dir, ts: r.first_ts, account: r.account_uuid });
-    if (r.last_ts) points.push({ dir: r.config_dir, ts: r.last_ts, account: r.account_uuid });
+    sessionPoints.push({ dir: r.config_dir, ts: r.first_ts, account: r.account_uuid });
+    if (r.last_ts) sessionPoints.push({ dir: r.config_dir, ts: r.last_ts, account: r.account_uuid });
   }
+  // Observations first among points made at the same moment, as they were read first.
+  const points = mergeByTime(obs.points, sessionPoints.sort((a, b) => a.ts - b.ts), true);
 
   const timelines = new Map();
-  for (const p of points.sort((a, b) => a.ts - b.ts)) {
+  for (const p of points) {
     if (!timelines.has(p.dir)) timelines.set(p.dir, []);
     const tl = timelines.get(p.dir);
     // Collapse runs: only the moments the account actually changed matter.
@@ -276,18 +308,16 @@ export function attributeSessions() {
       .all().map((r) => [r.e, r.a]));
 
   // Global anchors, for sessions whose profile has no timeline at all.
-  const anchors = [];
+  const bridged = [];
   for (const r of d.prepare(`
       SELECT first_ts, last_ts, account_uuid FROM sessions
       WHERE account_uuid IS NOT NULL AND account_source = 'bridge'
         AND first_ts IS NOT NULL`).all()) {
-    anchors.push({ ts: r.first_ts, account: r.account_uuid });
-    if (r.last_ts) anchors.push({ ts: r.last_ts, account: r.account_uuid });
+    bridged.push({ ts: r.first_ts, account: r.account_uuid });
+    if (r.last_ts) bridged.push({ ts: r.last_ts, account: r.account_uuid });
   }
-  for (const r of d.prepare('SELECT ts, account_uuid FROM account_observations').all()) {
-    anchors.push({ ts: r.ts, account: r.account_uuid });
-  }
-  anchors.sort((a, b) => a.ts - b.ts);
+  // Here the sessions were read first, so they come first at the same moment.
+  const anchors = mergeByTime(obs.anchors, bridged.sort((a, b) => a.ts - b.ts), false);
 
   const times = anchors.map((a) => a.ts);
   const bisect = (t) => {
@@ -297,11 +327,14 @@ export function attributeSessions() {
   };
 
   const pending = d.prepare(`
-    SELECT session_id, first_ts, config_dir, user_email FROM sessions
+    SELECT session_id, first_ts, config_dir, user_email, account_uuid cur, account_source cur_source FROM sessions
     WHERE (account_uuid IS NULL OR account_source IN ('inferred', 'profile', 'email'))
       AND first_ts IS NOT NULL`).all();
 
-  const upd = d.prepare('UPDATE sessions SET account_uuid = ?, account_source = ? WHERE session_id = ?');
+  const write = d.prepare('UPDATE sessions SET account_uuid = ?, account_source = ? WHERE session_id = ?');
+  // Every session is decided again each time, but written only when the answer moved:
+  // thousands of rows rewritten as they were, on every sync batch, grew the log by the gigabyte.
+  const set = (s, a, source) => { if (s.cur !== a || s.cur_source !== source) write.run(a, source, s.session_id); };
   const counts = { email: 0, profile: 0, inferred: 0, ambiguous: 0 };
 
   tx(() => {
@@ -309,7 +342,7 @@ export function attributeSessions() {
       // The session recorded the address it was signed in as - unambiguous.
       const fromEmail = s.user_email ? byEmail.get(s.user_email.toLowerCase()) : null;
       if (fromEmail) {
-        upd.run(fromEmail, 'email', s.session_id);
+        set(s, fromEmail, 'email');
         counts.email++;
         continue;
       }
@@ -317,7 +350,7 @@ export function attributeSessions() {
       // Otherwise the profile the session was recorded under names its account.
       const fromProfile = s.config_dir ? accountAt(s.config_dir, s.first_ts) : null;
       if (fromProfile) {
-        upd.run(fromProfile, 'profile', s.session_id);
+        set(s, fromProfile, 'profile');
         counts.profile++;
         continue;
       }
@@ -347,8 +380,8 @@ export function attributeSessions() {
         }
       }
 
-      if (account) { upd.run(account, 'inferred', s.session_id); counts.inferred++; }
-      else { upd.run(null, null, s.session_id); counts.ambiguous++; }
+      if (account) { set(s, account, 'inferred'); counts.inferred++; }
+      else { set(s, null, null); counts.ambiguous++; }
     }
   });
 

@@ -25,6 +25,33 @@ export function aggregatesCutoff() { return base ? base.cutoff : -Infinity; }
 const GROUP = 'SELECT account_uuid a, session_id s, COUNT(*) n, SUM(cost_usd) c FROM events';
 const keyOf = (r) => `${r.a}|${r.s}`;
 
+/**
+ * An account's calls and spend from `start` to `end`, both included: what lies
+ * before the frozen cutoff summed once and kept, what follows summed each time.
+ * A billing period or a week-long window re-summed on every push, for every
+ * account, was most of what the overview cost.
+ */
+const RANGE = 'SELECT COUNT(*) n, COALESCE(SUM(cost_usd), 0) c FROM events WHERE account_uuid = ? AND ts >= ?';
+const frozen = new Map();
+let frozenOf = null;
+export function accountSpend(accountUuid, start, end) {
+  const d = db();
+  if (!base || start >= base.cutoff || end < base.cutoff) {
+    const r = d.prepare(`${RANGE} AND ts <= ?`).get(accountUuid, start, end);
+    return { cost: r.c, events: r.n };
+  }
+  if (frozenOf !== base) { frozen.clear(); frozenOf = base; }
+  const key = `${accountUuid}|${start}`;
+  let f = frozen.get(key);
+  if (!f) {
+    f = d.prepare(`${RANGE} AND ts < ?`).get(accountUuid, start, base.cutoff);
+    if (frozen.size > 5000) frozen.clear();
+    frozen.set(key, f);
+  }
+  const live = d.prepare(`${RANGE} AND ts <= ?`).get(accountUuid, base.cutoff, end);
+  return { cost: f.c + live.c, events: f.n + live.n };
+}
+
 export function accountAggregates(now = Date.now()) {
   if (!base || now - base.cutoff > MAX_BASE_AGE_MS) {
     const cutoff = now - LIVE_WINDOW_MS;
@@ -35,7 +62,9 @@ export function accountAggregates(now = Date.now()) {
     base = { cutoff, rows };
   }
   const merged = new Map(base.rows);
-  for (const r of db().prepare(`${GROUP} WHERE ts >= ? GROUP BY account_uuid, session_id`).all(base.cutoff)) {
+  // Grouped by +column so SQLite finds the last minutes by time. Plain, it read the whole
+  // (account, session) index - every call ever, a fifth of a second - to group a few hundred.
+  for (const r of db().prepare(`${GROUP} WHERE ts >= ? GROUP BY +account_uuid, +session_id`).all(base.cutoff)) {
     const prev = merged.get(keyOf(r));
     merged.set(keyOf(r), prev ? { a: r.a, s: r.s, n: prev.n + r.n, c: prev.c + r.c } : r);
   }

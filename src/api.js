@@ -165,7 +165,6 @@ function activeRejections(now) {
 }
 
 export function overview(now = Date.now()) {
-  const d = db();
   const agg = accountAggregates(now);
   const accounts = listAccounts(agg);
   const cur = currentAccount();
@@ -227,7 +226,7 @@ export function overview(now = Date.now()) {
       totalEvents: totals.events,
       limits,
       available,
-      billing: period ? { ...period, spend: periodSpend(d, a.account_uuid, period) } : null,
+      billing: period ? { ...period, spend: periodSpend(a.account_uuid, period) } : null,
       plan: planPrice(a),
     };
   });

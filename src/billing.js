@@ -1,3 +1,5 @@
+import { accountSpend } from './aggregates.js';
+
 /**
  * Subscription renewal dates.
  *
@@ -73,11 +75,7 @@ export function billingPeriod(startedAt, cycle = 'month', now = Date.now()) {
 }
 
 /** Spend inside the current billing period, in quota units. */
-export function periodSpend(db, accountUuid, period) {
+export function periodSpend(accountUuid, period) {
   if (!period) return { cost: 0, events: 0 };
-  const row = db.prepare(`
-    SELECT COUNT(*) AS events, COALESCE(SUM(cost_usd), 0) AS cost
-      FROM events WHERE account_uuid = ? AND ts >= ? AND ts <= ?`)
-    .get(accountUuid, period.start, period.end);
-  return { cost: row.cost, events: row.events };
+  return accountSpend(accountUuid, period.start, period.end);
 }

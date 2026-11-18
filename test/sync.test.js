@@ -285,3 +285,37 @@ test('a machine with no tracker running says so, in its own words', { timeout: 6
   assert.equal(r.status, 1);
   assert.match(r.stderr, new RegExp(`could not sync with ${quoted(IDLE_HOST)}: claude-tracker is not running on`));
 });
+
+test('a terminal dashboard beside a running tracker shows what that one works out, and finds it again after a restart', {
+  skip: spawnSync('tmux', ['-V']).status !== 0 && 'needs tmux', timeout: 120_000 }, async () => {
+  const svc = machine('served', 47914, { uuid: 'dddddddd-0000-0000-0000-000000000004', email: 'served@example.com' });
+  svc.start();
+  await until('the service to have its account', async () => (await svc.get('/api/overview')).accounts?.some((a) => a.email === 'served@example.com'));
+
+  // Its own home and index are empty: what it shows can only have come from the service.
+  const own = path.join(root, 'follower');
+  fs.mkdirSync(path.join(own, '.claude'), { recursive: true });
+  const sock = path.join(root, 'tmux.sock');
+  const tmux = (...args) => spawnSync('tmux', ['-S', sock, ...args], { encoding: 'utf8' });
+  const env = `env -u TMUX -u CLAUDE_CONFIG_DIR -u CLAUDE_TRACKER_EXTRA_DIRS HOME='${own}' CLAUDE_TRACKER_DIR='${path.join(own, 'data')}' CLAUDE_TRACKER_NOTIFY=0 NO_COLOR=1`;
+  tmux('new-session', '-d', '-s', 'tui', '-x', '160', '-y', '50', `${env} '${process.execPath}' '${CLI}' --port ${svc.port}`);
+  const screen = () => tmux('capture-pane', '-p', '-t', 'tui').stdout;
+  try {
+    await until('the service\'s account and session on screen', () => {
+      const s = screen();
+      return s.includes('(service)') && s.includes('served@example.com') && s.includes('served-task') && s;
+    });
+    assert.ok(!fs.existsSync(path.join(own, 'data', 'tracker.db'))
+      || new DatabaseSync(path.join(own, 'data', 'tracker.db'), { readOnly: true }).prepare('SELECT COUNT(*) n FROM events').get().n === 0,
+    'it read no transcripts of its own');
+
+    // The service restarts: the dashboard says it is waiting, then follows the new one.
+    await new Promise((r) => { svc.proc.once('exit', r); svc.proc.kill(); });
+    await until('it to say the service went away', () => /waiting for it/.test(screen()));
+    svc.start();
+    await until('it to follow the service again', () => !/waiting for it/.test(screen()) && screen().includes('served-task'), 60_000);
+  } finally {
+    tmux('kill-server');
+    if (svc.proc.exitCode === null) await new Promise((r) => { svc.proc.once('exit', r); svc.proc.kill(); });
+  }
+});

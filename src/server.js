@@ -14,7 +14,7 @@ import { notify } from './notify.js';
 import { PROTOCOL, advertise, startSync } from './sync.js';
 import { plan, runFailover } from './failover.js';
 import { send, onSend } from './notify.js';
-import { setMeta } from './db.js';
+import { setMeta, dbVersion } from './db.js';
 import { accountsCsv, exportFileName } from './export.js';
 import { startPanes } from './panes.js';
 import { startBridge, bridgeStatus, readConfig as slackConfig } from './bridge.js';
@@ -43,6 +43,27 @@ function sendJson(res, body, status = 200) {
     'content-length': Buffer.byteLength(s),
   });
   res.end(s);
+}
+
+/**
+ * A read every dashboard makes after each push - the web page in each tab, a
+ * terminal dashboard following this one - worked out once: the same answer goes
+ * to whoever asks within a second while the database has not changed.
+ */
+const shared = new Map();
+function sendShared(res, key, fn) {
+  const version = dbVersion();
+  let hit = shared.get(key);
+  if (!hit || hit.version !== version || Date.now() - hit.at > 1000) {
+    hit = { version, at: Date.now(), body: JSON.stringify(fn()) };
+    shared.set(key, hit);
+  }
+  res.writeHead(200, {
+    'content-type': 'application/json; charset=utf-8',
+    'cache-control': 'no-store',
+    'content-length': Buffer.byteLength(hit.body),
+  });
+  res.end(hit.body);
 }
 
 /** Push an event to every connected dashboard. */
@@ -78,12 +99,12 @@ function handleApi(req, res, url) {
 
   switch (url.pathname) {
     case '/api/health': return sendJson(res, { app: 'claude-tracker', pid: process.pid, sync: PROTOCOL, slack: 1 });
-    case '/api/overview': return sendJson(res, overview());
+    case '/api/overview': return sendShared(res, 'overview', () => overview());
     case '/api/history': return sendJson(res, history(days, account));
     case '/api/sessions': return sendJson(res, sessions(Math.min(200, Number(q.get('limit') ?? 40)), account));
     case '/api/models': return sendJson(res, modelBreakdown(days, account));
-    case '/api/live': return sendJson(res, liveSessions());
-    case '/api/box': return sendJson(res, boxes());
+    case '/api/live': return sendShared(res, 'live', () => liveSessions());
+    case '/api/box': return sendShared(res, 'box', () => boxes());
     // This machine's, or with ?on=<machine id> a synced machine's as it last sent it.
     case '/api/machine': return sendJson(res, panelOf('machine', q.get('on'), machinePanel));
     case '/api/storage': return sendJson(res, panelOf('storage', q.get('on'), storagePanel));
@@ -188,9 +209,9 @@ function handleEvents(req, res) {
  * scanned once no matter how many views are open.
  */
 /** Is another claude-tracker already serving on this port? */
-async function probe(port) {
+async function probe(port, timeout = 800) {
   try {
-    const r = await fetch(`http://127.0.0.1:${port}/api/health`, { signal: AbortSignal.timeout(800) });
+    const r = await fetch(`http://127.0.0.1:${port}/api/health`, { signal: AbortSignal.timeout(timeout) });
     return (await r.json())?.app === 'claude-tracker' ? 'tracker' : 'other';
   } catch (err) {
     return err?.cause?.code === 'ECONNREFUSED' || err?.name === 'TypeError' ? 'free' : 'other';
@@ -206,6 +227,12 @@ export async function serve({ port = 4785, open = false, refresh, fastRefresh, a
 
   // Pin which code this is now, before anything can be pulled over it.
   build();
+
+  // A terminal dashboard beside a tracker that already serves the port - usually
+  // the login service - shows what that one works out. Reading every transcript,
+  // attributing every call and sampling every process a second time, on the same
+  // database, took most of a core of its own.
+  if (tui && await probe(port, 3000) === 'tracker') return follow(`http://127.0.0.1:${port}`);
 
   // Bring the database current before accepting requests.
   await serial(() => refresh({ quiet: true, reattribute: 'all' }));
@@ -434,6 +461,52 @@ export async function serve({ port = 4785, open = false, refresh, fastRefresh, a
     ui = startTui({ webUrl: addr ? `${addr}${attached ? ' (service)' : ''}` : 'web dashboard off', onQuit: shutdown });
   } else if (web) {
     console.log(`\n  claude-tracker  →  ${addr}\n  watching for new usage… (ctrl-c to stop)\n`);
+  }
+}
+
+/**
+ * The terminal dashboard for the tracker serving `addr`: what it shows comes from
+ * that tracker's API, and it draws again whenever that tracker says something
+ * changed, as the web dashboard does. Keys that change things - failover, the
+ * account a profile is on - work as they always have.
+ */
+async function follow(addr) {
+  const { startTui } = await import('./tui.js');
+  let closing = false;
+  let stream = null;
+  const shutdown = () => {
+    if (closing) return;
+    closing = true;
+    stream?.abort();
+    ui.stop();
+    process.exit(0);
+  };
+  const ui = startTui({ webUrl: `${addr} (service)`, onQuit: shutdown, service: addr });
+  process.on('SIGINT', shutdown);
+  process.on('SIGTERM', shutdown);
+
+  // Its pushes, for as long as this runs: a restarted service is picked up again.
+  for (let first = true; !closing; first = false) {
+    stream = new AbortController();
+    try {
+      const res = await fetch(`${addr}/events`, { signal: stream.signal });
+      if (!res.ok || !res.body) throw new Error(`events: ${res.status}`);
+      if (!first) ui.update();    // whatever changed while it was away
+      const text = new TextDecoder();
+      let buf = '';
+      for await (const chunk of res.body) {
+        buf += text.decode(chunk, { stream: true });
+        for (let i = buf.indexOf('\n\n'); i >= 0; i = buf.indexOf('\n\n')) {
+          const msg = buf.slice(0, i);
+          buf = buf.slice(i + 2);
+          if (/^event: (?:update|machine)$/m.test(msg)) ui.update();
+        }
+      }
+      if (!closing) ui.reportError(`the tracker on ${addr} went away; waiting for it`);
+    } catch (err) {
+      if (!closing) ui.reportError(`the tracker on ${addr}: ${err.cause?.code ?? err.message}; waiting for it`);
+    }
+    if (!closing) await new Promise((r) => setTimeout(r, 2000));
   }
 }
 

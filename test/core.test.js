@@ -356,6 +356,55 @@ test('a session is attributed to whoever was signed into its profile', () => {
   assert.equal(p.account_uuid, 'personal', 'concurrent profiles do not bleed into each other');
 });
 
+test('an account\'s spend over a range counts every call in it, before the frozen line and after', async () => {
+  reset();
+  const { accountAggregates, accountSpend, invalidateAggregates } = await import('../src/aggregates.js');
+  const now = Date.now();
+  db().prepare("INSERT INTO sessions (session_id, first_ts, account_uuid) VALUES ('s', ?, 'acct')").run(now - 5 * HOUR);
+  addEvent('s', now - 4 * HOUR, 1);
+  addEvent('s', now - 2 * HOUR, 2);
+  addEvent('s', now - MIN, 4);
+  invalidateAggregates();
+  accountAggregates(now);                       // the line is drawn: calls before it are kept
+  assert.deepEqual(accountSpend('acct', now - 3 * HOUR, now), { cost: 6, events: 2 });
+  assert.deepEqual(accountSpend('acct', now - 5 * HOUR, now), { cost: 7, events: 3 });
+
+  addEvent('s', now - 30_000, 8);               // a new call, after the line
+  assert.deepEqual(accountSpend('acct', now - 3 * HOUR, now), { cost: 14, events: 3 });
+  assert.deepEqual(accountSpend('acct', now - 5 * HOUR, now - HOUR), { cost: 3, events: 2 }, 'a range that ends before the line');
+
+  // An old call corrected, as a late /login record re-attributes it: the kept sums go with the line.
+  db().prepare("UPDATE events SET account_uuid = 'other' WHERE cost_usd = 2").run();
+  invalidateAggregates();
+  assert.deepEqual(accountSpend('acct', now - 3 * HOUR, now), { cost: 12, events: 2 });
+});
+
+test('attributing sessions again writes nothing until the answer moves, and then follows it', () => {
+  reset();
+  const t0 = Date.UTC(2026, 8, 2, 0, 0, 0);
+  addAccount('first');
+  addAccount('second');
+  const dir = '/home/me/.claude';
+  const observe = (ts, account) => db().prepare(`INSERT INTO account_observations (ts, config_dir, account_uuid, source)
+    VALUES (?,?,?,'backup')`).run(ts, dir, account);
+  observe(t0, 'first');
+  db().prepare('INSERT INTO sessions (session_id, first_ts, last_ts, config_dir) VALUES (?,?,?,?)').run('late', t0 + 5 * HOUR, t0 + 5 * HOUR, dir);
+  const acct = () => db().prepare("SELECT account_uuid a FROM sessions WHERE session_id = 'late'").get().a;
+  const writes = () => db().prepare('SELECT total_changes() n').get().n;
+
+  attributeSessions();
+  assert.equal(acct(), 'first');
+  const before = writes();
+  attributeSessions();
+  attributeSessions();
+  assert.equal(writes(), before, 'the same answers are not written again');
+
+  // The profile was seen on another account before the session began: the answer moves.
+  observe(t0 + 4 * HOUR, 'second');
+  attributeSessions();
+  assert.equal(acct(), 'second', 'a new observation is read, not the ones kept from before');
+});
+
 test('a profile that changed accounts attributes by date, not by latest', () => {
   reset();
   const t0 = Date.UTC(2026, 8, 1, 0, 0, 0);
