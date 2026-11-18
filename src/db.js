@@ -495,15 +495,6 @@ export function tx(fn) {
   }
 }
 
-/**
- * Changes to the database since it was opened: commits by this connection, and
- * by every other process's. Equal twice, nothing anyone reads from it has moved.
- */
-export function dbVersion() {
-  const d = db();
-  return `${d.prepare('PRAGMA data_version').get().data_version}:${d.prepare('SELECT total_changes() n').get().n}`;
-}
-
 export function closeDb() {
   if (_db) { _db.close(); _db = null; }
 }

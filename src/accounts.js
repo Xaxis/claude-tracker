@@ -24,8 +24,20 @@ import { accountAggregates } from './aggregates.js';
  * so the dashboard can show honestly how much is unaccounted for.
  */
 
+// A config file, parsed again only when its text changed: Claude Code's runs to hundreds of
+// kilobytes, and was parsed for every session list, several times a second. Reading it is
+// cheap; parsing it was not. Every caller only reads what it is given.
+const parsed = new Map();
 function readJson(file) {
-  try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return null; }
+  let text;
+  try { text = fs.readFileSync(file, 'utf8'); } catch { parsed.delete(file); return null; }
+  const hit = parsed.get(file);
+  if (hit?.text === text) return hit.value;
+  let value = null;
+  try { value = JSON.parse(text); } catch { /* half-written, or not JSON */ }
+  if (parsed.size > 200) parsed.clear();
+  parsed.set(file, { text, value });
+  return value;
 }
 
 function accountFromConfig(cfg, configDir = null) {

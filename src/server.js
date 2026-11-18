@@ -14,7 +14,7 @@ import { notify } from './notify.js';
 import { PROTOCOL, advertise, startSync } from './sync.js';
 import { plan, runFailover } from './failover.js';
 import { send, onSend } from './notify.js';
-import { setMeta, dbVersion } from './db.js';
+import { setMeta } from './db.js';
 import { accountsCsv, exportFileName } from './export.js';
 import { startPanes } from './panes.js';
 import { startBridge, bridgeStatus, readConfig as slackConfig } from './bridge.js';
@@ -47,27 +47,35 @@ function sendJson(res, body, status = 200) {
 
 /**
  * A read every dashboard makes after each push - the web page in each tab, a
- * terminal dashboard following this one - worked out once: the same answer goes
- * to whoever asks within a second while the database has not changed.
+ * terminal dashboard following this one - worked out once per push: the same
+ * answer goes to everyone who asks until the next push, or for two seconds.
+ * Dashboards read only when told something changed, and the database itself
+ * changes many times a second (every session's status line writes to it), so
+ * keying on its writes shared nothing.
  */
 const shared = new Map();
-function sendShared(res, key, fn) {
-  const version = dbVersion();
+let pushes = 0;
+function sharedValue(key, fn) {
   let hit = shared.get(key);
-  if (!hit || hit.version !== version || Date.now() - hit.at > 1000) {
-    hit = { version, at: Date.now(), body: JSON.stringify(fn()) };
+  if (!hit || hit.push !== pushes || Date.now() - hit.at > 2000) {
+    hit = { push: pushes, at: Date.now(), value: fn() };
     shared.set(key, hit);
   }
+  return hit.value;
+}
+function sendShared(res, key, fn) {
+  const body = sharedValue(`json:${key}`, () => JSON.stringify(fn()));
   res.writeHead(200, {
     'content-type': 'application/json; charset=utf-8',
     'cache-control': 'no-store',
-    'content-length': Buffer.byteLength(hit.body),
+    'content-length': Buffer.byteLength(body),
   });
-  res.end(hit.body);
+  res.end(body);
 }
 
 /** Push an event to every connected dashboard. */
 export function broadcast(event, data) {
+  if (event === 'update') pushes++;
   const payload = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
   for (const res of clients) {
     try { res.write(payload); } catch { clients.delete(res); }
@@ -369,7 +377,8 @@ export async function serve({ port = 4785, open = false, refresh, fastRefresh, a
       }, 1000);
     };
     sync = startSync({
-      serial, onRows, localState, onLink: (link) => drive?.linked(link),
+      // Sent after every push and every two seconds, to each machine: worked out once for all of them.
+      serial, onRows, localState: () => sharedValue('state', localState), onLink: (link) => drive?.linked(link),
       // A priority set from another machine's dashboard is answered here; the rest is Slack's.
       onControl: async (link, msg) => (await onBoxControl(link, msg, () => broadcast('machine', { at: Date.now() }))) || control?.(link, msg),
       localPanel: () => ({ machine: machinePanel(), storage: storagePanel() }),
