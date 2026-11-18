@@ -540,8 +540,12 @@ export function boxPanel(now = Date.now(), entries = null) {
 
 /** Running Claude sessions as the machine sampler and the storage survey want them. */
 function runningSessions() {
+  // Where each last worked, as its transcript said with its latest call: a session started in
+  // ~/Projects that went on into one repository is that repository's.
+  const latest = db().prepare('SELECT cwd FROM sessions WHERE session_id IN (?, ?) AND cwd IS NOT NULL ORDER BY last_ts DESC LIMIT 1');
   return [...runningEntries()].map(({ s }) => ({ sessionId: s.sessionId, parkedJobId: s.parkedJobId ?? null, pid: s.pid,
-    cwd: s.cwd, name: s.name ?? null, status: s.status ?? null }));
+    cwd: s.cwd, workDir: latest.get(s.sessionId, s.parkedJobId ?? s.sessionId)?.cwd ?? null,
+    name: s.name ?? null, status: s.status ?? null }));
 }
 
 /** A session's name from any id it goes by, among the running ones. */

@@ -128,6 +128,45 @@ test('the sampler says whose each process is: sessions, jobs, what was left runn
   assert.equal(byName.quiet, undefined, 'a project only shows when it has something here, or the owner ranked it');
 });
 
+test('a session started in the folder above its repositories is the project it works in', () => {
+  const parent = path.join(TMP, 'repos');
+  const delta = repo('delta');
+  const app = path.join(delta, 'apps', 'web');
+  fs.mkdirSync(app, { recursive: true });
+  const world = (k) => {
+    machineFiles(1000 * k, 2400 * k);
+    proc(100, { comm: 'claude', cg: `${USER}/app.slice/run-r1.scope`, ticks: 10 * k, cwd: parent });
+  };
+  const run = (sessions) => {
+    machine.resetMachine();
+    const t0 = Date.now();
+    world(1); machine.sample(sessions, t0);
+    world(4); machine.sample(sessions, t0 + 3000);
+    return Object.fromEntries(machine.machineView({ nameOf: () => null }).projects.map((p) => [p.name, p]));
+  };
+  const one = (workDir) => [{ sessionId: 'roaming', pid: 100, cwd: parent, workDir, name: 'roaming', status: 'busy' }];
+
+  let byName = run(one(app));
+  assert.deepEqual(byName.delta?.sessions.map((s) => s.sessionId), ['roaming'], 'its latest call was made inside delta');
+  assert.equal(byName.repos, undefined, 'not the folder it was started in');
+
+  byName = run(one(null));
+  assert.deepEqual(byName.repos?.sessions.map((s) => s.sessionId), ['roaming'], 'before its first call, where it started');
+
+  byName = run(one(path.join(os.tmpdir(), 'claude-1000', '-elsewhere', 'x', 'scratchpad')));
+  assert.ok(byName.repos, 'a scratch folder outside every repository does not move it');
+
+  // A session started in a repository stays its project wherever its calls are made.
+  const echo = repo('echo');
+  machine.resetMachine();
+  const t0 = Date.now();
+  const inRepo = [{ sessionId: 'home', pid: 100, cwd: echo, workDir: app, name: 'home', status: 'busy' }];
+  machineFiles(1000, 2400); proc(100, { comm: 'claude', cg: `${USER}/app.slice/run-r1.scope`, ticks: 10, cwd: echo }); machine.sample(inRepo, t0);
+  machineFiles(4000, 9600); proc(100, { comm: 'claude', cg: `${USER}/app.slice/run-r1.scope`, ticks: 40, cwd: echo }); machine.sample(inRepo, t0 + 3000);
+  const names = machine.machineView({ nameOf: () => null }).projects.map((p) => p.name);
+  assert.ok(names.includes('echo') && !names.includes('delta'), names.join(','));
+});
+
 test('the owner\'s priorities: read from heavy\'s file, set only through heavy', () => {
   const file = process.env.BOX_PRIORITY_FILE;
   try { fs.unlinkSync(file); } catch { /* none yet */ }

@@ -318,6 +318,17 @@ export function projectOf(dir) {
 }
 
 /**
+ * The project a running session is working on: the one it was started in, or,
+ * when it was started outside every repository (~/Projects, home) and has since
+ * gone into one, that repository, as heavy names the jobs it runs there. A
+ * session that moves between repositories moves with them.
+ */
+export function sessionProject({ cwd, workDir } = {}) {
+  if (workDir && workDir !== cwd && !gitTop(cwd) && gitTop(workDir)) return projectOf(workDir);
+  return projectOf(cwd);
+}
+
+/**
  * The directory a Claude folder name stands for. Claude names a session's
  * folders for its working directory with every character but a letter or digit
  * made a dash ("/srv/my-app/.claude/worktrees/a" is "-srv-my-app--claude-worktrees-a"),
@@ -472,7 +483,7 @@ export function sample(sessions = [], now = Date.now()) {
   // Running sessions by every id their commands carry, and by their own process.
   const bySid = new Map(), byPid = new Map();
   for (const s of sessions) {
-    const info = { ...s, project: projectOf(s.cwd) };
+    const info = { ...s, project: sessionProject(s) };
     for (const id of [s.sessionId, s.parkedJobId]) if (id) bySid.set(id, info);
     if (s.pid) byPid.set(s.pid, info);
   }

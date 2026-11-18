@@ -369,24 +369,18 @@ export function attributeSessions() {
  */
 let resolverCache = { sig: null, fn: null };
 
-/** Cheap fingerprint of everything the resolver is built from. */
+/** How many times what the resolver is built from has changed: the database's triggers count it (db.js). */
 function resolverSignature(d) {
-  const a = d.prepare('SELECT COUNT(*) n, MAX(ts) m, COUNT(config_dir) p FROM identity_points').get();
-  const b = d.prepare('SELECT COUNT(*) n, MAX(ts) m FROM account_observations').get();
-  const c = d.prepare('SELECT COUNT(*) n, COUNT(email) e FROM accounts').get();
-  const s = d.prepare('SELECT COUNT(*) n, COUNT(account_uuid) k FROM sessions').get();
-  const l = d.prepare('SELECT COUNT(*) n, MAX(ts) m, COUNT(config_dir) p FROM limit_events').get();
-  // Readings matter per session and window, not per reading.
-  const u = d.prepare('SELECT COUNT(*) n FROM (SELECT DISTINCT session_id, limit_type, resets_at FROM utilization)').get();
-  return `${a.n}:${a.m}:${a.p}|${b.n}:${b.m}|${c.n}:${c.e}|${s.n}:${s.k}|${l.n}:${l.m}:${l.p}|${u.n}`;
+  return d.prepare("SELECT n FROM revs WHERE name = 'resolver'").get()?.n ?? 0;
 }
 
 function buildResolver() {
   const d = db();
   const sig = resolverSignature(d);
-  if (resolverCache.sig === sig) return resolverCache.fn;
+  // The count starts again in another database (a test's, or one reopened).
+  if (resolverCache.sig === sig && resolverCache.d === d) return resolverCache.fn;
   const fn = createResolver(d);
-  resolverCache = { sig, fn };
+  resolverCache = { sig, fn, d };
   return fn;
 }
 

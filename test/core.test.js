@@ -494,6 +494,57 @@ test('a session that follows a /login bills each account for its own part', () =
   assert.equal(acctOf('after'), 'new', 'calls after the switch must not stay on the old account');
 });
 
+test('the rules calls are billed by follow every new record, from whichever process wrote it', () => {
+  reset();
+  const dir = '/home/me/.claude';
+  const t0 = Date.UTC(2026, 8, 12, 13, 0);
+  db().prepare("INSERT INTO accounts (account_uuid, email) VALUES ('old', 'old@x.com'), ('new', NULL)").run();
+  db().prepare('INSERT INTO sessions (session_id, first_ts, last_ts, config_dir) VALUES (?,?,?,?)').run('s', t0, t0 + 5 * HOUR, dir);
+  db().prepare("INSERT INTO identity_points (session_id, ts, email, source) VALUES ('s', ?, 'old@x.com', 'context')").run(t0);
+  rawEvent('first', 's', t0 + MIN, dir);
+  attributeEvents({ all: true });
+  assert.equal(acctOf('first'), 'old');
+
+  // A /login lands after the rules were built: they must be built again.
+  db().prepare("INSERT INTO identity_points (session_id, ts, email, source) VALUES ('s', ?, 'new@x.com', 'context')").run(t0 + HOUR);
+  rawEvent('second', 's', t0 + HOUR + MIN, dir);
+  attributeEvents({ all: true });
+  assert.notEqual(acctOf('second'), 'new', 'an email no account has yet names no account');
+
+  // The account learns its email: a change to a row, not a new one.
+  db().prepare("UPDATE accounts SET email = 'new@x.com' WHERE account_uuid = 'new'").run();
+  attributeEvents({ all: true });
+  assert.equal(acctOf('second'), 'new');
+  assert.equal(acctOf('first'), 'old');
+
+  // Another tracker process writes through its own connection; the count is the database's, so it moves too.
+  const { DatabaseSync } = process.getBuiltinModule('node:sqlite');
+  const other = new DatabaseSync(path.join(process.env.CLAUDE_TRACKER_DIR, 'tracker.db'));
+  other.exec('PRAGMA busy_timeout = 5000');
+  other.prepare("INSERT INTO identity_points (session_id, ts, email, source) VALUES ('s', ?, 'old@x.com', 'context')").run(t0 + 2 * HOUR);
+  other.close();
+  rawEvent('third', 's', t0 + 2 * HOUR + MIN, dir);
+  attributeEvents({ all: true });
+  assert.equal(acctOf('third'), 'old');
+});
+
+test('a record no call can place is left alone, and does not have the rules rebuilt on every refresh', async () => {
+  reset();
+  const { placeRecords } = await import('../src/ingest.js');
+  const rev = () => db().prepare("SELECT n FROM revs WHERE name = 'resolver'").get()?.n ?? 0;
+  const t0 = Date.UTC(2026, 8, 13, 13, 0);
+  db().prepare("INSERT INTO identity_points (session_id, ts, email, source) VALUES ('quiet', ?, 'a@x.com', 'context')").run(t0);
+  const before = rev();
+  assert.equal(placeRecords().placed, 0, 'its session made no call to say which profile');
+  assert.equal(placeRecords().placed, 0);
+  assert.equal(rev(), before, 'nothing changed, so nothing has to be built again');
+
+  rawEvent('q1', 'quiet', t0 + MIN, '/home/me/.claude');
+  assert.equal(placeRecords().placed, 1);
+  assert.equal(db().prepare("SELECT config_dir c FROM identity_points WHERE session_id = 'quiet'").get().c, '/home/me/.claude');
+  assert.ok(rev() > before, 'a record placed is news to the rules');
+});
+
 test('a background job keeps its own account when the profile switches', () => {
   reset();
   const dir = '/home/me/.claude';

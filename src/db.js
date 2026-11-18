@@ -231,6 +231,65 @@ WHEN OLD.email IS NOT NEW.email OR OLD.display_name IS NOT NEW.display_name OR O
 BEGIN DELETE FROM sync_dirty WHERE tbl = 'accounts' AND key = NEW.account_uuid;
       INSERT INTO sync_dirty (tbl, key) VALUES ('accounts', NEW.account_uuid); END;
 
+-- A count of changes to what the account resolver is built from (accounts.js),
+-- kept by the database so every process's writes move it. The resolver used to
+-- tell by counting those tables, a tenth of a second spent several times a
+-- second; this is one row. A reading is news only when it opens a window for
+-- its session, and an account settled on a call or reading is the resolver's
+-- output, not its input.
+CREATE TABLE IF NOT EXISTS revs (
+  name TEXT PRIMARY KEY,
+  n    INTEGER NOT NULL
+);
+CREATE TRIGGER IF NOT EXISTS identity_points_rev_insert AFTER INSERT ON identity_points
+BEGIN INSERT INTO revs (name, n) VALUES ('resolver', 1) ON CONFLICT (name) DO UPDATE SET n = n + 1; END;
+CREATE TRIGGER IF NOT EXISTS identity_points_rev_update AFTER UPDATE ON identity_points
+WHEN OLD.session_id IS NOT NEW.session_id OR OLD.ts IS NOT NEW.ts OR OLD.email IS NOT NEW.email
+  OR OLD.account_uuid IS NOT NEW.account_uuid OR OLD.source IS NOT NEW.source OR OLD.config_dir IS NOT NEW.config_dir
+BEGIN INSERT INTO revs (name, n) VALUES ('resolver', 1) ON CONFLICT (name) DO UPDATE SET n = n + 1; END;
+CREATE TRIGGER IF NOT EXISTS identity_points_rev_delete AFTER DELETE ON identity_points
+BEGIN INSERT INTO revs (name, n) VALUES ('resolver', 1) ON CONFLICT (name) DO UPDATE SET n = n + 1; END;
+CREATE TRIGGER IF NOT EXISTS account_observations_rev_insert AFTER INSERT ON account_observations
+BEGIN INSERT INTO revs (name, n) VALUES ('resolver', 1) ON CONFLICT (name) DO UPDATE SET n = n + 1; END;
+CREATE TRIGGER IF NOT EXISTS account_observations_rev_update AFTER UPDATE ON account_observations
+WHEN OLD.ts IS NOT NEW.ts OR OLD.config_dir IS NOT NEW.config_dir OR OLD.account_uuid IS NOT NEW.account_uuid
+BEGIN INSERT INTO revs (name, n) VALUES ('resolver', 1) ON CONFLICT (name) DO UPDATE SET n = n + 1; END;
+CREATE TRIGGER IF NOT EXISTS account_observations_rev_delete AFTER DELETE ON account_observations
+BEGIN INSERT INTO revs (name, n) VALUES ('resolver', 1) ON CONFLICT (name) DO UPDATE SET n = n + 1; END;
+CREATE TRIGGER IF NOT EXISTS accounts_rev_insert AFTER INSERT ON accounts
+BEGIN INSERT INTO revs (name, n) VALUES ('resolver', 1) ON CONFLICT (name) DO UPDATE SET n = n + 1; END;
+CREATE TRIGGER IF NOT EXISTS accounts_rev_update AFTER UPDATE ON accounts
+WHEN OLD.account_uuid IS NOT NEW.account_uuid OR OLD.email IS NOT NEW.email
+BEGIN INSERT INTO revs (name, n) VALUES ('resolver', 1) ON CONFLICT (name) DO UPDATE SET n = n + 1; END;
+CREATE TRIGGER IF NOT EXISTS accounts_rev_delete AFTER DELETE ON accounts
+BEGIN INSERT INTO revs (name, n) VALUES ('resolver', 1) ON CONFLICT (name) DO UPDATE SET n = n + 1; END;
+CREATE TRIGGER IF NOT EXISTS sessions_rev_insert AFTER INSERT ON sessions
+BEGIN INSERT INTO revs (name, n) VALUES ('resolver', 1) ON CONFLICT (name) DO UPDATE SET n = n + 1; END;
+CREATE TRIGGER IF NOT EXISTS sessions_rev_update AFTER UPDATE ON sessions
+WHEN OLD.session_id IS NOT NEW.session_id OR OLD.config_dir IS NOT NEW.config_dir
+  OR OLD.account_uuid IS NOT NEW.account_uuid OR OLD.first_ts IS NOT NEW.first_ts
+BEGIN INSERT INTO revs (name, n) VALUES ('resolver', 1) ON CONFLICT (name) DO UPDATE SET n = n + 1; END;
+CREATE TRIGGER IF NOT EXISTS sessions_rev_delete AFTER DELETE ON sessions
+BEGIN INSERT INTO revs (name, n) VALUES ('resolver', 1) ON CONFLICT (name) DO UPDATE SET n = n + 1; END;
+CREATE TRIGGER IF NOT EXISTS limit_events_rev_insert AFTER INSERT ON limit_events
+BEGIN INSERT INTO revs (name, n) VALUES ('resolver', 1) ON CONFLICT (name) DO UPDATE SET n = n + 1; END;
+CREATE TRIGGER IF NOT EXISTS limit_events_rev_update AFTER UPDATE ON limit_events
+WHEN OLD.ts IS NOT NEW.ts OR OLD.session_id IS NOT NEW.session_id OR OLD.limit_type IS NOT NEW.limit_type
+  OR OLD.resets_at IS NOT NEW.resets_at OR OLD.overage IS NOT NEW.overage OR OLD.config_dir IS NOT NEW.config_dir
+BEGIN INSERT INTO revs (name, n) VALUES ('resolver', 1) ON CONFLICT (name) DO UPDATE SET n = n + 1; END;
+CREATE TRIGGER IF NOT EXISTS limit_events_rev_delete AFTER DELETE ON limit_events
+BEGIN INSERT INTO revs (name, n) VALUES ('resolver', 1) ON CONFLICT (name) DO UPDATE SET n = n + 1; END;
+CREATE TRIGGER IF NOT EXISTS utilization_rev_insert AFTER INSERT ON utilization
+WHEN NOT EXISTS (SELECT 1 FROM utilization u WHERE u.session_id = NEW.session_id AND u.limit_type = NEW.limit_type
+  AND u.resets_at IS NEW.resets_at AND u.rowid <> NEW.rowid)
+BEGIN INSERT INTO revs (name, n) VALUES ('resolver', 1) ON CONFLICT (name) DO UPDATE SET n = n + 1; END;
+CREATE TRIGGER IF NOT EXISTS utilization_rev_update AFTER UPDATE ON utilization
+WHEN OLD.ts IS NOT NEW.ts OR OLD.session_id IS NOT NEW.session_id OR OLD.limit_type IS NOT NEW.limit_type
+  OR OLD.resets_at IS NOT NEW.resets_at OR OLD.config_dir IS NOT NEW.config_dir
+BEGIN INSERT INTO revs (name, n) VALUES ('resolver', 1) ON CONFLICT (name) DO UPDATE SET n = n + 1; END;
+CREATE TRIGGER IF NOT EXISTS utilization_rev_delete AFTER DELETE ON utilization
+BEGIN INSERT INTO revs (name, n) VALUES ('resolver', 1) ON CONFLICT (name) DO UPDATE SET n = n + 1; END;
+
 -- How far this tracker has read each table of each other machine's index.
 CREATE TABLE IF NOT EXISTS sync_cursors (
   machine_id TEXT NOT NULL,

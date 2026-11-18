@@ -526,7 +526,12 @@ const GROWS_ONLY = [
 
 // The owner's cleanup tools, where this machine has them.
 const coreTool = (name) => { const p = path.join(HOME, '.claude', 'claude-core', 'bin', name); return exists(p) ? p : null; };
-const onPath = (name) => works(name, ['--version']);
+// Looked up, not run: the view is drawn every few seconds, and `npm --version` blocked the
+// whole server for a third of a second each time on a busy machine.
+const onPath = (name) => SYSTEM_PATH().split(path.delimiter).some((d) => {
+  if (!d) return false;
+  try { fs.accessSync(path.join(d, name), fs.constants.X_OK); return fs.statSync(path.join(d, name)).isFile(); } catch { return false; }
+});
 /** A recommendation the dashboard can run: named by what it does, so its id holds while that stays the same. */
 const offer = (c) => ({ ...c, id: crypto.createHash('sha1').update(JSON.stringify([c.run, c.cwd ?? null])).digest('hex').slice(0, 12) });
 

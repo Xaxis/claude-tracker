@@ -341,8 +341,11 @@ export function placeRecords() {
     (SELECT e.config_dir FROM events e WHERE e.session_id = r.session_id AND e.ts >= r.ts ORDER BY e.ts LIMIT 1),
     (SELECT e.config_dir FROM events e WHERE e.session_id = r.session_id AND e.ts < r.ts ORDER BY e.ts DESC LIMIT 1))`;
   const d = db();
-  const a = d.prepare(`UPDATE identity_points AS r SET config_dir = ${near} WHERE r.config_dir IS NULL`).run().changes;
-  const b = d.prepare(`UPDATE limit_events AS r SET config_dir = ${near} WHERE r.config_dir IS NULL AND r.session_id IS NOT NULL`).run().changes;
+  // Only where a call says: a record whose session made none would be written NULL over NULL on
+  // every refresh, and each such write tells the account resolver to rebuild itself.
+  const a = d.prepare(`UPDATE identity_points AS r SET config_dir = ${near} WHERE r.config_dir IS NULL AND ${near} IS NOT NULL`).run().changes;
+  const b = d.prepare(`UPDATE limit_events AS r SET config_dir = ${near}
+    WHERE r.config_dir IS NULL AND r.session_id IS NOT NULL AND ${near} IS NOT NULL`).run().changes;
   return { placed: a + b };
 }
 
