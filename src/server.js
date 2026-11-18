@@ -365,13 +365,14 @@ export async function serve({ port = 4785, open = false, refresh, fastRefresh, a
   let control = null, drive = null;
   if (web) {
     advert = advertise(port);
-    let since = null, settling = null;
-    const onRows = (t) => {
+    let since = null, calls = null, settling = null;
+    const onRows = (t, c) => {
       since = Math.min(since ?? Infinity, t ?? Infinity);
+      calls = Math.min(calls ?? Infinity, c ?? Infinity);
       settling ??= setTimeout(() => {
-        const from = since;
-        since = null; settling = null;
-        serial(() => afterSync(from))
+        const from = since, first = calls;
+        since = null; calls = null; settling = null;
+        serial(() => afterSync(from, first))
           .then(() => push({ reason: 'sync' }))
           .catch((err) => (ui ? ui.reportError(err.message) : console.error('sync failed:', err.message)));
       }, 1000);

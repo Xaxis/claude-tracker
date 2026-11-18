@@ -86,7 +86,7 @@ async function refresh({ quiet = false, force = false, reattribute = 'recent' } 
   // re-check the last six hours so late-arriving identity records still land.
   const a = attributeEvents(reattribute === 'all' ? { all: true } : { since: Date.now() - 6 * 3600_000 });
   const live = ingestLive();
-  invalidateCaches(reattribute === 'all', res.minNewTs, a.minChangedTs, live.oldest, importedSince());
+  invalidateCaches(reattribute === 'all', [res.minNewTs, a.minChangedTs, importedSince()], [live.oldest]);
   calibrateAll();
   return { ...res, ms: Date.now() - t0 };
 }
@@ -103,23 +103,24 @@ async function fastRefresh(paths = []) {
   const r = paths.length ? await ingestPaths(paths) : { scanned: 0, newEvents: 0 };
   const a = attributeEvents({ since: Date.now() - 10 * 60_000, includeNull: false });
   const live = ingestLive();
-  invalidateCaches(false, r.minNewTs, a.minChangedTs, live.oldest, importedSince());
+  invalidateCaches(false, [r.minNewTs, a.minChangedTs, importedSince()], [live.oldest]);
   return { ...r, attributed: a.changed, exact: live.samples, ms: Date.now() - t0 };
 }
 
 /**
  * Rows from another machine have arrived: re-derive what they bear on. `since`
  * is the earliest time they could change attribution from - null when they
- * only touched what attribution never reads.
+ * only touched what attribution never reads - and `calls` the earliest call
+ * among them.
  */
-function afterSync(since) {
+function afterSync(since, calls = null) {
   if (since == null || !Number.isFinite(since)) return;
   placeRecords();
   attributeSessions();
   attributeLimitEvents();
   resolveAccountEmails();
   const a = attributeEvents({ since: Math.min(since, Date.now() - 6 * 3600_000) });
-  invalidateCaches(false, since, a.minChangedTs);
+  invalidateCaches(false, [calls, a.minChangedTs], [since]);
 }
 
 /**
@@ -130,21 +131,25 @@ function afterSync(since) {
 let seenImport = null;
 function importedSince() {
   const m = importMark();
-  const fresh = seenImport !== null && m.n !== seenImport;
+  // This process's own imports were settled as they arrived (afterSync).
+  const fresh = seenImport !== null && m.n !== seenImport && !m.mine;
   seenImport = m.n;
   return fresh ? m.since : null;
 }
 
 /**
  * Drop the cached window chains and account totals only when something they
- * were built from changed - a new or re-attributed call older than what they
- * already cover. Dropping them on every rescan made the next read rebuild whole
- * histories once a minute.
+ * were built from changed: a new or re-attributed call older than what they
+ * already cover, or - for the chains alone - a reset time read from a status
+ * line, which can move where a chain begins. Dropping them on every rescan made
+ * the next read rebuild whole histories once a minute; dropping the totals for
+ * every synced reading or session, several times a minute.
  */
-function invalidateCaches(all, ...times) {
-  const touched = Math.min(...times.map((t) => t ?? Infinity));
-  if (all || touched < earliestCachedChain()) resetWindowCache();
-  if (all || touched < aggregatesCutoff()) invalidateAggregates();
+function invalidateCaches(all, calls, resets = []) {
+  const earliest = (ts) => Math.min(...ts.map((t) => t ?? Infinity));
+  const c = earliest(calls);
+  if (all || Math.min(c, earliest(resets)) < earliestCachedChain()) resetWindowCache();
+  if (all || c < aggregatesCutoff()) invalidateAggregates();
 }
 
 function cmdStatus() {

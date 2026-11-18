@@ -1079,6 +1079,27 @@ test('rows from another machine keep their profiles apart, and merge without fla
   assert.equal(db().prepare("SELECT COUNT(*) n FROM sync_cursors WHERE tbl = 'events'").get().n, 0);
 });
 
+test('only calls from another machine are news to the totals other trackers here keep', async () => {
+  reset();
+  const R = await import('../src/replica.js');
+  const other = 'abcdef123456';
+  const before = R.importMark().n;
+  const scols = Object.keys(R.TABLES.sessions.cols);
+  // A session that began hours ago, and a reading: no call total moves until attribution moves a call.
+  const s = R.importBatch(other, 'sessions', scols, [scols.map((c) => ({ session_id: 'far', first_ts: 1000, last_ts: 2000 })[c] ?? null)], 1);
+  assert.equal(s.calls, null);
+  assert.equal(R.importMark().n, before, 'a session alone is not news to them');
+
+  const ecols = Object.keys(R.TABLES.events.cols);
+  const call = { call_id: 'far-1', ts: 1500, session_id: 'far', model: 'claude-opus-5' };
+  const e = R.importBatch(other, 'events', ecols, [ecols.map((c) => call[c] ?? (R.TABLES.events.cols[c] === 'I!' ? 0 : null))], 1);
+  assert.equal(e.calls, 1500);
+  const m = R.importMark();
+  assert.equal(m.n, before + 1);
+  assert.equal(m.since, 1500);
+  assert.equal(m.mine, true, 'the tracker that imported them settled them already');
+});
+
 /* ---------------------------------------------------- when accounts free up */
 
 const observe = (dir, ts, account) => db().prepare(

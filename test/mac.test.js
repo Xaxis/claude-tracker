@@ -81,7 +81,9 @@ test('on a Mac the sampler reads ps, vm_stat, sysctl and ioreg, and says whose e
   world(1);
   assert.ok(machine.sample(sessions, t0), 'a Mac can be sampled');
   world(4);                       // three seconds later
+  const loadBefore = os.loadavg()[0];
   const s = machine.sample(sessions, t0 + 3000);
+  const loadAfter = os.loadavg()[0];
   const v = machine.machineView({ nameOf: () => null });
 
   const byName = Object.fromEntries(v.projects.map((p) => [p.name, p]));
@@ -109,7 +111,8 @@ test('on a Mac the sampler reads ps, vm_stat, sysctl and ioreg, and says whose e
   assert.equal(s.mem.swapUsed, 1024.5 * 2 ** 20);
   assert.equal(s.mem.swapTotal, 2048 * 2 ** 20);
   assert.deepEqual(s.gpu, { busy: 37, vramUsed: 734003200, vramTotal: null }, 'Apple\'s GPU shares memory: no total of its own');
-  assert.equal(s.cpu.demand, os.loadavg()[0]);
+  // The kernel updates it every five seconds: the sample took it in between, whenever that fell.
+  assert.ok([loadBefore, loadAfter].includes(s.cpu.demand), `demand ${s.cpu.demand} is the load average`);
   assert.equal(v.cpu.cores, os.cpus().length);
 });
 

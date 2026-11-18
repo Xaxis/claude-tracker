@@ -328,29 +328,37 @@ export function importBatch(from, tbl, cols, rows, upTo) {
     }
     stmt(`INSERT INTO sync_cursors (machine_id, tbl, cursor) VALUES (?,?,?)
       ON CONFLICT(machine_id, tbl) DO UPDATE SET cursor = excluded.cursor`).run(from, tbl, upTo);
-    if (Number.isFinite(since)) noteImport(since);
+    if (tbl === 'events' && Number.isFinite(since)) noteImport(since);
   });
-  return { stored, since: Number.isFinite(since) ? since : null };
+  const reached = Number.isFinite(since) ? since : null;
+  return { stored, since: reached, calls: tbl === 'events' ? reached : null };
 }
 
 /*
  * Other tracker processes on this machine - a terminal dashboard attached to
- * the service - cache history they will not re-read. They check this after
- * each refresh, and drop whatever an import reached back past.
+ * the service - cache totals of calls they will not re-read. They check this
+ * after each refresh, and drop whatever an import of calls reached back past.
+ * Only calls: a session, reading or account that arrives changes no total until
+ * attribution moves a call, and that is noted where it happens.
  */
+let noted = null;
 function noteImport(since) {
   const prev = importMark();
   const now = Date.now();
   // Readers look at least once a minute; folding five minutes together means
   // none can miss an earlier, older import behind a later, newer one.
   const oldest = prev.at && now - prev.at < 5 * 60_000 ? Math.min(prev.since, since) : since;
-  setMeta('sync_import', `${prev.n + 1}|${oldest}|${now}`);
+  noted = prev.n + 1;
+  setMeta('sync_import', `${noted}|${oldest}|${now}`);
 }
 
-/** The latest import: a counter, and the earliest time it reached back to. */
+/**
+ * The latest import of calls: a counter, the earliest time it reached back to,
+ * and whether this process made it (and so already settled what it reached).
+ */
 export function importMark() {
   const [n, since, at] = String(getMeta('sync_import', '0|0|0')).split('|').map(Number);
-  return { n: n || 0, since: since || 0, at: at || 0 };
+  return { n: n || 0, since: since || 0, at: at || 0, mine: noted !== null && n === noted };
 }
 
 /* --- machines and peers ---------------------------------------------------- */

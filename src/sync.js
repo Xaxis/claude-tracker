@@ -45,8 +45,9 @@ const IDLE_MS = 60_000;
  *
  * Imports and exports go through `serial`, the tracker's write queue, so they
  * land between refreshes rather than inside one. `admit(peer, link)` returns a
- * reason to refuse the machine, if there is one. `onRows(since)` hears that
- * rows arrived, and the earliest time they could change attribution from.
+ * reason to refuse the machine, if there is one. `onRows(since, calls)` hears
+ * that rows arrived, the earliest time they could change attribution from, and
+ * the earliest call among them (null when they brought none).
  * `localState()` says what is running here, for the other side's dashboards.
  * `onControl(link, msg)` hears `ctl` messages; `link.send(msg)` sends one.
  * `localPanel()` gives this machine's live views ({machine, storage}), and
@@ -130,7 +131,7 @@ export function openLink({ input, output, serial, admit = () => null, onRows = (
       case 'rows': {
         if (!link.peer) return fail('sent rows before saying hello');
         const r = await serial(() => importBatch(link.peer.id, msg.tbl, msg.cols, msg.rows, msg.upTo));
-        if (r.stored) onRows(r.since);
+        if (r.stored) onRows(r.since, r.calls);
         return;
       }
       case 'state':

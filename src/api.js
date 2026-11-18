@@ -33,10 +33,12 @@ export const limitLabel = (type) => LIMIT_TYPES[type]?.label ?? EXTRA_LABELS[typ
 function exactReading(accountUuid, type, now) {
   // Never one dated before its own window began: an idle session's fresh numbers, misdated.
   const span = LIMIT_TYPES[type]?.span ?? 0;
+  // Either kind is dated after now - span or now - 30 minutes, so only those are read:
+  // an account with nothing current had every reading it ever got scanned, on every push.
   return db().prepare(`SELECT ts, pct, resets_at FROM utilization
-     WHERE account_uuid = ? AND limit_type = ? AND (resets_at > ? OR (resets_at IS NULL AND ts > ?))
+     WHERE account_uuid = ? AND limit_type = ? AND ts > ? AND (resets_at > ? OR (resets_at IS NULL AND ts > ?))
        AND (resets_at IS NULL OR ts >= resets_at - ?)
-     ORDER BY ts DESC LIMIT 1`).get(accountUuid, type, now, now - 30 * 60_000, span) ?? null;
+     ORDER BY ts DESC LIMIT 1`).get(accountUuid, type, now - Math.max(span, 30 * 60_000), now, now - 30 * 60_000, span) ?? null;
 }
 
 /**
@@ -419,9 +421,31 @@ export function localSessions(now = Date.now()) {
   // here, and forced a full scan of every call for every running session.
   const lastIdentity = d.prepare(`SELECT session_id sid, ts FROM identity_points
      WHERE session_id >= ? AND session_id < ? || '~' ORDER BY ts DESC LIMIT 1`);
-  const recent = d.prepare(`SELECT COUNT(*) calls, COALESCE(SUM(cost_usd),0) cost, MAX(ts) last
-     FROM events WHERE session_id >= ? AND session_id < ? || '~' AND ts >= ?`);
-  const lastCall = d.prepare(`SELECT session_id sid, MAX(ts) last FROM events WHERE session_id >= ? AND session_id < ? || '~'`);
+  // A range over ids leaves the index no way to reach the newest calls, so every
+  // call the session ever made was read, for each running session on every push.
+  // The ids under a key are found first (one, nearly always), then each read exactly.
+  const firstId = d.prepare(`SELECT session_id s FROM events WHERE session_id >= ? AND session_id < ? || '~' ORDER BY session_id LIMIT 1`);
+  const nextId = d.prepare(`SELECT session_id s FROM events WHERE session_id > ? AND session_id < ? || '~' ORDER BY session_id LIMIT 1`);
+  const idsUnder = (k) => {
+    const out = [];
+    for (let r = firstId.get(k, k); r; r = nextId.get(r.s, k)) out.push(r.s);
+    return out;
+  };
+  const recentOf = d.prepare('SELECT COUNT(*) calls, COALESCE(SUM(cost_usd),0) cost FROM events WHERE session_id = ? AND ts >= ?');
+  const lastOf = d.prepare('SELECT MAX(ts) last FROM events WHERE session_id = ?');
+  const lastCall = { get: (k) => {
+    let best = { sid: null, last: null };
+    for (const s of idsUnder(k)) {
+      const last = lastOf.get(s).last;
+      if (last != null && (best.last == null || last > best.last)) best = { sid: s, last };
+    }
+    return best;
+  } };
+  const recent = { get: (k, since) => {
+    let calls = 0, cost = 0;
+    for (const s of idsUnder(k)) { const r = recentOf.get(s, since); calls += r.calls; cost += r.cost; }
+    return { calls, cost };
+  } };
   const who = accountResolver();
 
   const entries = [...runningEntries()];
@@ -436,7 +460,7 @@ export function localSessions(now = Date.now()) {
     // The transcript's own id: whichever key has the newest record or call.
     let sid = null, seen = -Infinity;
     for (const k of keys) {
-      for (const r of [lastIdentity.get(k, k), lastCall.get(k, k)]) {
+      for (const r of [lastIdentity.get(k, k), lastCall.get(k)]) {
         const ts = r?.ts ?? r?.last;
         if (r?.sid && ts > seen) { sid = r.sid; seen = ts; }
       }
@@ -450,9 +474,9 @@ export function localSessions(now = Date.now()) {
 
     let calls = 0, cost = 0, last = null;
     for (const k of keys) {
-      const r = recent.get(k, k, now - 5 * 60_000);
+      const r = recent.get(k, now - 5 * 60_000);
       calls += r.calls; cost += r.cost;
-      const lc = lastCall.get(k, k).last;
+      const lc = lastCall.get(k).last;
       if (lc && (!last || lc > last)) last = lc;
     }
 
