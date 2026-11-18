@@ -9,7 +9,7 @@ import { LIMIT_TYPES, currentWindow, burnRate, recentWindows, sumBetween } from 
 import { modelLabel } from './pricing.js';
 import { billingPeriod, periodSpend } from './billing.js';
 import { planPrice, paidOn } from './plans.js';
-import { accountAggregates } from './aggregates.js';
+import { accountAggregates, rollup, sessionParts, QUARTER } from './aggregates.js';
 import { machine, remoteMachines, listPeers, machineNameOf } from './replica.js';
 import { failoverSettings, recentSwitches, spares, SPARE_PREFIX } from './failover.js';
 import { getMeta } from './db.js';
@@ -271,13 +271,19 @@ function slackSummary(now) {
  * node:sqlite rejects a named parameter the statement does not mention, so the
  * bindings have to be built alongside the clause rather than passed always.
  */
-function accountFilter(accountUuid, prefix = 'AND') {
-  if (!accountUuid || accountUuid === 'all') return { clause: '', params: {} };
+function accountFilter(accountUuid) {
+  if (!accountUuid || accountUuid === 'all') return { key: 'all', clause: '', params: {} };
   // Filter on the call's own account: a session that switched mid-run then
   // shows up under each account for exactly the part it billed there.
-  if (accountUuid === UNATTRIBUTED) return { clause: `${prefix} e.account_uuid IS NULL`, params: {} };
-  return { clause: `${prefix} e.account_uuid = @acct`, params: { acct: accountUuid } };
+  if (accountUuid === UNATTRIBUTED) return { key: UNATTRIBUTED, clause: 'AND e.account_uuid IS NULL', params: {} };
+  return { key: accountUuid, clause: 'AND e.account_uuid = @acct', params: { acct: accountUuid } };
 }
+
+/** The same choice, of one call's account. */
+const billedTo = (accountUuid) => (!accountUuid || accountUuid === 'all' ? () => true
+  : accountUuid === UNATTRIBUTED ? (a) => a == null : (a) => a === accountUuid);
+
+const localDay = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
 
 /**
  * Daily totals for the trailing `days`, split by model, and what the subscriptions
@@ -285,16 +291,22 @@ function accountFilter(accountUuid, prefix = 'AND') {
  */
 export function history(days = 30, accountUuid = null) {
   const since = Date.now() - days * 86400000;
-  const { clause: where, params } = accountFilter(accountUuid);
-  const rows = db().prepare(`
-    SELECT strftime('%Y-%m-%d', e.ts/1000, 'unixepoch', 'localtime') AS day,
-           e.model AS model,
-           COUNT(*) AS events,
-           SUM(e.input_tokens + e.output_tokens + e.cache_write_5m + e.cache_write_1h + e.cache_read) AS tokens,
-           SUM(e.cost_usd) AS cost
-      FROM events e
-     WHERE e.ts >= @since ${where}
-     GROUP BY day, model ORDER BY day`).all({ since, ...params });
+  // Quarter hours to (day, model), each day's models in the order SQL grouped them.
+  const dayOf = new Map();
+  const cells = new Map();
+  for (const q of rollup(since, accountFilter(accountUuid))) {
+    let day = dayOf.get(q.b);
+    if (day === undefined) dayOf.set(q.b, (day = localDay(new Date(q.b * QUARTER))));
+    const key = `${day}\0${q.model ?? ''}\0${q.model == null}`;
+    const c = cells.get(key) ?? { day, model: q.model, events: 0, tokens: 0, cost: 0 };
+    c.events += q.events;
+    c.tokens += q.input + q.output + q.cache_write + q.cache_read;
+    c.cost += q.cost;
+    cells.set(key, c);
+  }
+  const order = (a, b) => (a < b ? -1 : a > b ? 1 : 0);
+  const rows = [...cells.values()].sort((a, b) => order(a.day, b.day)
+    || (a.model == null ? (b.model == null ? 0 : -1) : b.model == null ? 1 : order(a.model, b.model)));
 
   const byDay = new Map();
   for (const r of rows) {
@@ -311,7 +323,7 @@ export function history(days = 30, accountUuid = null) {
   const day = new Date(since);
   day.setHours(0, 0, 0, 0);
   for (; day.getTime() <= Date.now(); day.setDate(day.getDate() + 1)) {
-    const key = `${day.getFullYear()}-${String(day.getMonth() + 1).padStart(2, '0')}-${String(day.getDate()).padStart(2, '0')}`;
+    const key = localDay(day);
     const e = byDay.get(key) ?? { day: key, cost: 0, tokens: 0, events: 0, models: {} };
     e.paid = paidOn(accounts, day.getTime());
     out.push(e);
@@ -321,24 +333,19 @@ export function history(days = 30, accountUuid = null) {
 
 /** Recent sessions with their cost and owning account. */
 export function sessions(limit = 40, accountUuid = null) {
-  const { clause: where, params } = accountFilter(accountUuid, 'WHERE');
-  const rows = db().prepare(`
-    SELECT s.session_id, s.project, s.cwd, s.git_branch, s.first_ts, s.last_ts,
-           s.account_uuid, s.account_source, s.version, s.config_dir,
-           COALESCE(SUM(e.cost_usd), 0) AS cost,
-           COUNT(e.call_id) AS events,
-           COALESCE(SUM(e.input_tokens + e.output_tokens + e.cache_write_5m + e.cache_write_1h + e.cache_read), 0) AS tokens
-      FROM sessions s LEFT JOIN events e ON e.session_id = s.session_id
-      ${where}
-     GROUP BY s.session_id
-     HAVING events > 0
-     ORDER BY s.last_ts DESC LIMIT @limit`).all({ limit, ...params });
-  // A session that switched accounts billed each for part of it - list both.
-  const split = db().prepare(`SELECT account_uuid a, SUM(cost_usd) c FROM events
-     WHERE session_id = ? GROUP BY account_uuid ORDER BY MIN(ts)`);
-  for (const r of rows) {
-    r.accounts = split.all(r.session_id).map((x) => ({ accountUuid: x.a, cost: x.c }));
-    r.machine = machineNameOf(r.config_dir);
+  const counts = billedTo(accountUuid);
+  const rows = [];
+  // Newest first, until enough have calls billed to the account asked about. Grouping
+  // every call ever made to find the newest forty took two seconds.
+  for (const s of db().prepare(`SELECT session_id, project, cwd, git_branch, first_ts, last_ts,
+      account_uuid, account_source, version, config_dir FROM sessions ORDER BY last_ts DESC`).iterate()) {
+    const parts = sessionParts(s.session_id);
+    let cost = 0, events = 0, tokens = 0;
+    for (const p of parts) if (counts(p.a)) { cost += p.c; events += p.n; tokens += p.t; }
+    if (!events) continue;
+    // A session that switched accounts billed each for part of it - list both.
+    rows.push({ ...s, cost, events, tokens, accounts: parts.map((p) => ({ accountUuid: p.a, cost: p.c })), machine: machineNameOf(s.config_dir) });
+    if (rows.length >= limit) break;
   }
   return rows;
 }
@@ -725,17 +732,14 @@ export function inUse(ov, live) {
 /** Per-model totals over the trailing `days`. */
 export function modelBreakdown(days = 30, accountUuid = null) {
   const since = Date.now() - days * 86400000;
-  const { clause: where, params } = accountFilter(accountUuid);
-  const rows = db().prepare(`
-    SELECT e.model, COUNT(*) AS events, SUM(e.cost_usd) AS cost,
-           SUM(e.input_tokens) AS input, SUM(e.output_tokens) AS output,
-           SUM(e.thinking_tokens) AS thinking,
-           SUM(e.cache_write_5m + e.cache_write_1h) AS cache_write,
-           SUM(e.cache_read) AS cache_read
-      FROM events e
-     WHERE e.ts >= @since ${where}
-     GROUP BY e.model ORDER BY cost DESC`).all({ since, ...params });
-  return rows.map((r) => ({ ...r, label: modelLabel(r.model) }));
+  const by = new Map();
+  for (const q of rollup(since, accountFilter(accountUuid))) {
+    const m = by.get(q.model) ?? { model: q.model, events: 0, cost: 0, input: 0, output: 0, thinking: 0, cache_write: 0, cache_read: 0 };
+    m.events += q.events; m.cost += q.cost; m.input += q.input; m.output += q.output;
+    m.thinking += q.thinking; m.cache_write += q.cache_write; m.cache_read += q.cache_read;
+    by.set(q.model, m);
+  }
+  return [...by.values()].sort((a, b) => b.cost - a.cost).map((r) => ({ ...r, label: modelLabel(r.model) }));
 }
 
 /** Window-by-window history, for the "how full does it usually get" chart. */

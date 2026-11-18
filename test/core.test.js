@@ -379,6 +379,47 @@ test('an account\'s spend over a range counts every call in it, before the froze
   assert.deepEqual(accountSpend('acct', now - 3 * HOUR, now), { cost: 12, events: 2 });
 });
 
+test('the charts and the session list count every call, kept or new, and only those in range', async () => {
+  reset();
+  const api = await import('../src/api.js');
+  const { accountAggregates, invalidateAggregates } = await import('../src/aggregates.js');
+  const now = Date.now();
+  const DAY = 24 * HOUR;
+  db().prepare(`INSERT INTO sessions (session_id, first_ts, last_ts, account_uuid) VALUES
+    ('mine', ?, ?, 'acct'), ('theirs', ?, ?, 'other')`).run(now - 3 * DAY, now - MIN, now - 6 * HOUR, now - 5 * HOUR);
+  addEvent('mine', now - 3 * DAY, 1);           // outside a day's range
+  addEvent('mine', now - DAY - MIN, 2);         // a minute before it begins
+  addEvent('mine', now - DAY + MIN, 4);         // a minute after: same quarter hour, counted
+  addEvent('mine', now - 3 * HOUR, 8);
+  addEvent('theirs', now - 5 * HOUR, 16);
+  addEvent('mine', now - MIN, 32);              // after the line
+  invalidateAggregates();
+  accountAggregates(now);
+
+  const day = () => api.history(1).reduce((s, d) => s + d.cost, 0);
+  const models = (acct) => api.modelBreakdown(7, acct).map((m) => [m.events, m.cost]);
+  const list = (acct) => api.sessions(40, acct).map((s) => [s.session_id, s.events, s.cost, s.accounts.map((a) => a.accountUuid)]);
+  for (let i = 0; i < 2; i++) {                 // worked out, then read from what was kept
+    assert.equal(day(), 4 + 8 + 16 + 32);
+    assert.deepEqual(models(), [[6, 63]]);
+    assert.deepEqual(models('acct'), [[5, 47]]);
+    assert.deepEqual(list(), [['mine', 5, 47, ['acct']], ['theirs', 1, 16, ['other']]]);
+    assert.deepEqual(list('other'), [['theirs', 1, 16, ['other']]]);
+  }
+  assert.equal(api.history(7).reduce((s, d) => s + d.events, 0), 6);
+
+  addEvent('mine', now - 30_000, 64);           // new: read as it comes
+  assert.equal(day(), 124);
+  assert.deepEqual(list('acct'), [['mine', 6, 111, ['acct']]]);
+
+  // A call behind the line moved to another account, as a late /login moves it: the kept sums go.
+  db().prepare("UPDATE events SET account_uuid = 'other' WHERE cost_usd = 8").run();
+  invalidateAggregates();
+  accountAggregates(now);
+  assert.deepEqual(models('acct'), [[5, 103]]);
+  assert.deepEqual(list(), [['mine', 6, 111, ['acct', 'other']], ['theirs', 1, 16, ['other']]]);
+});
+
 test('the window read again on the next push is the one rebuilt from every call', async () => {
   reset();
   const { resetWindowCache } = await import('../src/windows.js');
