@@ -11,7 +11,8 @@ process.env.NO_COLOR = '1';
 
 const { db, closeDb } = await import('../src/db.js');
 const { costOf, modelInfo, modelLabel, repriceSql } = await import('../src/pricing.js');
-const { buildWindows, currentWindow, FIVE_HOUR, SEVEN_DAY } = await import('../src/windows.js');
+const { buildWindows, currentWindow, resetWindowCache, FIVE_HOUR, SEVEN_DAY } = await import('../src/windows.js');
+const { invalidateAggregates } = await import('../src/aggregates.js');
 const { calibrateAll, capacityFor } = await import('../src/calibrate.js');
 const { attributeSessions, attributeEvents } = await import('../src/accounts.js');
 
@@ -27,6 +28,9 @@ function reset() {
   for (const t of ['events', 'sessions', 'accounts', 'limit_events', 'calibration', 'account_observations', 'files', 'identity_points', 'utilization', 'notifications']) {
     d.exec(`DELETE FROM ${t}`);
   }
+  // A fresh index: nothing kept from the last test's calls.
+  invalidateAggregates();
+  resetWindowCache();
 }
 
 let seq = 0;
@@ -208,6 +212,38 @@ test('capacity is measured from usage up to the refusal, not the whole window', 
   const cap = capacityFor('acct-a', 'five_hour');
   assert.equal(cap.capacity, 60, 'capacity is the pre-refusal total only');
   assert.equal(cap.confidence, 'partial', 'one sample is only partial confidence');
+});
+
+test('a ceiling measured from old calls is kept, and measured again once one of them changes', async () => {
+  reset();
+  const { accountAggregates } = await import('../src/aggregates.js');
+  const resetsAt = Date.UTC(2026, 8, 5, 15, 0, 0);
+  const start = resetsAt - FIVE_HOUR;
+  addAccount('acct-a');
+  addAccount('acct-r');
+  addSession('sa', start, 'acct-a');
+  addSession('sr', start, 'acct-r');
+  addEvent('sa', start + MIN, 40);
+  addEvent('sa', resetsAt - 2 * HOUR, 20);
+  addRejection('acct-a', 'five_hour', resetsAt - HOUR, Math.floor(resetsAt / 1000), 'sa');
+  addEvent('sr', start + MIN, 30);             // half full, as a status line read it
+  db().prepare(`INSERT INTO utilization (ts, session_id, account_uuid, limit_type, pct, resets_at)
+    VALUES (?, 'sr', 'acct-r', 'five_hour', 50, ?)`).run(start + 2 * MIN, resetsAt);
+  accountAggregates(Date.now());                // every one of those calls is behind the line now
+
+  for (let i = 0; i < 2; i++) {
+    calibrateAll();
+    assert.equal(capacityFor('acct-a', 'five_hour').capacity, 60);
+    assert.equal(capacityFor('acct-r', 'five_hour').capacity, 60);
+  }
+  // A call found late, as another machine's arrive: the line is drawn again, and both are re-measured.
+  addEvent('sa', resetsAt - 3 * HOUR, 10);
+  addEvent('sr', start + MIN + 1, 6);
+  invalidateAggregates();
+  accountAggregates(Date.now());
+  calibrateAll();
+  assert.equal(capacityFor('acct-a', 'five_hour').capacity, 70);
+  assert.equal(capacityFor('acct-r', 'five_hour').capacity, 72);
 });
 
 test('an account with no rejection inherits a measured ceiling, not a constant', () => {

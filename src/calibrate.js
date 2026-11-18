@@ -1,5 +1,6 @@
 import { db, tx } from './db.js';
 import { LIMIT_TYPES, buildWindows, eventsFor } from './windows.js';
+import { accountSpend, behindLine } from './aggregates.js';
 
 /**
  * Learning each plan's real capacity.
@@ -36,6 +37,11 @@ function calibrationEvents(accountUuid, since, until) {
  * moment and total the usage from its start up to the refusal.
  */
 function measureRejection(accountUuid, type, resetsAtMs, rejectedAtMs) {
+  // A refusal is history: measured once, while its calls stay behind the frozen line.
+  return behindLine(`refusal|${accountUuid}|${type}|${resetsAtMs}|${rejectedAtMs}`, Math.max(resetsAtMs, rejectedAtMs ?? 0),
+    () => measureOnce(accountUuid, type, resetsAtMs, rejectedAtMs));
+}
+function measureOnce(accountUuid, type, resetsAtMs, rejectedAtMs) {
   const { span, grain } = LIMIT_TYPES[type];
   const windowStart = resetsAtMs - span;
   // Look back an extra span so the window that was open is reconstructed whole.
@@ -64,8 +70,8 @@ function exactCapacity(accountUuid, type) {
   for (const r of db().prepare(`SELECT ts, pct, resets_at FROM utilization
       WHERE account_uuid = ? AND limit_type = ? AND pct >= 10 AND resets_at IS NOT NULL
       ORDER BY ts DESC LIMIT 50`).all(accountUuid, type)) {
-    const used = db().prepare(`SELECT COALESCE(SUM(cost_usd), 0) c FROM events
-      WHERE account_uuid = ? AND ts >= ? AND ts <= ?`).get(accountUuid, r.resets_at - span, r.ts).c;
+    // Mostly behind the frozen line, so kept: summed afresh, these were most of each rescan.
+    const used = accountSpend(accountUuid, r.resets_at - span, r.ts).cost;
     if (used > 0) out.push(used / (r.pct / 100));
   }
   return out;

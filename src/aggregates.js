@@ -43,6 +43,14 @@ function keep(key, fn) {
 }
 
 /**
+ * `fn()`'s answer, kept while every call it reads - none after `end` - stays
+ * behind the frozen line. What it returns is shared, so it must be only read.
+ */
+export function behindLine(key, end, fn) {
+  return base && end < base.cutoff ? keep(`behind|${key}`, () => fn()) : fn();
+}
+
+/**
  * An account's calls and spend from `start` to `end`, both included: what lies
  * behind the frozen line summed once and kept, what follows summed each time.
  * A billing period or a week-long window re-summed on every push, for every
