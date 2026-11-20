@@ -1266,3 +1266,11 @@ test('an idle session whose numbers change with no call since is read as of now'
   assert.deepEqual(at, [[30, lastCall], [5, now]]);
   fs.rmSync(LIVE_DIR, { recursive: true, force: true });
 });
+
+test('queries bind by bare ?, which every Node that runs the tracker supports', () => {
+  // Node 22.13 to 24.0 bind arguments only to bare ?: a ?1 there fails "column index out of range".
+  const dir = path.join(import.meta.dirname, '..', 'src');
+  for (const f of fs.readdirSync(dir).filter((x) => x.endsWith('.js'))) {
+    assert.doesNotMatch(fs.readFileSync(path.join(dir, f), 'utf8'), /[=(,\s]\?\d/, f);
+  }
+});

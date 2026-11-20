@@ -151,8 +151,8 @@ export function currentWindow(accountUuid, type, now = Date.now()) {
   // week of calls into a chain on every push, for every account, said the same.
   const known = chainStart.get(key);
   if (known != null && known >= (anchor ?? 0) && accountUuid != null && accountUuid !== '__all__') {
-    const r = db().prepare(`SELECT (SELECT MIN(ts) FROM events WHERE account_uuid = ?1 AND ts >= ?2) f,
-                                   (SELECT MAX(ts) FROM events WHERE account_uuid = ?1 AND ts >= ?2) l`).get(accountUuid, known);
+    const r = db().prepare(`SELECT (SELECT MIN(ts) FROM events WHERE account_uuid = ? AND ts >= ?) f,
+                                   (SELECT MAX(ts) FROM events WHERE account_uuid = ? AND ts >= ?) l`).get(accountUuid, known, accountUuid, known);
     const start = r.f == null ? null : floorTo(r.f, LIMIT_TYPES[type].grain);
     if (start != null && r.l < start + span) {
       // One window holds every call since: the chain below would build exactly this.
