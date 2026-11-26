@@ -446,7 +446,9 @@ export function startDirector({ hands, log = () => {} }) {
       if (early?.options?.length) {
         launches.delete(r.pane);
         await hands.act({ op: 'close', pane: r.pane, socket: r.socket, force: true }).catch(() => {});
-        throw new Refused(409, `Claude asked something before it started, so it was closed: ${early.dialog?.title ?? early.text.split('\n').filter(Boolean).slice(-6).join(' / ')}`);
+        const d = early.dialog;
+        const asked = d ? [d.title, ...d.body.slice(0, 3).map((l) => l.text)].join(' ') : early.text.split('\n').filter(Boolean).slice(-6).join(' / ');
+        throw new Refused(409, `Claude asked something before it started, so it was closed: ${clip(asked, 400)}`);
       }
     }
     return { id: s?.sessionId ?? null, tmux: r.tmux, cwd: r.dir, ...(s ? {} : { pending: 'not up yet: its id comes with the started event' }) };
