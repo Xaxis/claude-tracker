@@ -6,8 +6,8 @@ import path from 'node:path';
 
 process.env.CLAUDE_TRACKER_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'ct-slack-unit-'));
 test.after(() => fs.rmSync(process.env.CLAUDE_TRACKER_DIR, { recursive: true, force: true }));
-const { toMrkdwn, split, fromSlack, escape } = await import('../src/slack.js');
-const { screenOptions, screenDialog, inputBox, parseKeys, readEntry, toolSummary } = await import('../src/panes.js');
+const { toMrkdwn, split, fromSlack, escape, readMessage } = await import('../src/slack.js');
+const { screenOptions, screenDialog, inputBox, parseKeys, readEntry, toolSummary, resolveDir } = await import('../src/panes.js');
 const { toolsLine, parseControl } = await import('../src/bridge.js');
 
 /* Screens as Claude Code 2.1.312 drew them, captured from a real session. */
@@ -212,5 +212,55 @@ test('what was typed in Slack comes back as typed', () => {
   assert.equal(fromSlack('see <https://x.co/a?b=1&amp;c=2|x.co/a?b=1&amp;c=2> &lt;div&gt; 5 &gt; 3'), 'see https://x.co/a?b=1&c=2 <div> 5 > 3');
   assert.equal(fromSlack('<mailto:a@b.co|a@b.co> in <#C1|general> for <@U1> <!here>'), 'a@b.co in #general for @U1 @here');
   assert.equal(fromSlack('<https://plain.example>'), 'https://plain.example');
+  // A folder name Slack made a link of is the folder name, not a web address.
+  assert.equal(fromSlack('new <http://overlook.technology|overlook.technology>'), 'new overlook.technology');
   assert.equal(escape('<&>'), '&lt;&amp;&gt;');
+});
+
+// What the Claude connector posts for the owner, as Slack keeps it (2026-11-26).
+const footer = { type: 'context', block_id: 'mcp_attribution_footer', elements: [{ type: 'mrkdwn', text: '*Sent using* Claude', verbatim: false }] };
+const rich = (...elements) => ({ type: 'rich_text', block_id: 'b1', elements: [{ type: 'rich_text_section', elements }] });
+
+test('a message sent through an app reads as written: no footer, and the app named', () => {
+  assert.deepEqual(readMessage({ text: ';keys 1 *Sent using* Claude', blocks: [rich({ type: 'text', text: ';keys 1' }), footer] }), { text: ';keys 1', via: 'Claude' });
+  assert.deepEqual(readMessage({ text: 'new `/mnt/x` *Sent using* Claude', blocks: [rich({ type: 'text', text: 'new ' }, { type: 'text', text: '/mnt/x', style: { code: true } }), footer] }),
+    { text: 'new `/mnt/x`', via: 'Claude' });
+  // With no blocks, the footer still comes off the text.
+  assert.deepEqual(readMessage({ text: 'help *Sent using* Claude' }), { text: 'help', via: 'Claude' });
+  assert.deepEqual(readMessage({ text: 'plain &amp; simple' }), { text: 'plain & simple', via: null });
+});
+
+test('rich text: links as typed or as meant, people, emoji, lists, quotes and code blocks', () => {
+  const ev = { blocks: [{ type: 'rich_text', elements: [
+    { type: 'rich_text_section', elements: [
+      { type: 'text', text: 'see ' }, { type: 'link', url: 'http://overlook.technology', text: 'overlook.technology' },
+      { type: 'text', text: ' and ' }, { type: 'link', url: 'https://x.co/a?b=1', text: 'the docs' },
+      { type: 'text', text: ' for ' }, { type: 'user', user_id: 'U1' }, { type: 'text', text: ' ' }, { type: 'emoji', name: 'tada', unicode: '1f389' },
+      { type: 'text', text: '\n' },
+    ] },
+    { type: 'rich_text_list', style: 'bullet', indent: 0, elements: [
+      { type: 'rich_text_section', elements: [{ type: 'text', text: 'one' }] },
+      { type: 'rich_text_section', elements: [{ type: 'text', text: 'two' }] },
+    ] },
+    { type: 'rich_text_quote', elements: [{ type: 'text', text: 'quoted' }] },
+    { type: 'rich_text_preformatted', elements: [{ type: 'text', text: 'a < b\nc' }] },
+  ] }] };
+  assert.equal(readMessage(ev).text, 'see overlook.technology and https://x.co/a?b=1 for @U1 🎉\n- one\n- two\n> quoted\n```\na < b\nc\n```');
+});
+
+test('a bare folder name is found where projects are kept; a path is taken as it is', () => {
+  const base = fs.mkdtempSync(path.join(os.homedir(), '.ct-resolve-'));
+  try {
+    fs.mkdirSync(path.join(base, 'a', 'site.example'), { recursive: true });
+    fs.mkdirSync(path.join(base, 'a', 'here'), { recursive: true });
+    fs.mkdirSync(path.join(base, 'b', 'both'), { recursive: true });
+    fs.mkdirSync(path.join(base, 'a', 'both'), { recursive: true });
+    const work = [path.join(base, 'a', 'here'), path.join(base, 'b', 'x')];
+    assert.equal(resolveDir('site.example', work), path.join(base, 'a', 'site.example'));
+    assert.equal(resolveDir(path.join(base, 'a', 'here'), []), path.join(base, 'a', 'here'));
+    assert.throws(() => resolveDir('both', work), /in more than one place/);
+    assert.throws(() => resolveDir('no-such-folder-here', work), /no folder called no-such-folder-here/);
+  } finally {
+    fs.rmSync(base, { recursive: true, force: true });
+  }
 });

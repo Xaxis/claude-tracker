@@ -135,6 +135,16 @@ test('a reply in the thread is typed into the session, and its answer comes back
   assert.ok(!blocksText(reply).includes('at the terminal'), 'not echoed back as if typed at the terminal');
 });
 
+test('a message sent through the Claude connector is typed as written, and its answer says so', { skip: !hasTmux, timeout: 30_000 }, async () => {
+  const footer = { type: 'context', block_id: 'mcp_attribution_footer', elements: [{ type: 'mrkdwn', text: '*Sent using* Claude' }] };
+  slack.message({ channel: 'C1', user: 'U1', app_id: 'A1', text: 'check <http://site.example|site.example> *Sent using* Claude', thread_ts: one.root.ts,
+    blocks: [{ type: 'rich_text', elements: [{ type: 'rich_text_section', elements: [{ type: 'text', text: 'check ' }, { type: 'link', url: 'http://site.example', text: 'site.example' }] }] }, footer] });
+  await until('the prompt, without the footer', () => prompts(one.s.transcript).includes('check site.example'));
+  const reply = await until('the answer', () => inThread(one.root.ts).find((p) => /echo: check site\.example/.test(p.text)));
+  assert.match(reply.blocks[0].elements[0].text, /worked \d+s · asked via Claude/);
+  assert.ok(!prompts(one.s.transcript).some((p) => /Sent using/.test(p)));
+});
+
 test('what is typed at the terminal shows in the thread', { skip: !hasTmux, timeout: 30_000 }, async () => {
   tmux('send-keys', '-t', 'alpha', '-l', 'from the keyboard');
   tmux('send-keys', '-t', 'alpha', 'Enter');

@@ -300,16 +300,77 @@ export function split(text, max = 3500) {
   return parts;
 }
 
+/**
+ * Did Slack make a link of something typed as plain text? It puts http:// in
+ * front of a bare name like `overlook.technology` and shows it as typed: what
+ * was typed is what was meant. A link with its own scheme was pasted as one.
+ */
+const linkedAsTyped = (url, label) => !!label && !/^[a-z]+:/i.test(label)
+  && String(url).replace(/\/$/, '').toLowerCase() === `http://${label}`.replace(/\/$/, '').toLowerCase();
+
 /** What someone typed in Slack, as they typed it: links, names and escapes undone. */
 export function fromSlack(text) {
   return String(text ?? '')
     .replace(/<#[A-Z0-9]+\|([^>]*)>/g, '#$1')
     .replace(/<!(here|channel|everyone)[^>]*>/g, '@$1')
     .replace(/<@([A-Z0-9]+)(?:\|[^>]*)?>/g, '@$1')
-    // A pasted link comes back as <url|what was shown>: the url is what was meant.
-    .replace(/<([^<>|]+)\|([^<>]*)>/g, (_, target, label) => (/^https?:/.test(target) ? target : label))
+    // A pasted link comes back as <url|what was shown>: the url is what was meant,
+    // unless Slack made the link itself out of what was typed.
+    .replace(/<([^<>|]+)\|([^<>]*)>/g, (_, target, label) => (/^https?:/.test(target) && !linkedAsTyped(target, label) ? target : label))
     .replace(/<(?:mailto:|tel:)?([^<>]+)>/g, '$1')
     .replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&');
+}
+
+/** A rich-text block's words: code spans keep their backticks, as they were typed. */
+function richText(block) {
+  const piece = (e) => {
+    switch (e.type) {
+      case 'text': return e.style?.code ? `\`${e.text ?? ''}\`` : e.text ?? '';
+      case 'link': return e.text && (linkedAsTyped(e.url, e.text) || !/^https?:/i.test(e.url ?? '')) ? e.text : e.url ?? e.text ?? '';
+      case 'user': return `@${e.user_id}`;
+      case 'usergroup': return `@${e.usergroup_id}`;
+      case 'channel': return `#${e.channel_id}`;
+      case 'broadcast': return `@${e.range}`;
+      case 'emoji': try { return e.unicode ? String.fromCodePoint(...e.unicode.split('-').map((h) => parseInt(h, 16))) : `:${e.name}:`; } catch { return `:${e.name}:`; }
+      default: return e.text ?? e.fallback ?? '';
+    }
+  };
+  const run = (els) => (els ?? []).map(piece).join('');
+  const parts = [];
+  for (const s of block.elements ?? []) {
+    if (s.type === 'rich_text_section') parts.push(run(s.elements));
+    else if (s.type === 'rich_text_preformatted') parts.push(`\`\`\`\n${(s.elements ?? []).map((e) => e.text ?? e.url ?? '').join('').replace(/\n$/, '')}\n\`\`\``);
+    else if (s.type === 'rich_text_quote') parts.push(run(s.elements).replace(/\n$/, '').split('\n').map((l) => `> ${l}`).join('\n'));
+    else if (s.type === 'rich_text_list') {
+      parts.push((s.elements ?? []).map((item, i) => `${'  '.repeat(s.indent ?? 0)}${s.style === 'ordered' ? `${(s.offset ?? 0) + i + 1}.` : '-'} ${run(item.elements)}`).join('\n'));
+    }
+  }
+  return parts.map((p) => p.replace(/\n$/, '')).join('\n');
+}
+
+/** The "Sent using Claude" that an app posting as the person adds below what they wrote. */
+const FOOTER = /\s*\*?Sent using\*?\s+([^\n*]+?)\s*$/;
+
+/**
+ * A message as its author wrote it, and the app it was sent through, if any.
+ * Read from its rich-text block, which holds exactly what was written - no
+ * links Slack added, no footer - and from its text when it has none.
+ */
+export function readMessage(ev) {
+  const blocks = Array.isArray(ev?.blocks) ? ev.blocks : [];
+  let via = null;
+  for (const b of blocks) {
+    if (b.type !== 'context') continue;
+    const said = (b.elements ?? []).map((e) => e.text ?? '').join(' ');
+    const m = said.match(/^\s*\*?Sent using\*?\s+(.+?)\s*$/);
+    if (m || b.block_id === 'mcp_attribution_footer') via = (m?.[1] ?? 'an app').replace(/[*_~`]/g, '').trim();
+  }
+  const rich = blocks.filter((b) => b.type === 'rich_text');
+  if (rich.length) return { text: rich.map(richText).join('\n'), via };
+  let text = fromSlack(ev?.text);
+  const m = text.match(FOOTER);
+  if (m) { text = text.slice(0, m.index); via ??= m[1].trim(); }
+  return { text, via };
 }
 
 /* --- the app ---------------------------------------------------------------- */

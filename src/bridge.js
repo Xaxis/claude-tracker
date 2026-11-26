@@ -3,7 +3,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { DATA_DIR, ensureDataDir } from './paths.js';
 import { db, getMeta, setMeta } from './db.js';
-import { call, queue, socketMode, toMrkdwn, split, fromSlack, escape, FATAL } from './slack.js';
+import { call, queue, socketMode, toMrkdwn, split, readMessage, escape, FATAL } from './slack.js';
 
 /**
  * Claude Code sessions in Slack: one thread per session, in one channel.
@@ -458,11 +458,11 @@ export function startBridge({ info = () => null, usage = () => '', here = 'this 
   /** A grey line in a session's thread: something that happened, not something said. */
   const meta = (x, text, priority = 1) => post(x.thread.channel, x.thread.ts, plain(text), { blocks: [context(text)] }, priority);
 
-  /** Was this prompt typed from Slack? Then it is already in the thread. */
+  /** Was this prompt typed from Slack? Then it is already in the thread: what was sent, from where. */
   function fromHere(x, text) {
-    const i = x.sent.findIndex((m) => m.norm === norm(text));
-    if (i >= 0) x.sent.splice(i, 1);
-    return i >= 0;
+    const m = x.sent.find((s) => s.norm === norm(text));
+    if (m) x.sent = x.sent.filter((s) => s !== m && !(m.ts && s.ts === m.ts));
+    return m ?? null;
   }
 
   /**
@@ -486,7 +486,7 @@ export function startBridge({ info = () => null, usage = () => '', here = 'this 
           if (x.work?.texts.length || x.work?.tools.length) await flush(x);
           if (it.command) { x.command = { text: it.text, at: Date.now(), mine: fromHere(x, it.text) }; continue; }
           const mine = fromHere(x, it.text);
-          x.work = { at: it.at ?? Date.now(), prompt: it.text, terminal: !mine, asked: mine ? x.asked : null, texts: [], tools: [] };
+          x.work = { at: it.at ?? Date.now(), prompt: it.text, terminal: !mine, asked: mine, texts: [], tools: [] };
         } else if (it.kind === 'text') {
           x.work ??= { at: it.at ?? Date.now(), texts: [], tools: [] };
           for (const t of x.work.texts) if (!t.posted && t.text.length >= LONG && !quiet) { await saying(x, t); t.posted = true; }
@@ -548,7 +548,7 @@ export function startBridge({ info = () => null, usage = () => '', here = 'this 
     const did = toolsLine(w.tools).replace(/^:hammer_and_wrench: /, '');
     const lines = [
       w.terminal && w.prompt && `:keyboard: at the terminal: “${escape(clip(w.prompt, 300))}”`,
-      `${ping}${w.interrupted ? ':octagonal_sign: interrupted after' : ':hammer_and_wrench: worked'} ${ago(took)}${did ? ` · ${did}` : ''}`,
+      `${ping}${w.interrupted ? ':octagonal_sign: interrupted after' : ':hammer_and_wrench: worked'} ${ago(took)}${w.asked?.via ? ` · asked via ${escape(w.asked.via)}` : ''}${did ? ` · ${did}` : ''}`,
       ...texts.slice(0, -1).slice(-4).map((t) => `› ${escape(clip(t.text, 160))}`),
     ].filter(Boolean);
     const body = answer ? sections(`${answer.error ? ':warning: ' : ''}${answer.text}`) : [];
@@ -655,14 +655,18 @@ export function startBridge({ info = () => null, usage = () => '', here = 'this 
     return out;
   }
 
-  /** Type into a session from here: kept so it is not echoed back, and a prompt it answers says so. */
-  async function typeIn(x, typed, files = []) {
+  /**
+   * Type into a session from here: kept so it is not echoed back, and a
+   * prompt it answers says so. `from` is the Slack message it came from, and
+   * the app it was sent through.
+   */
+  async function typeIn(x, typed, files = [], from = {}) {
     if (x.s.status === 'waiting' && x.alert) x.alert.pending = 'Esc, then your reply';
-    x.sent.push({ norm: norm(typed), at: Date.now() });
+    x.sent.push({ norm: norm(typed), at: Date.now(), ...from });
     x.sent = x.sent.filter((m) => Date.now() - m.at < 15 * 60_000).slice(-20);
     try {
       const r = await act(x, { op: 'type', sessionId: x.s.sessionId, text: typed, files });
-      if (r.typed && norm(r.typed) !== norm(typed)) x.sent.push({ norm: norm(r.typed), at: Date.now() });
+      if (r.typed && norm(r.typed) !== norm(typed)) x.sent.push({ norm: norm(r.typed), at: Date.now(), ...from });
       if (r.dismissed && x.alert?.pending) answered(x, x.alert.pending);
       return r;
     } catch (err) {
@@ -681,7 +685,8 @@ export function startBridge({ info = () => null, usage = () => '', here = 'this 
   /** A reply in a session's thread: typed in, or a `;` command. */
   async function reply(x, ev) {
     const t = x.thread;
-    const text = fromSlack(ev.text).trim();
+    const { text: written, via } = readMessage(ev);
+    const text = written.trim();
     const say = (m, priority = 0) => post(t.channel, t.ts, m, {}, priority);
     const ctl = parseControl(text);
     const fail = (err) => { react(ev.channel, ev.ts, 'x'); return say(`:x: ${escape(err.message)}`); };
@@ -696,7 +701,7 @@ export function startBridge({ info = () => null, usage = () => '', here = 'this 
           return react(ev.channel, ev.ts, 'octagonal_sign');
         }
         if (cmd === 'keys' || cmd === 'key') {
-          const r = await act(x, { op: 'keys', sessionId: x.s.sessionId, keys: rest.split(/\s+/).filter(Boolean) });
+          const r = await act(x, { op: 'keys', sessionId: x.s.sessionId, keys: rest.replace(/`/g, '').split(/\s+/).filter(Boolean) });
           react(ev.channel, ev.ts, 'white_check_mark');
           return showScreen(x, r);
         }
@@ -704,8 +709,7 @@ export function startBridge({ info = () => null, usage = () => '', here = 'this 
       const typed = ctl ? `/${ctl[0]}${ctl[1] ? ` ${ctl[1]}` : ''}` : text;
       const files = await filesOf(ev);
       if (!typed && !files.length) return;
-      const r = await typeIn(x, typed, files);
-      x.asked = { at: Date.now(), ts: ev.ts };
+      const r = await typeIn(x, typed, files, { ts: ev.ts, channel: ev.channel, via });
       react(ev.channel, ev.ts, r.sent === false ? 'warning' : 'white_check_mark');
       const notes = [
         r.cleared && `cleared what was in its input box first: “${escape(clip(r.cleared, 300))}”`,
@@ -732,7 +736,7 @@ export function startBridge({ info = () => null, usage = () => '', here = 'this 
   /* --- commands outside threads ------------------------------------------ */
 
   async function command(ev) {
-    const text = fromSlack(ev.text).trim().replace(/^<@[A-Z0-9]+>\s*/, '');
+    const text = readMessage(ev).text.trim().replace(/^@[A-Z0-9]+\s+/, '');
     const [word, ...rest] = text.split(/\s+/);
     const say = (m, extra) => post(ev.channel, ev.thread_ts ?? ev.ts, m, extra, 0);
     switch ((word ?? '').toLowerCase()) {
@@ -763,6 +767,8 @@ export function startBridge({ info = () => null, usage = () => '', here = 'this 
   }
 
   async function launch(ev, args, say) {
+    // A folder written as code, or quoted, is the folder.
+    args = args.replace(/^([`'"])([^\s`'"]+)\1(?=\s|$)/, '$2');
     const m = args.match(/^(?:([^\s:/~]+):)?(\S+)\s*([\s\S]*)$/);
     if (!m) return say('Say where: `new ~/Projects/app` or `new app fix the login bug`.');
     let machine = '';

@@ -1,5 +1,6 @@
 import { execFile } from 'node:child_process';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { db } from './db.js';
 import { DATA_DIR, discoverProfiles, ensureDataDir, HOME } from './paths.js';
@@ -397,6 +398,44 @@ export function parseKeys(words) {
   return out;
 }
 
+const isDir = (p) => { try { return fs.statSync(p).isDirectory(); } catch { return false; } };
+const real = (p) => { try { return fs.realpathSync(p); } catch { return p; } };
+const tildeOf = (p) => (p === HOME || p.startsWith(`${HOME}/`) ? `~${p.slice(HOME.length)}` : p);
+
+/**
+ * The folder a launch names. A path is taken as it is, from home when it is
+ * relative; a bare name is looked for in the folders projects are kept in -
+ * ~/Projects and its like, and where the sessions running here work - and
+ * then in home. A name found in two places says so, rather than guess.
+ */
+export function resolveDir(dir, workDirs = []) {
+  const d = String(dir).trim().replace(/^~(?=$|\/)/, HOME);
+  if (!d) throw new Error('say which folder');
+  if (path.isAbsolute(d)) return path.resolve(d);
+  const roots = [];
+  if (!d.includes('/')) {
+    // Where sessions here work first, the most used first: that is the path
+    // they know their projects by, even when ~/Projects is a link to it.
+    const used = new Map();
+    for (const w of workDirs) {
+      const parent = w && path.dirname(w);
+      if (parent && parent !== HOME && parent !== '/' && !parent.startsWith(os.tmpdir())) used.set(parent, (used.get(parent) ?? 0) + 1);
+    }
+    roots.push(...[...used].sort((a, b) => b[1] - a[1]).map(([r]) => r));
+    roots.push(...['Projects', 'projects', 'Code', 'code', 'src', 'dev', 'work', 'repos'].map((n) => path.join(HOME, n)));
+  }
+  const found = new Map();   // real path -> as found
+  for (const r of roots) {
+    const p = path.join(r, d);
+    if (isDir(p) && !found.has(real(p))) found.set(real(p), p);
+  }
+  if (found.size > 1) throw new Error(`there is a ${dir} in more than one place: ${[...found.values()].map(tildeOf).join(', ')} - say which`);
+  if (found.size === 1) return [...found.values()][0];
+  const inHome = path.join(HOME, d);
+  if (isDir(inHome)) return inHome;
+  throw new Error(roots.length ? `no folder called ${dir} in ${[...new Set(roots.filter(isDir).map(tildeOf))].join(', ') || '~'}, or in ~` : `${tildeOf(inHome)} does not exist`);
+}
+
 export function startPanes({ onSessions = () => {}, onItems = () => {} } = {}) {
   const live = new Map();       // pid -> session as last seen
   const reads = new Map();      // session id -> { path, offset, partial, state }
@@ -686,7 +725,7 @@ export function startPanes({ onSessions = () => {}, onItems = () => {} } = {}) {
    * the shell sets up for `claude` applies. A prompt is typed once it is ready.
    */
   async function launch({ dir, prompt, command = process.env.CLAUDE_TRACKER_LAUNCH || 'claude' }) {
-    const full = path.resolve(String(dir).replace(/^~(?=$|\/)/, HOME));
+    const full = resolveDir(dir, [...live.values()].map((s) => s.cwd));
     let st;
     try { st = fs.statSync(full); } catch { throw new Error(`${dir} does not exist`); }
     if (!st.isDirectory()) throw new Error(`${dir} is not a directory`);
