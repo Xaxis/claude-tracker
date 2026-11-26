@@ -24,6 +24,8 @@ const KEEP_MS = 7 * 24 * 3600e3;
 // Minutes idle, each said once a stretch (a test says sooner).
 const IDLE_AT = (process.env.CLAUDE_TRACKER_DIRECTOR_IDLE ?? '10,60').split(',').map(Number).filter((n) => n > 0);
 const CONTEXT_AT = [70, 85];      // percent of the way to auto-compact, each said once
+// How often idle stretches and context use are looked at: each look works out every session's account and context.
+const WATCH_MS = Math.min(30_000, Math.max(1000, (Math.min(...IDLE_AT) * 60_000) / 4));
 const BODY_MAX = 256 * 1024;
 const LAUNCH_WAIT_MS = 30_000;
 
@@ -267,7 +269,7 @@ export function startDirector({ hands, log = () => {} }) {
       // Compacted or cleared: it can fill again, and be said again.
       v.level = pct < 50 ? 0 : Math.max(level, v.level);
     }
-  }, 5_000);
+  }, WATCH_MS);
   watch.unref?.();
 
   /* --- turns, from the transcript ---------------------------------------------- */
