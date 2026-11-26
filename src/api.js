@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { db } from './db.js';
-import { discoverProfiles, HOME, tildify, REPO_DIR } from './paths.js';
+import { discoverProfiles, HOME, tildify, REPO_DIR, registryEntry } from './paths.js';
 import { accountLabel, listAccounts, currentAccount, profileAccount, accountResolver } from './accounts.js';
 import { capacityFor } from './calibrate.js';
 import { LIMIT_TYPES, currentWindow, burnRate, recentWindows, sumBetween } from './windows.js';
@@ -396,9 +396,8 @@ function runningEntries() {
     try { names = fs.readdirSync(profile.sessionsDir); } catch { continue; }
     for (const n of names) {
       if (!n.endsWith('.json')) continue;
-      let s;
-      try { s = JSON.parse(fs.readFileSync(path.join(profile.sessionsDir, n), 'utf8')); } catch { continue; }
-      if (!s.sessionId) continue;
+      const s = registryEntry(path.join(profile.sessionsDir, n));
+      if (!s?.sessionId) continue;
       // The registry keeps entries for exited processes; drop anything whose pid is gone.
       try { process.kill(s.pid, 0); } catch { continue; }
       const prev = byPid.get(s.pid);

@@ -42,12 +42,17 @@ for (const d of [path.join(prof, 'projects'), path.join(prof, 'sessions'), data]
 fs.writeFileSync(path.join(prof, 'settings.json'), '{}');
 fs.writeFileSync(path.join(home, '.claude.json'), JSON.stringify({ oauthAccount: { accountUuid: 'box-acct', emailAddress: 'box@example.com' } }));
 // What the director starts: the fake, with a new session id each time, in the folder it was started in.
+// ps, failing while this file is there: as a ps that times out on a loaded box.
+const psFails = path.join(home, 'ps-fails');
+const shims = path.join(root, 'shims');
+fs.mkdirSync(shims, { recursive: true });
+fs.writeFileSync(path.join(shims, 'ps'), `#!/bin/sh\n[ -e '${psFails}' ] && exit 2\nexec '${spawnSync('sh', ['-c', 'command -v ps'], { encoding: 'utf8' }).stdout.trim()}' "$@"\n`, { mode: 0o755 });
 const LAUNCH = `'${process.execPath}' '${FAKE}' '${prof}' "$('${process.execPath}' -p 'crypto.randomUUID()')" "$PWD"`;
 
 let slack, proc, log = '';
 const t = {};
 const env = () => ({
-  ...env0, HOME: home, CLAUDE_TRACKER_DIR: data, CLAUDE_TRACKER_NOTIFY: '0', NO_COLOR: '1',
+  ...env0, PATH: `${shims}:${env0.PATH}`, HOME: home, CLAUDE_TRACKER_DIR: data, CLAUDE_TRACKER_NOTIFY: '0', NO_COLOR: '1',
   CLAUDE_TRACKER_SLACK_API: slack.api, CLAUDE_TRACKER_PANES_MS: '250', CLAUDE_TRACKER_LAUNCH: LAUNCH,
   CLAUDE_TRACKER_DIRECTOR_IDLE: '0.05',
   BOX_GPU_DIR: path.join(home, 'box-gpu'), BOX_HEAVY_DIR: path.join(home, 'box-heavy'), BOX_GPU_STATE: path.join(home, 'gpu-state'),
@@ -192,6 +197,26 @@ test('keys by name, a slash command, and the Ctrl-C it never sends', { skip: !ha
   const r = await ok('POST', `/sessions/${t.id}/keys`, { keys: ['shift-tab'] });
   assert.match(r.screen, /accept edits on/);
   assert.equal(tmux('display', '-p', '-t', 'beta-dir', '#{pane_current_command}').stdout.trim(), 'node', 'still running: no Ctrl-C');
+});
+
+test('a session that cannot be read for a moment has not ended, and is still the director\'s', { skip: !hasTmux, timeout: 60_000 }, async () => {
+  const before = (await events()).at(-1).seq;
+  // Its registry entry caught mid-rewrite, for a few looks.
+  const dir = path.join(prof, 'sessions');
+  const file = fs.readdirSync(dir).map((n) => path.join(dir, n)).find((f) => f.endsWith('.json') && fs.readFileSync(f, 'utf8').includes(t.id));
+  const text = fs.readFileSync(file, 'utf8');
+  fs.writeFileSync(file, '');
+  await sleep(1500);
+  fs.writeFileSync(`${file}.tmp`, text);
+  fs.renameSync(`${file}.tmp`, file);
+  // ps failing, for a few looks.
+  fs.writeFileSync(psFails, '');
+  await sleep(1500);
+  fs.unlinkSync(psFails);
+  await sleep(1000);
+  const since = (await ok('GET', `/events?after=${before}`)).events.filter((e) => e.session === t.id);
+  assert.deepEqual(since.filter((e) => e.kind === 'exited' || e.kind === 'started'), [], 'it never left');
+  assert.equal((await ok('GET', `/sessions/${t.id}`)).owner, 'director');
 });
 
 test('context nearly full is said at 70%, and again at 85%', { skip: !hasTmux, timeout: 90_000 }, async () => {

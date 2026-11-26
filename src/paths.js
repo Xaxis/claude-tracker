@@ -2,6 +2,25 @@ import os from 'node:os';
 import path from 'node:path';
 import fs from 'node:fs';
 
+/**
+ * A session's entry in a Claude Code registry. Its file is rewritten as the
+ * session changes, and a read can land between the truncate and the write:
+ * until it reads whole again, what that file last said stands, as a session
+ * caught mid-rewrite has not ended.
+ */
+const lastEntry = new Map();
+export function registryEntry(file) {
+  let s;
+  try { s = JSON.parse(fs.readFileSync(file, 'utf8')); } catch (err) {
+    if (err.code === 'ENOENT') { lastEntry.delete(file); return null; }
+    return lastEntry.get(file) ?? null;
+  }
+  lastEntry.delete(file);
+  lastEntry.set(file, s);
+  if (lastEntry.size > 2000) lastEntry.delete(lastEntry.keys().next().value);
+  return s;
+}
+
 export const HOME = os.homedir();
 // Profiles are resolved through symlinks, so home must be too if it is to match them.
 const REAL_HOME = (() => { try { return fs.realpathSync(HOME); } catch { return HOME; } })();

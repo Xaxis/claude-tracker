@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { db } from './db.js';
-import { DATA_DIR, discoverProfiles, ensureDataDir, HOME } from './paths.js';
+import { DATA_DIR, discoverProfiles, ensureDataDir, HOME, registryEntry } from './paths.js';
 
 /**
  * The Claude Code sessions running in tmux panes on this machine: what each one
@@ -34,7 +34,6 @@ const CATCH_UP_BYTES = 4 * 1024 * 1024;
 const CATCH_UP_ITEMS = 8;
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-const readJson = (f) => { try { return JSON.parse(fs.readFileSync(f, 'utf8')); } catch { return null; } };
 
 function exec(cmd, args, { input, timeout = 5000 } = {}) {
   return new Promise((resolve, reject) => {
@@ -58,7 +57,9 @@ async function tmuxSocket(pid) {
     env = fs.readFileSync(`${PROC()}/${pid}/environ`, 'utf8').replace(/\0/g, '\n');
   } catch {
     // No /proc (a Mac): ps prints a process's environment after its command.
-    try { env = await exec('ps', ['eww', '-o', 'command=', '-p', String(pid)]); } catch { /* gone */ }
+    try { env = await exec('ps', ['eww', '-o', 'command=', '-p', String(pid)]); } catch (err) {
+      if (err.code !== 1) throw err;   // 1: gone; anything else, ps could not say
+    }
   }
   const sock = env.match(/(?:^|\s)TMUX=([^,\s]+),/m)?.[1] ?? null;
   if (socketCache.size > 500) socketCache.clear();
@@ -72,7 +73,10 @@ async function processes(pids) {
   if (!pids.length) return out;
   let text = '';
   try { text = await exec('ps', ['-o', 'pid=,pgid=,tpgid=,tty=,args=', '-p', pids.join(',')]); } catch (err) {
-    text = err.stdout ?? '';  // ps exits 1 when one of them has gone
+    // ps exits 1 when one of them has gone. Timed out on a loaded box, or failed, it has said nothing about any of
+    // them: the look is skipped, rather than every session taken to have ended.
+    if (err.code !== 1) throw err;
+    text = err.stdout ?? '';
   }
   for (const line of text.split('\n')) {
     const m = line.trim().match(/^(\d+)\s+(\d+)\s+(-?\d+)\s+(\S+)\s+(.*)$/);
@@ -90,7 +94,10 @@ async function panesOf(socket) {
   try {
     text = await tmux(socket, ['list-panes', '-a', '-F',
       '#{pane_id}\t#{pane_tty}\t#{session_name}\t#{window_index}\t#{pane_index}\t#{pane_current_command}']);
-  } catch { return out; }
+  } catch (err) {
+    if (err.killed || err.signal) throw err;   // timed out: it has not said there are none
+    return out;                                 // no server there
+  }
   for (const line of text.split('\n')) {
     const [id, tty, session, win, pane, command] = line.split('\t');
     if (id) out.set(id, { id, tty: tty.replace(/^\/dev\//, ''), session, target: `${session}:${win}.${pane}`, command });
@@ -116,7 +123,7 @@ function registered() {
     try { names = fs.readdirSync(profile.sessionsDir); } catch { continue; }
     for (const n of names) {
       if (!n.endsWith('.json')) continue;
-      const s = readJson(path.join(profile.sessionsDir, n));
+      const s = registryEntry(path.join(profile.sessionsDir, n));
       if (!s?.sessionId || !s.pid) continue;
       try { process.kill(s.pid, 0); } catch (err) { if (err.code !== 'EPERM') continue; }
       // A copied profile carries a copy of the registry; the newest entry is the live one.
