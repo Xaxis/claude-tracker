@@ -54,7 +54,7 @@ const HELP = [
   '• `;esc` interrupts what it is doing. `;screen` shows its terminal. `;keys 2`, `;keys down enter`, `;keys shift-tab` press keys.',
   '• *More…* on a thread\'s first message: compact, switch model, change permission mode, show context, mute, or start over.',
   '• `;mute` stops showing what it writes here (it still tells you when it needs you); `;unmute` starts again.',
-  '• Writing while it waits on a prompt answers the prompt with Esc - no - and sends what you wrote instead. The buttons pick a choice.',
+  '• While it waits on a prompt, what you write is held, not typed: the buttons, or `;1` `;2` …, pick a choice and `;esc` says no - then what was held goes in. `;drop` throws away what is held.',
   '• Files you attach are saved on its machine, and their paths are added to the message.',
   '*Anywhere in this channel, or a DM with me*',
   '• `list` - every session, with a link to its thread.',
@@ -174,7 +174,7 @@ export function startBridge({ info = () => null, usage = () => '', here = 'this 
     const head = `*${escape(name)}*${s.title ? `  ·  ${escape(s.title)}` : ''}`;
     let state;
     if (x.ended) state = `${EMOJI.ended} ended`;
-    else if (s.status === 'waiting') state = `${EMOJI.waiting} *waiting on you* · ${escape(s.waitingFor ?? 'input')}`;
+    else if (s.status === 'waiting') state = `${EMOJI.waiting} *waiting on you* · ${escape(s.waitingFor ?? 'input')}${x.held?.length ? ` · ${x.held.length} message${x.held.length === 1 ? '' : 's'} held` : ''}`;
     else if (s.status === 'busy') {
       // What it is doing, as it does it: the last thing it said and did.
       const since = x.work?.at ?? s.statusAt;
@@ -420,7 +420,7 @@ export function startBridge({ info = () => null, usage = () => '', here = 'this 
       if (!x) {
         // A /clear starts a new conversation in the same process; it keeps the thread.
         const before = gone.find((g) => g.s.pid === s.pid && g.s.sessionId !== s.sessionId && !list.some((l) => l.sessionId === g.s.sessionId));
-        x = { key, machine, s, chain: Promise.resolve(), sent: [], muted: false };
+        x = { key, machine, s, chain: Promise.resolve(), sent: [], held: [], muted: false };
         live.set(key, x);
         if (before?.thread) {
           live.delete(before.key);
@@ -439,6 +439,7 @@ export function startBridge({ info = () => null, usage = () => '', here = 'this 
         await ensureThread(x);
         if (s.status === 'waiting' && (prev.status !== 'waiting' || prev.waitingFor !== s.waitingFor || !x.alert)) soonWaiting(x);
         else if (s.status !== 'waiting' && x.alert) answered(x);
+        if (s.status !== 'waiting' && x.held.length) await deliver(x);
         // Idle, or idle with shells left running: the turn is over. A prompt only
         // pauses it - what was said before it is posted with the prompt.
         if (prev.status !== s.status && over(s.status) && x.work) soonFlush(x);
@@ -450,7 +451,13 @@ export function startBridge({ info = () => null, usage = () => '', here = 'this 
       if (seen.has(x.key) || !live.has(x.key)) continue;
       x.ended = true;
       try { q.end.run(Date.now(), x.s.sessionId); } catch { /* fine */ }
-      if (ready()) chain(x, async () => { if (x.alert) answered(x); refreshCard(x, true); });
+      if (ready()) {
+        chain(x, async () => {
+          if (x.alert) answered(x);
+          if (x.held.length) await meta(x, `:wastebasket: it ended with ${x.held.length} message${x.held.length === 1 ? '' : 's'} held, not sent`, 0);
+          refreshCard(x, true);
+        });
+      }
       live.delete(x.key);
     }
   }
@@ -580,20 +587,39 @@ export function startBridge({ info = () => null, usage = () => '', here = 'this 
     x.waitTimer.unref?.();
   }
 
-  /** The session waits on a prompt: the question, a button per choice, and a mention. */
-  async function waiting(x) {
+  /** The prompt on a session's screen, read once its dialog has drawn. */
+  async function promptScreen(x) {
     // Some dialogs take a moment to draw after Claude Code says one is open.
     let screen = null;
     for (let i = 0; i < 3 && !screen?.dialog; i++) {
       if (i) await new Promise((r) => setTimeout(r, 700));
       try { screen = (await act(x, { op: 'screen', sessionId: x.s.sessionId })).screen; } catch { /* shown without it */ }
     }
+    return screen;
+  }
+
+  /** What answers a prompt, as words to reply with: for whoever cannot press a button. */
+  const answers = (opts) => [...opts.map((o, n) => `\`;${n + 1}\` ${escape(o.label)}`), '`;esc` no'].join(' · ');
+
+  /** The session waits on a prompt: the question, a button per choice, and a mention. */
+  async function waiting(x) {
+    const screen = await promptScreen(x);
+    const name = x.s.tmux ?? x.s.name ?? 'A session';
+    const d = screen?.dialog;
+    // Claude Code's own word for it - permission prompt, input needed - only when the dialog has no title.
+    const head = `:raising_hand: ${mention()} *${escape(name)} needs you*${d ? '' : ` · ${escape(x.s.waitingFor ?? 'input')}`}`;
+    const { title, blocks } = promptBlocks(x, screen, head);
+    const r = await post(x.thread.channel, x.thread.ts, `${mention()} ${name} needs you: ${title}`, { blocks }, 0);
+    x.alert = { ts: r.ts, waitingFor: x.s.waitingFor, title };
+    refreshOverview();
+  }
+
+  /** A prompt as blocks: the question, what it is about, and a button and a reply for each choice. */
+  function promptBlocks(x, screen, head) {
     const opts = (screen?.options ?? []).slice(0, 9);
     const d = screen?.dialog;
     const title = d?.title ?? x.s.waitingFor ?? 'input';
-    const name = x.s.tmux ?? x.s.name ?? 'A session';
-    // Claude Code's own word for it - permission prompt, input needed - only when the dialog has no title.
-    const blocks = [{ type: 'section', text: { type: 'mrkdwn', text: `:raising_hand: ${mention()} *${escape(name)} needs you*${d ? '' : ` · ${escape(x.s.waitingFor ?? 'input')}`}` } }];
+    const blocks = [{ type: 'section', text: { type: 'mrkdwn', text: head } }];
     if (d) {
       // Lines between dashed rules - the command or file it is about - read as code.
       const parts = [];
@@ -611,10 +637,45 @@ export function startBridge({ info = () => null, usage = () => '', here = 'this 
         ...opts.map((o, n) => button(`${n + 1}. ${o.label}`, 'ct:keys', x, o.keys.map((k) => k.toLowerCase()), n === 0 ? 'primary' : null, { a: 1, l: `${n + 1}. ${o.label}` })),
         button('Esc', 'ct:keys', x, ['esc'], null, { a: 1, l: 'Esc' }), button('Full screen', 'ct:screen', x),
       ].slice(0, 25) });
+      blocks.push(context(`or reply ${answers(opts)}`));
     }
-    const r = await post(x.thread.channel, x.thread.ts, `${mention()} ${name} needs you: ${title}`, { blocks }, 0);
-    x.alert = { ts: r.ts, waitingFor: x.s.waitingFor, title };
-    refreshOverview();
+    return { title, blocks };
+  }
+
+  /**
+   * A message that came while a prompt is open: held, not typed - typing it
+   * would answer the prompt - and the prompt shown again with what answers it.
+   * What is held goes in, in order, once the prompt is answered.
+   */
+  async function hold(x, h) {
+    x.held.push(h);
+    react(h.from.channel, h.from.ts, 'raised_hand');
+    refreshCard(x, true);
+    // The prompt went while this was on its way: it goes in now.
+    if (x.s.status !== 'waiting') { chain(x, () => deliver(x)); return; }
+    if (x.alert?.heldNote) return;
+    const screen = await promptScreen(x);
+    const { blocks } = promptBlocks(x, screen, `:raised_hand: *Held, not typed:* ${escape(nameOf(x.s))} is waiting on this. Once it is answered, what you wrote goes in. \`;drop\` throws it away.`);
+    await post(x.thread.channel, x.thread.ts, `Held until ${nameOf(x.s)}'s prompt is answered`, { blocks }, 0);
+    if (x.alert) x.alert.heldNote = true;
+  }
+
+  /** The prompt is gone: what was held goes in, in the order it came. */
+  async function deliver(x) {
+    while (x.held.length && x.s.status !== 'waiting') {
+      const h = x.held[0];
+      let r;
+      try { r = await typeIn(x, h.typed, h.files, h.from); } catch (err) {
+        x.held.shift();
+        react(h.from.channel, h.from.ts, 'x');
+        await meta(x, `:x: a held message was not typed: ${escape(err.message)}`, 0);
+        continue;
+      }
+      if (r.waiting) return;   // another prompt came first: it waits on that one
+      x.held.shift();
+      await delivered(x, h.from, r);
+    }
+    refreshCard(x, true);
   }
 
   /**
@@ -661,18 +722,49 @@ export function startBridge({ info = () => null, usage = () => '', here = 'this 
    * the app it was sent through.
    */
   async function typeIn(x, typed, files = [], from = {}) {
-    if (x.s.status === 'waiting' && x.alert) x.alert.pending = 'Esc, then your reply';
     x.sent.push({ norm: norm(typed), at: Date.now(), ...from });
     x.sent = x.sent.filter((m) => Date.now() - m.at < 15 * 60_000).slice(-20);
-    try {
-      const r = await act(x, { op: 'type', sessionId: x.s.sessionId, text: typed, files });
-      if (r.typed && norm(r.typed) !== norm(typed)) x.sent.push({ norm: norm(r.typed), at: Date.now(), ...from });
-      if (r.dismissed && x.alert?.pending) answered(x, x.alert.pending);
-      return r;
-    } catch (err) {
-      if (x.alert) delete x.alert.pending;
+    const r = await act(x, { op: 'type', sessionId: x.s.sessionId, text: typed, files });
+    if (r.typed && norm(r.typed) !== norm(typed)) x.sent.push({ norm: norm(r.typed), at: Date.now(), ...from });
+    return r;
+  }
+
+  /** Typed in: said so on the message, with anything worth knowing about how it went. */
+  async function delivered(x, from, r) {
+    react(from.channel, from.ts, r.sent === false ? 'warning' : 'white_check_mark');
+    const notes = [
+      r.cleared && `cleared what was in its input box first: “${escape(clip(r.cleared, 300))}”`,
+      ...(r.skipped ?? []).map((f) => `${escape(f.name)} not attached: ${escape(f.skipped)}`),
+      r.sent === false && 'typed, but it does not look sent - `;screen` to see',
+    ].filter(Boolean);
+    if (notes.length) await meta(x, notes.join('\n'), 0);
+  }
+
+  /**
+   * Keys pressed from a reply. On an open prompt, the alert says what was
+   * chosen - at once for a choice, or once the prompt goes for keys that may
+   * only move about in it.
+   */
+  async function press(x, keys, label, via, choice = false) {
+    const shown = via ? `${label} (via ${via})` : label;
+    const onAlert = x.s.status === 'waiting' && x.alert;
+    if (onAlert) x.alert.pending = shown;
+    let r;
+    try { r = await act(x, { op: 'keys', sessionId: x.s.sessionId, keys }); } catch (err) {
+      if (onAlert && x.alert) delete x.alert.pending;
       throw err;
     }
+    if (choice && onAlert && x.alert?.pending === shown) answered(x, shown);
+    return r;
+  }
+
+  /** `;2`: the second choice on the prompt open now. */
+  async function choose(x, n, ev, via) {
+    const opts = (await act(x, { op: 'screen', sessionId: x.s.sessionId })).screen?.options ?? [];
+    const o = opts[n - 1];
+    if (!o) throw new Error(opts.length ? `its prompt has ${opts.length} choices: ${opts.map((c, i) => `;${i + 1} ${c.label}`).join(', ')}` : 'it is not asking anything now - `;screen` shows its screen');
+    await press(x, o.keys.map((k) => k.toLowerCase()), `${n}. ${o.label}`, via, true);
+    react(ev.channel, ev.ts, 'white_check_mark');
   }
 
   function setMuted(x, on) {
@@ -691,17 +783,26 @@ export function startBridge({ info = () => null, usage = () => '', here = 'this 
     const ctl = parseControl(text);
     const fail = (err) => { react(ev.channel, ev.ts, 'x'); return say(`:x: ${escape(err.message)}`); };
     try {
+      const pick = text.match(/^;\s*([1-9])$/);
+      if (pick) return await choose(x, Number(pick[1]), ev, via);
       if (ctl) {
         const [cmd, rest] = ctl;
         if (cmd === 'help') return say(HELP);
         if (cmd === 'mute' || cmd === 'unmute') return setMuted(x, cmd === 'mute');
         if (cmd === 'screen' || cmd === 's') return showScreen(x, await act(x, { op: 'screen', sessionId: x.s.sessionId }));
+        if (cmd === 'drop') {
+          const n = x.held.length;
+          x.held = [];
+          refreshCard(x, true);
+          return meta(x, n ? `:wastebasket: threw away ${n} held message${n === 1 ? '' : 's'}` : 'nothing is held', 0);
+        }
         if (cmd === 'esc' || cmd === 'stop' || cmd === 'interrupt') {
-          await act(x, { op: 'keys', sessionId: x.s.sessionId, keys: ['esc'] });
+          await press(x, ['esc'], 'Esc', via, true);
           return react(ev.channel, ev.ts, 'octagonal_sign');
         }
         if (cmd === 'keys' || cmd === 'key') {
-          const r = await act(x, { op: 'keys', sessionId: x.s.sessionId, keys: rest.replace(/`/g, '').split(/\s+/).filter(Boolean) });
+          const keys = rest.replace(/`/g, '').split(/\s+/).filter(Boolean);
+          const r = await press(x, keys, `keys ${keys.join(' ')}`, via);
           react(ev.channel, ev.ts, 'white_check_mark');
           return showScreen(x, r);
         }
@@ -709,14 +810,12 @@ export function startBridge({ info = () => null, usage = () => '', here = 'this 
       const typed = ctl ? `/${ctl[0]}${ctl[1] ? ` ${ctl[1]}` : ''}` : text;
       const files = await filesOf(ev);
       if (!typed && !files.length) return;
-      const r = await typeIn(x, typed, files, { ts: ev.ts, channel: ev.channel, via });
-      react(ev.channel, ev.ts, r.sent === false ? 'warning' : 'white_check_mark');
-      const notes = [
-        r.cleared && `cleared what was in its input box first: “${escape(clip(r.cleared, 300))}”`,
-        ...(r.skipped ?? []).map((f) => `${escape(f.name)} not attached: ${escape(f.skipped)}`),
-        r.sent === false && 'typed, but it does not look sent - `;screen` to see',
-      ].filter(Boolean);
-      if (notes.length) await meta(x, notes.join('\n'), 0);
+      const from = { ts: ev.ts, channel: ev.channel, via };
+      // Behind an open prompt, or behind messages held for one, it waits too.
+      if (x.s.controllable && (x.s.status === 'waiting' || x.held.length)) return await hold(x, { typed, files, from });
+      const r = await typeIn(x, typed, files, from);
+      if (r.waiting) return await hold(x, { typed, files, from });
+      await delivered(x, from, r);
     } catch (err) {
       await fail(err);
     }

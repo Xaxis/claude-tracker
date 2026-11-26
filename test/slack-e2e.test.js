@@ -197,13 +197,40 @@ test('a permission prompt: the screen and a button per choice, with a mention, a
   assert.match(blocksText(after), /ran `ls`/, 'what it did before the prompt is part of the turn');
 });
 
-test('writing while a prompt is open answers it with Esc, then sends what was written', { skip: !hasTmux, timeout: 30_000 }, async () => {
+test('writing while a prompt is open is held, not typed, until a choice answers it', { skip: !hasTmux, timeout: 40_000 }, async () => {
   slack.message({ channel: 'C1', user: 'U1', text: 'ASK once more', thread_ts: one.root.ts });
   const second = await until('the second alert', () => inThread(one.root.ts).filter((p) => /needs you/.test(blocksText(p)))[1]);
+  assert.match(blocksText(second), /or reply `;1` Yes · `;2` No · `;esc` no/, 'the choices, as words to reply with');
   slack.message({ channel: 'C1', user: 'U1', text: 'no - do it differently', thread_ts: one.root.ts });
-  await until('the new instruction', () => prompts(one.s.transcript).includes('no - do it differently'));
-  assert.ok(replies(one.s.transcript).includes('denied'));
-  await until('the alert to say how it was answered', () => /you chose Esc, then your reply$/.test(slack.messages.get(second.ts)?.text ?? ''));
+  const held = await until('the held note', () => inThread(one.root.ts).find((p) => /Held, not typed/.test(blocksText(p))));
+  assert.match(blocksText(held), /Do you want to proceed\?/, 'with the prompt it waits on');
+  assert.ok(reacted('raised_hand'));
+  await until('the card to say so', () => /1 message held/.test(blocksText(slack.messages.get(one.root.ts))));
+  await sleep(1500);
+  assert.ok(!prompts(one.s.transcript).includes('no - do it differently'), 'not typed while the prompt is open');
+  assert.ok(!replies(one.s.transcript).includes('denied'), 'and the prompt not answered by it');
+  slack.message({ channel: 'C1', user: 'U1', text: ';2', thread_ts: one.root.ts });
+  await until('the prompt to be answered no', () => replies(one.s.transcript).at(-1) === 'denied');
+  await until('the alert to say what was chosen', () => /you chose 2\. No$/.test(slack.messages.get(second.ts)?.text ?? ''));
+  await until('what was held to go in after', () => prompts(one.s.transcript).includes('no - do it differently'));
+});
+
+test('a prompt answered through the connector says so; `;drop` throws away what is held', { skip: !hasTmux, timeout: 40_000 }, async () => {
+  const footer = { type: 'context', block_id: 'mcp_attribution_footer', elements: [{ type: 'mrkdwn', text: '*Sent using* Claude' }] };
+  const count = () => inThread(one.root.ts).filter((p) => /needs you/.test(blocksText(p))).length;
+  const n = count();
+  slack.message({ channel: 'C1', user: 'U1', text: 'ASK a third time', thread_ts: one.root.ts });
+  const alert = await until('the third alert', () => count() > n && inThread(one.root.ts).filter((p) => /needs you/.test(blocksText(p))).at(-1));
+  slack.message({ channel: 'C1', user: 'U1', text: 'never mind this', thread_ts: one.root.ts });
+  await until('it to be held', () => /1 message held/.test(blocksText(slack.messages.get(one.root.ts))));
+  slack.message({ channel: 'C1', user: 'U1', text: ';drop', thread_ts: one.root.ts });
+  await until('the drop said', () => inThread(one.root.ts).find((p) => /threw away 1 held message/.test(p.text)));
+  slack.message({ channel: 'C1', user: 'U1', app_id: 'A1', text: ';keys 1 *Sent using* Claude', thread_ts: one.root.ts,
+    blocks: [{ type: 'rich_text', elements: [{ type: 'rich_text_section', elements: [{ type: 'text', text: ';1' }] }] }, footer] });
+  await until('the prompt to be answered yes', () => replies(one.s.transcript).at(-1) === 'approved');
+  await until('the alert to say who chose', () => /you chose 1\. Yes \(via Claude\)$/.test(slack.messages.get(alert.ts)?.text ?? ''));
+  await sleep(1500);
+  assert.ok(!prompts(one.s.transcript).includes('never mind this'), 'what was dropped is never typed');
 });
 
 test('`;` runs slash commands, `;screen` shows the terminal, and Ctrl-C is never sent', { skip: !hasTmux, timeout: 30_000 }, async () => {

@@ -692,16 +692,9 @@ export function startPanes({ onSessions = () => {}, onItems = () => {} } = {}) {
   async function type(s, text) {
     text = String(text).replace(/\r\n?/g, '\n').replace(/\t/g, '    ').replace(/\n+$/, '');
     if (!text.trim()) throw new Error('nothing to type');
-    let dismissed = null;
-    if (s.status === 'waiting') {
-      // A reply while a prompt is open answers it the way Esc does - no, or
-      // never mind - and then says what to do instead.
-      dismissed = s.waitingFor;
-      await send(s, ['Escape']);
-      await sleep(600);
-      s = await check(s.sessionId);
-      if (s.status === 'waiting') throw new Error(`it is still waiting (${s.waitingFor}) - answer with the buttons, or ;keys`);
-    }
+    // A prompt is answered on purpose - a choice, or Esc - and never by a
+    // message that happens to arrive while it is open: that is left unsent.
+    if (s.status === 'waiting') return { waiting: s.waitingFor ?? 'input', sent: false };
     const cleared = await clearInput(s);
     s = await check(s.sessionId);
     if (text.includes('\n')) {
@@ -717,7 +710,7 @@ export function startPanes({ onSessions = () => {}, onItems = () => {} } = {}) {
     await send(s, ['Enter']);
     await sleep(400);
     const after = inputBox(await capture(s, true).catch(() => ''));
-    return { cleared, dismissed, sent: !after?.text };
+    return { cleared, sent: !after?.text };
   }
 
   /**
