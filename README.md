@@ -565,11 +565,14 @@ from there.
   - `GET /sessions` lists every session in tmux on this machine, with its state,
     any open prompt and its choices, context use, account, owner and Slack
     thread. It also says whether the director is paused.
-  - `POST /sessions` `{ cwd, prompt?, model?, name? }` starts Claude in a new
-    tmux session, as `new` does in Slack.
+  - `POST /sessions` `{ cwd, prompt?, model?, name?, account? }` starts Claude
+    in a new tmux session, as `new` does in Slack. If Claude stops on a question
+    before it starts, such as a folder to trust, the session is closed and the
+    request refused with the question.
   - `POST /sessions/:id/type`, `/keys` (`{ keys: ["2"] }` or `{ choice: 2 }`),
     `/command` (`compact`, `clear`, or `model` with an `arg`) and `/stop`. Stop
-    types `/exit` and never sends Ctrl-C.
+    types `/exit` and never sends Ctrl-C. A session the director started has
+    its tmux session closed once Claude has exited.
   - `GET /sessions/:id/screen` returns the terminal.
   - `GET /sessions/:id/turns?after=n` returns its turns, numbered from the start
     of its transcript: what was asked, what it did and what it answered.
@@ -588,6 +591,17 @@ from there.
   tries until `director resume`. Handing it a session and resuming it take a post
   of your own. A post made through an app, such as the Claude connector, can do
   neither.
+- **Its own subscription.** `~/.claude/tracker/director.json` can name
+  accounts for it: `{ "accounts": { "<name>": { "env": "<file>", "profile":
+  "~/.claude-<name>" } } }`. Once any are named, every session it starts names
+  one of them.
+  - Claude runs in that account's own Claude Code profile, signed in by the
+    `CLAUDE_CODE_OAUTH_TOKEN` in the env file. Only that variable is passed on,
+    in a file the shell reads and deletes; it is never typed or shown.
+  - Failover never touches that profile.
+  - A start is refused, saying what to do, until the token is there, the profile
+    has been run once (`CLAUDE_CONFIG_DIR=<profile> claude`, to pick a theme)
+    and the folder is trusted in it.
 - **A Director thread** in the channel carries its brief, and the decisions it
   needs from you with a button for each choice. A tap, a `;1` reply or a message
   there goes back to it as an event.

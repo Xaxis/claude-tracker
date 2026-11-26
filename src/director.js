@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
-import { DATA_DIR, ensureDataDir } from './paths.js';
+import { DATA_DIR, HOME, ensureDataDir } from './paths.js';
 import { db, getMeta, setMeta } from './db.js';
 import { readEntry, parseKeys } from './panes.js';
 
@@ -20,6 +20,13 @@ import { readEntry, parseKeys } from './panes.js';
  */
 
 export const KEY_FILE = path.join(DATA_DIR, 'director.key');
+/**
+ * The accounts it may start sessions on, if any: each a Claude subscription
+ * of its own, never the owner's. `{ "accounts": { "<name>": { "env": file
+ * holding CLAUDE_CODE_OAUTH_TOKEN=…, "profile": its own Claude Code profile
+ * folder } } }`. Once any is named, every session it starts says which.
+ */
+export const CONFIG_FILE = path.join(DATA_DIR, 'director.json');
 const KEEP_MS = 7 * 24 * 3600e3;
 // Minutes idle, each said once a stretch (a test says sooner).
 const IDLE_AT = (process.env.CLAUDE_TRACKER_DIRECTOR_IDLE ?? '10,60').split(',').map(Number).filter((n) => n > 0);
@@ -46,6 +53,28 @@ export function directorKey() {
   fs.writeFileSync(tmp, `${k}\n`, { mode: 0o600 });
   fs.renameSync(tmp, KEY_FILE);
   return k;
+}
+
+const expand = (p) => path.resolve(String(p).replace(/^~(?=\/|$)/, HOME));
+const tilde = (p) => (p.startsWith(`${HOME}/`) ? `~${p.slice(HOME.length)}` : p);
+const readJson = (f) => { try { return JSON.parse(fs.readFileSync(f, 'utf8')); } catch { return null; } };
+const accountsOf = () => readJson(CONFIG_FILE)?.accounts ?? {};
+
+/** The profiles its accounts run in: never failed over, as they hold no sign-in of the owner's. */
+export function directorProfiles() {
+  return Object.values(accountsOf()).map((a) => a?.profile && expand(a.profile)).filter(Boolean);
+}
+
+/** The token in an env file: `CLAUDE_CODE_OAUTH_TOKEN=…`, maybe exported, maybe quoted. */
+function tokenIn(file) {
+  let text;
+  try { text = fs.readFileSync(file, 'utf8'); } catch { return null; }
+  for (const line of text.split('\n')) {
+    const m = line.match(/^\s*(?:export\s+)?CLAUDE_CODE_OAUTH_TOKEN\s*=\s*(.*?)\s*$/);
+    const v = m?.[1].replace(/^(['"])(.*)\1$/, '$2');
+    if (v) return v;
+  }
+  return null;
 }
 
 class Refused extends Error {
@@ -187,6 +216,7 @@ export function startDirector({ hands, log = () => {} }) {
     for (const v of gone) {
       seen.delete(v.s.sessionId);
       clearTimeout(v.waitTimer); clearTimeout(v.doneTimer);
+      if (v.closeOnExit) hands.act({ op: 'close', ...v.closeOnExit }).catch((err) => log(`director: ${v.s.tmux}: ${err.message}`));
       q.take.run(v.s.sessionId);
       emit(v.s.sessionId, 'exited');
     }
@@ -363,6 +393,34 @@ export function startDirector({ hands, log = () => {} }) {
     return fn();
   }
 
+  /**
+   * What a session on one of its accounts starts with: the account's own
+   * profile and token. Refused, saying what to do, until both are ready - a
+   * first start would stop on Claude Code's own questions, unseen.
+   */
+  function accountEnv(name, dir) {
+    const accounts = accountsOf();
+    const names = Object.keys(accounts);
+    if (name == null) {
+      if (names.length) throw new Refused(400, `account: say which - ${names.join(', ')}`);
+      return null;
+    }
+    const a = accounts[String(name)];
+    if (!a) throw new Refused(400, names.length ? `account: one of ${names.join(', ')}` : `account: none is set up in ${tilde(CONFIG_FILE)}`);
+    if (!a.env || !a.profile) throw new Refused(409, `account ${name} needs an env file and a profile in ${tilde(CONFIG_FILE)}`);
+    const envFile = expand(a.env), profile = expand(a.profile);
+    const token = tokenIn(envFile);
+    if (!token) throw new Refused(409, `account ${name} has no token yet: CLAUDE_CODE_OAUTH_TOKEN in ${tilde(envFile)}`);
+    if (!/^[\w.~+/=-]+$/.test(token)) throw new Refused(409, `the token in ${tilde(envFile)} does not look like one`);
+    const cfg = readJson(path.join(profile, '.claude.json'));
+    const setUp = `run \`CLAUDE_CONFIG_DIR=${tilde(profile)} claude\` once in your projects folder, with its token set, to choose a theme and trust the folder`;
+    if (!cfg?.hasCompletedOnboarding) throw new Refused(409, `${tilde(profile)} is not set up yet: ${setUp}`);
+    // Trusting a folder trusts what is in it.
+    const trusted = Object.entries(cfg.projects ?? {}).some(([p, v]) => v?.hasTrustDialogAccepted && (dir === p || dir.startsWith(`${p}/`)));
+    if (!trusted) throw new Refused(409, `${tilde(dir)} is not trusted in ${tilde(profile)}: ${setUp}`);
+    return { CLAUDE_CONFIG_DIR: profile, CLAUDE_CODE_OAUTH_TOKEN: token };
+  }
+
   async function launch(body) {
     if (paused()) throw new Refused(409, 'the owner paused the director from Slack');
     if (!bridge?.directorReady()) throw new Refused(409, 'Slack is not set up here, and nothing the director does may go unseen');
@@ -372,14 +430,25 @@ export function startDirector({ hands, log = () => {} }) {
     const model = body.model == null ? null : str(body.model, 'model', 64);
     if (model && !/^[A-Za-z0-9._[\]-]+$/.test(model)) throw new Refused(400, 'model: a model name, such as opus or claude-opus-5-5');
     const prompt = body.prompt == null ? null : str(body.prompt, 'prompt', BODY_MAX);
+    const env = accountEnv(body.account ?? null, path.resolve(cwd.replace(/^~(?=\/|$)/, HOME)));
     let r;
-    try { r = await hands.act({ op: 'launch', dir: cwd, name, model }); } catch (err) { throw new Refused(400, err.message); }
+    try { r = await hands.act({ op: 'launch', dir: cwd, name, model, env }); } catch (err) { throw new Refused(400, err.message); }
     const found = new Promise((resolve) => {
       launches.set(r.pane, { prompt: prompt?.trim() ? prompt : null, found: resolve, at: Date.now() });
       setTimeout(() => resolve(null), LAUNCH_WAIT_MS).unref?.();
     });
     setTimeout(() => launches.delete(r.pane), 15 * 60_000).unref?.();
     const s = await found;
+    if (!s) {
+      // Stopped on a question before it starts - a folder to trust, a first run: said, and the pane closed, rather than left waiting unseen.
+      let early = null;
+      try { early = (await hands.act({ op: 'early', pane: r.pane, socket: r.socket })).screen; } catch { /* gone, or not Claude */ }
+      if (early?.options?.length) {
+        launches.delete(r.pane);
+        await hands.act({ op: 'close', pane: r.pane, socket: r.socket, force: true }).catch(() => {});
+        throw new Refused(409, `Claude asked something before it started, so it was closed: ${early.dialog?.title ?? early.text.split('\n').filter(Boolean).slice(-6).join(' / ')}`);
+      }
+    }
     return { id: s?.sessionId ?? null, tmux: r.tmux, cwd: r.dir, ...(s ? {} : { pending: 'not up yet: its id comes with the started event' }) };
   }
 
@@ -493,7 +562,17 @@ export function startDirector({ hands, log = () => {} }) {
         if (arg.length > 2000) throw new Refused(400, 'arg: too long');
         return write(id, () => bridge.directorType(id, `/${name}${arg ? ` ${arg}` : ''}`, 'ran'));
       }
-      if (postReq && op === 'stop') return write(id, () => bridge.directorType(id, '/exit', 'stopped it with'));
+      if (postReq && op === 'stop') {
+        return write(id, async () => {
+          // One it started goes with its tmux session, once Claude has exited - which can be before this hears back.
+          const v = seen.get(id);
+          if (v && q.own.get(id)?.how === 'started') v.closeOnExit = { pane: s.pane, socket: s.socket };
+          try { return await bridge.directorType(id, '/exit', 'stopped it with'); } catch (err) {
+            if (v) v.closeOnExit = null;
+            throw err;
+          }
+        });
+      }
     }
     if (a === 'events' && !id && get) {
       const after = Math.max(0, Number(url.searchParams.get('after') ?? 0) || 0);

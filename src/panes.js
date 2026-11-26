@@ -1,4 +1,5 @@
 import { execFile } from 'node:child_process';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -97,6 +98,7 @@ async function panesOf(socket) {
   return out;
 }
 
+const SHELLS = new Set(['bash', 'zsh', 'sh', 'dash', 'fish', 'ksh', 'tcsh', 'csh']);
 const isPrint = (args) => / (-p|--print)( |$)/.test(` ${args} `);
 
 // Looking for profiles walks the home directory; once a tick is too often.
@@ -448,6 +450,7 @@ export function startPanes({ onSessions = () => {}, onItems = () => {} } = {}) {
   const live = new Map();       // pid -> session as last seen
   const reads = new Map();      // session id -> { path, offset, partial, state }
   const launched = new Map();   // pane id -> { prompt, at }: to type once Claude is up there
+  const made = new Map();       // pane id -> when this made it: only those may be closed with Claude still in them
   const unseen = new Set();     // sessions first seen before they had a transcript
   const watching = Date.now();
   let placedAt = 0, placing = null, places = new Map();
@@ -725,9 +728,11 @@ export function startPanes({ onSessions = () => {}, onItems = () => {} } = {}) {
    * Start Claude in a new tmux session in `dir`, through a shell, so whatever
    * the shell sets up for `claude` applies. A prompt is typed once it is ready.
    */
-  async function launch({ dir, prompt, name: wanted = null, model = null, command = process.env.CLAUDE_TRACKER_LAUNCH || 'claude' }) {
+  async function launch({ dir, prompt, name: wanted = null, model = null, env = null, command = process.env.CLAUDE_TRACKER_LAUNCH || 'claude' }) {
     // Typed into a shell: a model is a bare name, nothing else.
     if (model != null && !/^[A-Za-z0-9._[\]-]{1,64}$/.test(model)) throw new Error(`${model} is not a model name`);
+    let typed = model ? `${command} --model ${model}` : command;
+    if (env && Object.keys(env).length) typed = withEnv(env, typed);
     const full = resolveDir(dir, [...live.values()].map((s) => s.cwd));
     let st;
     try { st = fs.statSync(full); } catch { throw new Error(`${dir} does not exist`); }
@@ -741,10 +746,49 @@ export function startPanes({ onSessions = () => {}, onItems = () => {} } = {}) {
     for (let i = 2; names.has(name); i++) name = `${base}-${i}`;
     const pane = (await tmux(socket, ['new-session', '-d', '-s', name, '-c', full, '-P', '-F', '#{pane_id}'])).trim();
     await sleep(300);
-    await tmux(socket, ['send-keys', '-t', pane, '-l', '--', model ? `${command} --model ${model}` : command]);
+    await tmux(socket, ['send-keys', '-t', pane, '-l', '--', typed]);
     await tmux(socket, ['send-keys', '-t', pane, 'Enter']);
     if (prompt?.trim()) launched.set(pane, { prompt, at: Date.now() });
+    made.set(pane, Date.now());
+    for (const [p, at] of made) if (Date.now() - at > 15 * 60_000) made.delete(p);
     return { tmux: name, pane, socket, dir: full };
+  }
+
+  /**
+   * A command run with variables only it gets - a sign-in token, say - that
+   * are never typed, shown or put on a command line. They go in a file only
+   * this user can read; the shell reads it into a subshell and deletes it.
+   */
+  function withEnv(env, typed) {
+    for (const [k, v] of Object.entries(env)) {
+      if (!/^[A-Z_][A-Z0-9_]*$/.test(k) || /['\n\0]/.test(String(v))) throw new Error(`${k} can't be passed on`);
+    }
+    const dir = path.join(ensureDataDir(), 'launch-env');
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+    // Any a shell never got to read: gone after two minutes.
+    for (const f of fs.readdirSync(dir)) {
+      try { if (Date.now() - fs.statSync(path.join(dir, f)).mtimeMs > 120_000) fs.unlinkSync(path.join(dir, f)); } catch { /* gone */ }
+    }
+    const file = path.join(dir, `${crypto.randomBytes(8).toString('hex')}.env`);
+    if (file.includes("'")) throw new Error('the data folder\'s path has a quote in it');
+    fs.writeFileSync(file, Object.entries(env).map(([k, v]) => `export ${k}='${v}'\n`).join(''), { mode: 0o600 });
+    return `(. '${file}'; rm -f '${file}'; ${typed})`;
+  }
+
+  /**
+   * Close a tmux session Claude has exited from: only when its one pane is
+   * back at a shell, so nothing running there is ended with it.
+   */
+  async function closeSession({ pane, socket, force = false }) {
+    const p = (await panesOf(socket)).get(pane);
+    if (!p) return { closed: false };
+    // Claude still in it, stopped on a first question: only in a pane this just made, before it began.
+    const fresh = force && made.has(pane) && ![...live.values()].some((s) => s.pane === pane);
+    if (!SHELLS.has(p.command) && !fresh) throw new Error(`left open: ${p.command} is running in it`);
+    const panes = [...(await panesOf(socket)).values()].filter((x) => x.session === p.session);
+    if (panes.length > 1) throw new Error('left open: its tmux session has other panes');
+    await tmux(socket, ['kill-session', '-t', `=${p.session}`]);
+    return { closed: true };
   }
 
   /** A pane Claude was just launched in, before it has registered: its screen, or keys for its first dialog. */
@@ -771,6 +815,7 @@ export function startPanes({ onSessions = () => {}, onItems = () => {} } = {}) {
     /** Do something to a session (or a just-launched pane); resolves to what happened. */
     async act(op) {
       if (op.op === 'launch') return launch(op);
+      if (op.op === 'close') return closeSession(op);
       if (op.op === 'early') {
         const text = (await earlyPane(op, op.keys ? parseKeys(op.keys) : null)).replace(/[ \t]+$/gm, '').trimEnd();
         return { screen: { text, options: screenOptions(text), dialog: screenDialog(text) } };

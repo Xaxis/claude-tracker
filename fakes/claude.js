@@ -171,5 +171,9 @@ process.stdin.on('data', (d) => {
 });
 process.on('SIGTERM', () => { cleanup(); process.exit(0); });
 process.stdout.write('\x1b[?2004h');   // bracketed paste on, as Claude Code turns it on
+// Started with a sign-in token in its environment: says what it got, for a test to check.
+if (process.env.CLAUDE_CODE_OAUTH_TOKEN) {
+  fs.writeFileSync(path.join(profile, `env-${sessionId}.json`), JSON.stringify({ token: process.env.CLAUDE_CODE_OAUTH_TOKEN, configDir: process.env.CLAUDE_CONFIG_DIR ?? null }));
+}
 register();
 draw();

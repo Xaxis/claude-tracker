@@ -105,6 +105,26 @@ test('a profile running low switches to the spare with the most room, and every 
   assert.equal(out.lockGone, true);
 });
 
+test('a director\'s profile, on a subscription of its own, is never failed over', () => {
+  const root = scratch();
+  const out = inChild(root, `${SETUP}
+    // Signed into A as far as its config says - the worst case - and running low.
+    const bot = path.join(HOME, '.claude-bot');
+    fs.mkdirSync(path.join(bot, 'projects'), { recursive: true });
+    fs.writeFileSync(path.join(bot, 'settings.json'), '{}');
+    fs.writeFileSync(path.join(bot, '.claude.json'), JSON.stringify({ oauthAccount: account('A', 'a@x.com') }));
+    running(bot, 'bot-1');
+    reading('A', 'five_hour', 95, now + 3 * HOUR);
+    F.setFailover({ mode: 'auto', at: 90 });
+    const before = F.plan(api.overview(), api.liveSessions()).entries.map((e) => e.profile);
+    fs.writeFileSync(path.join(process.env.CLAUDE_TRACKER_DIR, 'director.json'), JSON.stringify({ accounts: { bot: { env: path.join(HOME, 'bot.env'), profile: '~/.claude-bot' } } }));
+    const after = F.plan(api.overview(), api.liveSessions()).entries.map((e) => e.profile);
+    return { before, after };
+  `);
+  assert.ok(out.before.includes('~/.claude-bot'), JSON.stringify(out.before));
+  assert.deepEqual(out.after, ['~/.claude']);
+});
+
 test('nothing switches while failover is off, below the threshold, or when the account frees up within the wait', () => {
   const root = scratch();
   const out = inChild(root, `${SETUP}

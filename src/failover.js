@@ -7,6 +7,7 @@ import { discoverProfiles, tildify, HOME, configFileOf } from './paths.js';
 import { profileAccount } from './accounts.js';
 import { readSignin, writeSignin, switchSignin, withStorageLock, signinHealth } from './signin.js';
 import { machine } from './replica.js';
+import { directorProfiles } from './director.js';
 
 /**
  * Failing over: when the account a profile is signed into runs low, sign the
@@ -224,10 +225,12 @@ export function plan(ov, live, settings = failoverSettings(), now = Date.now(), 
     working.set(s.profileDir, (working.get(s.profileDir) ?? 0) + 1);
   }
   const entries = [];
+  // A director's profile runs on its own subscription, by a token it is given: never moved onto the owner's.
+  const director = new Set(directorProfiles().map((d) => { try { return fs.realpathSync(d); } catch { return d; } }));
   for (const [dir, sessions] of working) {
     const profile = profiles.find((p) => p.dir === dir);
     const signed = profile && profileAccount(profile);
-    if (!signed) continue;
+    if (!signed || director.has(dir)) continue;
     const a = accounts.get(signed.accountUuid);
     // The profile's own sessions, when they have said anything since it was signed in; else the account's numbers.
     const own = ownState(dir, signedSince(dir, signed.accountUuid), now);

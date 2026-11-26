@@ -309,9 +309,42 @@ test('events: a long poll that wakes on the next one, idle, and seq that survive
 
 test('stop ends it with /exit, and it is gone', { skip: !hasTmux, timeout: 60_000 }, async () => {
   await ok('POST', `/sessions/${t.id}/stop`);
-  await until('Claude to exit', () => tmux('display', '-p', '-t', 'beta-dir', '#{pane_current_command}').stdout.trim() !== 'node');
   await event('exited', (e) => e.kind === 'exited' && e.session === t.id);
+  // One it started goes with its tmux session; the owner's keep theirs.
+  await until('its tmux session closed', () => tmux('has-session', '-t', '=beta-dir').status !== 0);
+  assert.equal(tmux('has-session', '-t', '=alpha').status, 0);
   assert.match(inThread(t.thread).map(blocksText).join('\n'), /the director\* stopped it with `\/exit`/);
   assert.equal((await api('POST', `/sessions/${t.id}/type`, { text: 'x' })).status, 404);
   assert.ok(!/director/.test(log.replace(/director\.key/g, '')), `nothing went wrong: ${log}`);
+});
+
+test('on an account of its own: refused until its token, profile and folder are ready, and the token reaches Claude alone', { skip: !hasTmux, timeout: 60_000 }, async () => {
+  const envFile = path.join(home, 'bot.env');
+  const profile = path.join(home, '.claude-bot');
+  fs.writeFileSync(path.join(data, 'director.json'), JSON.stringify({ accounts: { bot: { env: envFile, profile } } }));
+  const cwd = path.join(home, 'work', 'gamma');
+  fs.mkdirSync(cwd, { recursive: true });
+  const refused = async (body, status, why) => {
+    const r = await api('POST', '/sessions', { cwd, ...body });
+    assert.equal(r.status, status, JSON.stringify(r.body));
+    assert.match(r.body.error, why);
+  };
+  await refused({}, 400, /say which - bot/);
+  await refused({ account: 'owner' }, 400, /one of bot/);
+  await refused({ account: 'bot' }, 409, /no token yet/);
+  fs.writeFileSync(envFile, 'DATABASE_URL=postgres://secret\nexport CLAUDE_CODE_OAUTH_TOKEN="sk-ant-oat01-TEST_token-123"\n', { mode: 0o600 });
+  await refused({ account: 'bot' }, 409, /not set up yet/);
+  fs.mkdirSync(profile, { recursive: true });
+  fs.writeFileSync(path.join(profile, '.claude.json'), JSON.stringify({ hasCompletedOnboarding: true, projects: {} }));
+  await refused({ account: 'bot' }, 409, /not trusted/);
+  fs.writeFileSync(path.join(profile, '.claude.json'), JSON.stringify({ hasCompletedOnboarding: true, projects: { [path.join(home, 'work')]: { hasTrustDialogAccepted: true } } }));
+  const r = await ok('POST', '/sessions', { cwd, account: 'bot', name: 'gamma-bot', prompt: 'hello from its own account' });
+  const got = await until('what the session got', () => { try { return JSON.parse(fs.readFileSync(path.join(prof, `env-${r.id}.json`), 'utf8')); } catch { return null; } });
+  assert.deepEqual(got, { token: 'sk-ant-oat01-TEST_token-123', configDir: profile });
+  assert.deepEqual(fs.readdirSync(path.join(data, 'launch-env')), [], 'the file it came in is gone');
+  await until('its first message', () => prompts(transcriptOf(cwd, r.id)).includes('hello from its own account'));
+  const shown = tmux('capture-pane', '-p', '-S', '-2000', '-t', '=gamma-bot').stdout;
+  assert.ok(!shown.includes('TEST_token') && !shown.includes('postgres'), 'nothing from the env file is ever shown');
+  await ok('POST', `/sessions/${r.id}/stop`);
+  await until('its tmux session closed', () => tmux('has-session', '-t', '=gamma-bot').status !== 0);
 });
