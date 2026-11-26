@@ -550,6 +550,48 @@ another channel. `slack off` and `slack on` turn it off and back on, and `slack 
 forgets the tokens. On a machine without Slack set up, `slack off` stops a synced
 machine's Slack from driving its sessions.
 
+### Driving sessions from a local service
+
+A program on the same machine, such as an orchestrator, can start, read and
+drive sessions through `/api/director/` on the tracker's own server. Here it is
+called the director. Everything it does shows in Slack, and you can stop it
+from there.
+
+- **A key.** The tracker makes it on its first start, in
+  `~/.claude/tracker/director.key`, readable only by you. Every request sends it
+  as `Authorization: Bearer <key>`. A request with an `Origin` header is refused,
+  so no web page can call the API, and the server answers only on `127.0.0.1`.
+- **Sessions:**
+  - `GET /sessions` lists every session in tmux on this machine, with its state,
+    any open prompt and its choices, context use, account, owner and Slack
+    thread. It also says whether the director is paused.
+  - `POST /sessions` `{ cwd, prompt?, model?, name? }` starts Claude in a new
+    tmux session, as `new` does in Slack.
+  - `POST /sessions/:id/type`, `/keys` (`{ keys: ["2"] }` or `{ choice: 2 }`),
+    `/command` (`compact`, `clear`, or `model` with an `arg`) and `/stop`. Stop
+    types `/exit` and never sends Ctrl-C.
+  - `GET /sessions/:id/screen` returns the terminal.
+  - `GET /sessions/:id/turns?after=n` returns its turns, numbered from the start
+    of its transcript: what was asked, what it did and what it answered.
+- **Events.** `GET /events?after=<seq>&wait=<seconds>` is a long poll. It covers:
+  a session started, a turn done, a prompt waiting, idle, context at 70% and
+  again at 85% of the way to auto-compact, exited, handed over or taken back,
+  your messages and choices, and the director paused or resumed. Numbers survive
+  a restart, and events are kept for a week.
+- **Only its own sessions.** It may write only to a session it started, or one
+  you handed it with `;director` in that session's thread. `;mine` takes the
+  session back.
+  - Everything it types or presses is posted in that thread as the director's.
+  - It is held for an open prompt, as your replies are.
+  - It needs Slack: with no Slack set up here, the director does nothing.
+- **You can stop it.** `director pause` in the channel refuses everything it
+  tries until `director resume`. Handing it a session and resuming it take a post
+  of your own. A post made through an app, such as the Claude connector, can do
+  neither.
+- **A Director thread** in the channel carries its brief, and the decisions it
+  needs from you with a button for each choice. A tap, a `;1` reply or a message
+  there goes back to it as an event.
+
 ### Exporting accounts
 
 `claude-tracker accounts export` writes every account to a spreadsheet in
@@ -905,7 +947,9 @@ is set up. With Slack set up, what your sessions say is posted to the channel yo
 paired it with, and nowhere else. Its tokens are kept in
 `~/.claude/tracker/slack.json`, readable only by you. A synced machine with Slack
 set up can type into the sessions on this one. `claude-tracker slack off` here
-stops that. The web server binds
+stops that. A program here holding the director key
+(`~/.claude/tracker/director.key`, readable only by you) can start sessions,
+and drive the ones it started or you handed it; all of that shows in Slack. The web server binds
 to `127.0.0.1` only, and the index lives in `~/.claude/tracker/`. A sync
 connection reaches it only through `sync serve`, which has to show a token kept
 in a file only you can read.
@@ -913,7 +957,7 @@ in a file only you can read.
 ## Development
 
 ```sh
-node --test                     # unit tests, two trackers syncing, and sessions driven from Slack, end to end
+node --test                     # unit tests, two trackers syncing, and sessions driven from Slack and the director API, end to end
 CT_TEST_SSH=ssh CT_TEST_HOST=me@localhost node --test test/sync.test.js   # the same, over real ssh
 python3 bench/run_load.py   # end-to-end realtime test (needs Chrome)
 ```
@@ -942,6 +986,7 @@ depend on your own usage history.
 | `src/panes.js` | the sessions in tmux panes: what each says, and typing into it safely |
 | `src/slack.js` | Slack's Web API and Socket Mode, and Markdown as Slack shows it |
 | `src/bridge.js` | a thread per session in Slack, and replies typed back in |
+| `src/director.js` | the local API a service drives sessions through, and the events it hears |
 | `src/signin.js` | a profile's sign-in, read and moved the way Claude Code keeps it |
 | `src/billing.js` | projects the subscription cycle from its start date |
 | `src/api.js` | aggregation for both dashboards |

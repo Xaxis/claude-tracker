@@ -13,6 +13,7 @@ import path from 'node:path';
  *   WORK …  works for 4s, and is handed what is typed meanwhile, as Claude Code is mid-turn
  *   SHELLS … answers, then stays "shell": idle with shells left running
  *   STEPS …  a turn of several remarks and tool calls, a long write-up, and an answer
+ *   CONTEXT n  answers as a call that carried n tokens of context, with its usage, as Claude Code records each call
  *   /exit   quits
  *
  * Ctrl-C quits at once, so a test can tell if the tracker ever sends one.
@@ -104,6 +105,13 @@ function submit(text) {
       say('All done.');
       setStatus('idle');
     }, 300);
+  } else if (text.startsWith('CONTEXT')) {
+    const n = Number(text.split(/\s+/)[1]) || 0;
+    const id = Math.random().toString(36).slice(2);
+    timer = setTimeout(() => {
+      write({ type: 'assistant', requestId: `req_${id}`, message: { id: `msg_${id}`, model: 'claude-opus-5-5', usage: { input_tokens: n, output_tokens: 5 }, content: [{ type: 'text', text: `context ${n}` }] } });
+      setStatus('idle');
+    }, 200);
   } else if (text.startsWith('WORK')) {
     working = true;
     timer = setTimeout(() => { working = false; say('work done', [{ type: 'tool_use', name: 'Bash', input: { command: 'make' } }]); setStatus('idle'); }, 4000);

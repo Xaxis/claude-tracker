@@ -18,6 +18,7 @@ import { setMeta } from './db.js';
 import { accountsCsv, exportFileName } from './export.js';
 import { startPanes } from './panes.js';
 import { startBridge, bridgeStatus, readConfig as slackConfig } from './bridge.js';
+import { startDirector, directorKey } from './director.js';
 import { machine } from './replica.js';
 import { useLinks, onPanel, panelOf, ask, onBoxControl } from './fleet.js';
 import { setPlanPrice } from './plans.js';
@@ -253,6 +254,11 @@ export async function serve({ port = 4785, open = false, refresh, fastRefresh, a
     // A failing query must surface as a 500, never take the server down with it.
     try {
       if (url.pathname === '/events') return handleEvents(req, res);
+      // The director's hands: its own checks - a key, and never from a web page.
+      if (url.pathname === '/api/director' || url.pathname.startsWith('/api/director/')) {
+        if (!drive) return sendJson(res, { error: 'not running here' }, 404);
+        return drive.director.handle(req, res, url, sendJson);
+      }
       if (req.method === 'POST' && url.pathname.startsWith('/api/')) {
         return handleWrite(req, res, url).catch((err) => {
           console.error(`${url.pathname}:`, err.message);
@@ -533,9 +539,23 @@ function startDriving({ sync, log }) {
   const asked = new Map();       // request id -> { resolve, reject, timer }
   let nextId = 1;
 
+  // A local service driving sessions here through the tracker (director.js); its key is made now.
+  try { directorKey(); } catch (err) { log(`director key: ${err.message}`); }
+  const director = startDirector({
+    log,
+    hands: {
+      sessions: () => panes?.sessions() ?? null,
+      act: (op) => { if (!panes) throw new Error('not following the sessions here'); return panes.act(op); },
+      transcript: (id) => panes?.transcript(id) ?? null,
+      info: sessionInfo,
+      wake: () => want(),
+    },
+  });
+
   const bridge = startBridge({
     here: machine().name,
     log,
+    director,
     info: sessionInfo,
     usage: usageText,
     // A thread this machine does not know may be one of a machine that runs Slack itself.
@@ -545,13 +565,15 @@ function startDriving({ sync, log }) {
     },
   });
 
+  director.attach(bridge);
+
   const tell = (msg) => { for (const l of watchers) l.send({ t: 'ctl', ...msg }); };
   function want() {
-    const needed = bridge.active || watchers.size > 0;
+    const needed = bridge.active || watchers.size > 0 || director.wanted();
     if (needed && !panes) {
       panes = startPanes({
-        onSessions: (list) => { bridge.sessions(null, list); tell({ k: 'sessions', list }); },
-        onItems: (id, items) => { bridge.items(null, id, items); tell({ k: 'items', id, items }); },
+        onSessions: (list) => { bridge.sessions(null, list); director.sessions(list); tell({ k: 'sessions', list }); },
+        onItems: (id, items) => { bridge.items(null, id, items); director.items(id, items); tell({ k: 'items', id, items }); },
       });
       bridge.machine(null, machine().name, (op) => panes.act(op));
     } else if (!needed && panes) {
@@ -642,8 +664,8 @@ function startDriving({ sync, log }) {
   was = bridge.active;
 
   return {
-    bridge, control, linked,
-    stop() { clearInterval(timer); panes?.stop(); bridge.stop(); },
+    bridge, control, linked, director,
+    stop() { clearInterval(timer); panes?.stop(); bridge.stop(); director.stop(); },
   };
 }
 

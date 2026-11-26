@@ -356,6 +356,38 @@ CREATE TABLE IF NOT EXISTS slack_threads (
   ended_at   INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_slack_threads_ts ON slack_threads(channel, ts);
+
+-- What the director, a local service driving sessions through the tracker's
+-- API, is told (see director.js): kept a week, numbered so it can say what it
+-- has taken. AUTOINCREMENT: a number is never handed out twice, even after
+-- the newest rows are pruned.
+CREATE TABLE IF NOT EXISTS director_events (
+  seq     INTEGER PRIMARY KEY AUTOINCREMENT,
+  at      INTEGER NOT NULL,
+  session TEXT,
+  kind    TEXT NOT NULL,
+  detail  TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_director_events_at ON director_events(at);
+
+-- Sessions the director may type into: ones it started, or the owner handed it.
+CREATE TABLE IF NOT EXISTS director_sessions (
+  session_id TEXT PRIMARY KEY,
+  since      INTEGER NOT NULL,
+  how        TEXT NOT NULL           -- started | handed
+);
+
+-- The director's messages in its Slack thread, so only those are ever edited,
+-- and a tap or a reply is known for the choice it answers.
+CREATE TABLE IF NOT EXISTS director_posts (
+  ts       TEXT PRIMARY KEY,
+  channel  TEXT NOT NULL,
+  ref      TEXT,
+  kind     TEXT NOT NULL,
+  text     TEXT NOT NULL,
+  choices  TEXT,                     -- JSON [{ key, label }] while open; null once answered
+  at       INTEGER NOT NULL
+);
 `;
 
 /**

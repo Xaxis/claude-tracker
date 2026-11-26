@@ -725,7 +725,9 @@ export function startPanes({ onSessions = () => {}, onItems = () => {} } = {}) {
    * Start Claude in a new tmux session in `dir`, through a shell, so whatever
    * the shell sets up for `claude` applies. A prompt is typed once it is ready.
    */
-  async function launch({ dir, prompt, command = process.env.CLAUDE_TRACKER_LAUNCH || 'claude' }) {
+  async function launch({ dir, prompt, name: wanted = null, model = null, command = process.env.CLAUDE_TRACKER_LAUNCH || 'claude' }) {
+    // Typed into a shell: a model is a bare name, nothing else.
+    if (model != null && !/^[A-Za-z0-9._[\]-]{1,64}$/.test(model)) throw new Error(`${model} is not a model name`);
     const full = resolveDir(dir, [...live.values()].map((s) => s.cwd));
     let st;
     try { st = fs.statSync(full); } catch { throw new Error(`${dir} does not exist`); }
@@ -734,12 +736,12 @@ export function startPanes({ onSessions = () => {}, onItems = () => {} } = {}) {
     const socket = [...live.values()].find((s) => s.pane)?.socket ?? null;
     let names = new Set();
     try { names = new Set((await tmux(socket, ['list-sessions', '-F', '#{session_name}'])).split('\n')); } catch { /* no server yet */ }
-    const base = path.basename(full).replace(/[^A-Za-z0-9_-]+/g, '_') || 'claude';
+    const base = String(wanted ?? path.basename(full)).replace(/[^A-Za-z0-9_-]+/g, '_').slice(0, 40) || 'claude';
     let name = base;
     for (let i = 2; names.has(name); i++) name = `${base}-${i}`;
     const pane = (await tmux(socket, ['new-session', '-d', '-s', name, '-c', full, '-P', '-F', '#{pane_id}'])).trim();
     await sleep(300);
-    await tmux(socket, ['send-keys', '-t', pane, '-l', '--', command]);
+    await tmux(socket, ['send-keys', '-t', pane, '-l', '--', model ? `${command} --model ${model}` : command]);
     await tmux(socket, ['send-keys', '-t', pane, 'Enter']);
     if (prompt?.trim()) launched.set(pane, { prompt, at: Date.now() });
     return { tmux: name, pane, socket, dir: full };
@@ -762,6 +764,8 @@ export function startPanes({ onSessions = () => {}, onItems = () => {} } = {}) {
   }
 
   return {
+    /** Where a session's transcript is, once it has been read. */
+    transcript: (id) => reads.get(id)?.path ?? null,
     /** Every session, or null before the first look: an empty list would say they had all ended. */
     sessions: () => (looked ? [...live.values()] : null),
     /** Do something to a session (or a just-launched pane); resolves to what happened. */

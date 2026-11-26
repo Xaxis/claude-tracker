@@ -57,11 +57,13 @@ const HELP = [
   '• While it waits on a prompt, what you write is held, not typed: the buttons, or `;1` `;2` …, pick a choice and `;esc` says no - then what was held goes in. `;drop` throws away what is held.',
   '• Files you attach are saved on its machine, and their paths are added to the message.',
   '• The reaction on what you write says where it is: :raised_hand: held for a prompt, :hourglass_flowing_sand: typed, :eyes: Claude has read it, :white_check_mark: answered.',
+  '• `;director` hands the session to the director, a service on its machine that drives sessions: what it types and presses shows here. `;mine` takes it back.',
   '*Anywhere in this channel, or a DM with me*',
   '• `list` - every session, with a link to its thread.',
   '• `new <folder> [what to do]` - start Claude there, in a new tmux session. `new Mac:~/Projects/app …` starts it on another machine.',
   '• `usage` - how full each account is, and which to use.',
   '• `pause` / `resume` - stop and start showing conversations here. Prompts that need you still come through.',
+  '• `director pause` / `director resume` - stop the director typing or pressing anything, and let it again. `director <message>` tells it something.',
 ].join('\n');
 
 const EMOJI = { busy: ':large_green_circle:', idle: ':white_circle:', shell: ':white_circle:', waiting: ':large_orange_circle:', ended: ':black_circle:' };
@@ -114,7 +116,7 @@ export function parseControl(text) {
  * `forward(type, payload)` hands an event to another machine's bridge when a
  * thread here is not ours.
  */
-export function startBridge({ info = () => null, usage = () => '', here = 'this machine', forward = () => false, log = () => {} } = {}) {
+export function startBridge({ info = () => null, usage = () => '', here = 'this machine', forward = () => false, log = () => {}, director = null } = {}) {
   let cfg = null, api = null, sock = null, cfgStamp = null;
   let status = { state: 'off' };
   const machines = new Map();   // '' (here) or machine id -> { id, name, act, online, own }
@@ -211,6 +213,7 @@ export function startBridge({ info = () => null, usage = () => '', here = 'this 
       i.context?.tokens && `${shortNum(i.context.tokens)} context`,
       x.machine && machine?.name && `on ${escape(machine.name)}`,
       s.target && `tmux \`${escape(s.target)}\``,
+      !x.machine && director?.owns(s.sessionId) && ':robot_face: the director\'s',
     ].filter(Boolean).join(' · ');
     const how = x.ended ? 'This session has ended. If it is resumed, it carries on here.'
       : s.controllable ? 'Reply in this thread to type into it. `;help` for more.'
@@ -346,7 +349,8 @@ export function startBridge({ info = () => null, usage = () => '', here = 'this 
       const note = !m.online ? ' - not connected' : theirs.length && theirs.every((x) => !x.s.controllable) ? ' - read only: not in tmux' : '';
       if (theirs.length || !m.online) group(`On ${escape(m.name)}${note}`, theirs);
     }
-    blocks.push(context(`Reply in a session's thread to talk to it · \`new <folder>\` starts one · \`help\` · updated ${at(Date.now())}`));
+    const dl = dThread?.channel === cfg.channel ? link(dThread.channel, dThread.ts) : null;
+    blocks.push(context(`Reply in a session's thread to talk to it · \`new <folder>\` starts one${dl ? ` · <${dl}|the director>` : ''} · \`help\` · updated ${at(Date.now())}`));
     const plainCounts = counts.map(plain).join(', ');
     return { text: `Claude sessions: ${plainCounts || 'none running'}`, blocks };
   }
@@ -725,7 +729,7 @@ export function startBridge({ info = () => null, usage = () => '', here = 'this 
     if (!chose && a.chose) return;   // it says so already
     // A choice made here is known before the prompt goes, whichever comes first.
     const label = chose ?? a.pending;
-    const how = label ? `you chose *${escape(label)}*` : 'answered at the terminal';
+    const how = label ? `${a.by ?? 'you'} chose *${escape(label)}*` : 'answered at the terminal';
     send('chat.update', {
       channel: x.thread.channel, ts: a.ts, text: `${a.title}: ${plain(how)}`,
       blocks: [context(`:ballot_box_with_check: ${escape(a.title)} · ${how}`)],
@@ -782,13 +786,13 @@ export function startBridge({ info = () => null, usage = () => '', here = 'this 
    * chosen - at once for a choice, or once the prompt goes for keys that may
    * only move about in it.
    */
-  async function press(x, keys, label, via, choice = false) {
+  async function press(x, keys, label, via, choice = false, by = 'you') {
     const shown = via ? `${label} (via ${via})` : label;
     const onAlert = x.s.status === 'waiting' && x.alert;
-    if (onAlert) x.alert.pending = shown;
+    if (onAlert) Object.assign(x.alert, { pending: shown, by });
     let r;
     try { r = await act(x, { op: 'keys', sessionId: x.s.sessionId, keys }); } catch (err) {
-      if (onAlert && x.alert) delete x.alert.pending;
+      if (onAlert && x.alert) { delete x.alert.pending; delete x.alert.by; }
       throw err;
     }
     if (choice && onAlert && x.alert?.pending === shown) answered(x, shown);
@@ -811,6 +815,20 @@ export function startBridge({ info = () => null, usage = () => '', here = 'this 
     return meta(x, on ? ':mute: muted - only prompts that need you come through' : ':sound: unmuted', 0);
   }
 
+  /** `;director` and `;mine`: the session given to the director, or taken back. */
+  async function handOver(x, on, via, ev) {
+    if (!director) throw new Error('there is no director on this tracker');
+    if (x.machine) throw new Error(`the director drives only sessions on ${here}`);
+    // The director can answer its prompts: giving it a session takes your own post, not an app's.
+    if (on && via) throw new Error(`hand a session over yourself: a post made through ${via} can't, as the director could then answer its prompts`);
+    const changed = director.hand(x.s.sessionId, on);
+    refreshCard(x, true);
+    react(ev.channel, ev.ts, 'white_check_mark');
+    if (!changed) return meta(x, on ? 'it is the director\'s already' : 'it is yours already', 0);
+    return meta(x, on ? ':robot_face: handed to the director: what it types and presses shows here. `;mine` takes it back.'
+      : ':bust_in_silhouette: yours again: the director can\'t type or press anything here now.', 0);
+  }
+
   /** A reply in a session's thread: typed in, or a `;` command. */
   async function reply(x, ev) {
     const t = x.thread;
@@ -827,6 +845,7 @@ export function startBridge({ info = () => null, usage = () => '', here = 'this 
         if (cmd === 'help') return say(HELP);
         if (cmd === 'mute' || cmd === 'unmute') return setMuted(x, cmd === 'mute');
         if (cmd === 'screen' || cmd === 's') return showScreen(x, await act(x, { op: 'screen', sessionId: x.s.sessionId }));
+        if (cmd === 'director' || cmd === 'mine') return await handOver(x, cmd === 'director', via, ev);
         if (cmd === 'drop') {
           const n = x.held.length;
           x.held = [];
@@ -872,7 +891,8 @@ export function startBridge({ info = () => null, usage = () => '', here = 'this 
   /* --- commands outside threads ------------------------------------------ */
 
   async function command(ev) {
-    const text = readMessage(ev).text.trim().replace(/^@[A-Z0-9]+\s+/, '');
+    const { text: written, via } = readMessage(ev);
+    const text = written.trim().replace(/^@[A-Z0-9]+\s+/, '');
     const [word, ...rest] = text.split(/\s+/);
     const say = (m, extra) => post(ev.channel, ev.thread_ts ?? ev.ts, m, extra, 0);
     switch ((word ?? '').toLowerCase()) {
@@ -881,6 +901,7 @@ export function startBridge({ info = () => null, usage = () => '', here = 'this 
       case 'new': case 'start': case 'launch': return launch(ev, rest.join(' '), say);
       case 'pause': cfg.paused = true; writeConfig(cfg); return say(':double_vertical_bar: Paused: threads stay, conversations stop showing. Prompts that need you still come through. `resume` to carry on.');
       case 'resume': cfg.paused = false; writeConfig(cfg); return say(':arrow_forward: Showing conversations again.');
+      case 'director': return directorCommand(ev, text.replace(/^\S+\s*/, ''), say, via);
       case 'help': case '?': return say(HELP);
       default: return say(`Reply in a session's thread to talk to it. Here: \`list\`, \`new <folder> [what to do]\`, \`usage\`, \`help\`.`);
     }
@@ -942,6 +963,185 @@ export function startBridge({ info = () => null, usage = () => '', here = 'this 
     setTimeout(() => { const i = launches.indexOf(watch); if (i >= 0) launches.splice(i, 1); }, 15 * 60_000).unref?.();
   }
 
+  /* --- the director ------------------------------------------------------- */
+
+  /*
+   * A local service that drives sessions through the tracker's API
+   * (director.js). Whatever it types or presses goes in here, so it shows in
+   * the session's thread as the director's and is held for an open prompt as
+   * a reply is. It talks to the owner in a thread of its own: its brief, and
+   * decisions with a button for each choice.
+   */
+  let dThread = null;
+  try { dThread = JSON.parse(getMeta('director_thread') ?? 'null'); } catch { /* none yet */ }
+  const dq = {
+    put: d.prepare('INSERT OR REPLACE INTO director_posts (ts, channel, ref, kind, text, choices, at) VALUES (?, ?, ?, ?, ?, ?, ?)'),
+    get: d.prepare('SELECT * FROM director_posts WHERE ts = ?'),
+    open: d.prepare('SELECT * FROM director_posts WHERE channel = ? AND choices IS NOT NULL ORDER BY at DESC LIMIT 1'),
+    edit: d.prepare('UPDATE director_posts SET text = ?, choices = ? WHERE ts = ?'),
+  };
+  let dMaking = null;
+
+  /** The Director thread: the one it has, or a new one. */
+  function directorThread() {
+    if (dThread?.channel === cfg.channel) return dThread;
+    dMaking ??= (async () => {
+      const r = await send('chat.postMessage', {
+        channel: cfg.channel, text: 'Director', unfurl_links: false, blocks: [
+          { type: 'section', text: { type: 'mrkdwn', text: ':robot_face: *Director*\nIts brief, and the decisions it needs from you. Reply here to tell it something; tap a choice, or reply `;1` `;2` … to answer the newest question.' } },
+          context('`director pause` in the channel stops it typing or pressing anything in any session; `director resume` lets it again.'),
+        ],
+      }, { priority: 1 });
+      dThread = { channel: r.channel, ts: r.ts };
+      try { setMeta('director_thread', JSON.stringify(dThread)); } catch { /* made again next time */ }
+      toppled();
+      return dThread;
+    })().finally(() => { dMaking = null; });
+    return dMaking;
+  }
+
+  const DKIND = { brief: ':clipboard: brief', decision: ':raising_hand: decision', note: ':memo: note' };
+  function directorBlocks(row, text, choices, chosen = null) {
+    const head = `${DKIND[row.kind] ?? escape(row.kind)}${row.kind === 'decision' && choices?.length ? ` · ${mention()}` : ''}`;
+    const blocks = [context(head), ...sections(text).slice(0, 40)];
+    if (choices?.length) {
+      blocks.push({ type: 'actions', elements: choices.map((c, i) => ({
+        type: 'button', text: { type: 'plain_text', text: c.label.slice(0, 75), emoji: true },
+        action_id: `ct:dir:${crypto.randomBytes(3).toString('hex')}`, value: JSON.stringify({ c: c.key }), ...(i === 0 ? { style: 'primary' } : {}),
+      })) });
+      blocks.push(context(`or reply ${choices.map((c, i) => `\`;${i + 1}\` ${escape(c.label)}`).join(' · ')}`));
+    }
+    if (chosen) blocks.push(context(chosen));
+    return blocks;
+  }
+
+  async function directorPost({ text, kind, ref, choices }) {
+    const t = await directorThread();
+    const row = { kind, ref };
+    const ping = kind === 'decision' ? `${mention()} ` : '';
+    const r = await post(t.channel, t.ts, `${ping}${clip(plain(text), 150)}`, { blocks: directorBlocks(row, text, choices) }, kind === 'decision' ? 0 : 1);
+    dq.put.run(r.ts, r.channel, ref, kind, text, choices?.length ? JSON.stringify(choices) : null, Date.now());
+    return { ts: r.ts };
+  }
+
+  async function directorEdit(ts, { text, choices }) {
+    const row = dq.get.get(ts);
+    if (!row) return null;
+    await send('chat.update', { channel: row.channel, ts, text: clip(plain(text), 150), blocks: directorBlocks(row, text, choices) }, { priority: 0, key: `dir:${ts}` });
+    dq.edit.run(text, choices?.length ? JSON.stringify(choices) : null, ts);
+    return { ts };
+  }
+
+  /** A choice on one of its questions, tapped or replied: passed on, and its buttons gone so it is not chosen twice. */
+  async function directorChose(row, c, via = null, from = null) {
+    dq.edit.run(row.text, null, row.ts);
+    director.owner('owner_choice', { ref: row.ref, choice: c.key, ...(via ? { via } : {}) }, from);
+    if (from) mark(from, 'hourglass_flowing_sand');
+    await send('chat.update', {
+      channel: row.channel, ts: row.ts, text: `${clip(plain(row.text), 120)}: ${c.label}`,
+      blocks: directorBlocks(row, row.text, null, `:ballot_box_with_check: you chose *${escape(c.label)}*${via ? ` (via ${escape(via)})` : ''}`),
+    }, { priority: 0, key: `dir:${row.ts}` });
+  }
+
+  /** What the owner writes in the Director thread: an answer to its newest question, or a message for it. */
+  async function directorReply(ev) {
+    const { text: written, via } = readMessage(ev);
+    const text = written.trim();
+    const from = { channel: ev.channel, ts: ev.ts };
+    const pick = text.match(/^;\s*(\S+)$/);
+    if (pick) {
+      const row = dq.open.get(ev.channel);
+      const choices = row ? JSON.parse(row.choices) : [];
+      const c = /^[1-9]$/.test(pick[1]) ? choices[Number(pick[1]) - 1] : choices.find((o) => o.key === pick[1]);
+      if (!c) {
+        mark(from, 'x');
+        return post(ev.channel, ev.thread_ts, row ? `:x: Its newest question takes ${choices.map((o, i) => `\`;${i + 1}\` ${escape(o.label)}`).join(' · ')}` : ':x: Nothing it asked is waiting on a choice.', {}, 0);
+      }
+      return directorChose(row, c, via, from);
+    }
+    if (!text) return;
+    director.owner('owner_message', { text, ...(via ? { via } : {}) }, from);
+    mark(from, 'hourglass_flowing_sand');
+  }
+
+  /** `director …` in the channel: pause, resume, how it stands, or a message for it. */
+  function directorCommand(ev, arg, say, via) {
+    if (!director) return say('There is no director on this tracker.');
+    const word = arg.trim().toLowerCase();
+    if (word === 'pause' || word === 'stop') {
+      return say(director.pause(true) ? ':double_vertical_bar: The director is paused: anything it tries to type, press or start is refused until `director resume`.' : 'The director is paused already.');
+    }
+    if (word === 'resume') {
+      // Letting it act again takes your own post, as handing it a session does.
+      if (via) return say(`:x: Resume the director yourself: a post made through ${escape(via)} can't.`);
+      return say(director.pause(false) ? ':arrow_forward: The director can act again.' : 'The director is not paused.');
+    }
+    if (!word) {
+      const mine = [...live.values()].filter((x) => !x.machine && !x.ended && director.owns(x.s.sessionId));
+      const names = mine.map((x) => { const l = x.thread && link(x.thread.channel, x.thread.ts); return l ? `<${l}|${escape(nameOf(x.s))}>` : escape(nameOf(x.s)); });
+      return say(`:robot_face: The director is ${director.paused() ? '*paused*' : 'free to act'}. ${mine.length ? `Its sessions: ${names.join(', ')}.` : 'It has no sessions.'} \`director pause\` / \`director resume\`; \`;director\` in a session's thread hands it over.`);
+    }
+    director.owner('owner_message', { text: arg.trim(), ...(via ? { via } : {}) }, { channel: ev.channel, ts: ev.ts });
+    mark({ channel: ev.channel, ts: ev.ts }, 'hourglass_flowing_sand');
+  }
+
+  /** A session of this machine, with its thread, for the director to act on. */
+  async function directorSession(id) {
+    const x = live.get(keyOf(null, id));
+    if (!x || x.ended) throw new Error('no such session running here');
+    await chain(x, () => ensureThread(x));
+    if (!x.thread) throw new Error('its Slack thread could not be made');
+    return x;
+  }
+
+  /** What the director types: shown in the thread as its own, then typed - or held for an open prompt - as a reply is. */
+  async function directorType(id, text, what = 'typed') {
+    const x = await directorSession(id);
+    const typed = what === 'typed';
+    const r = await post(x.thread.channel, x.thread.ts, `the director ${what}${typed ? ':' : ''} ${clip(text, 150)}`, {
+      blocks: [context(`:robot_face: *the director* ${what}${typed ? ':' : ` \`${escape(text)}\``}`), ...(typed ? sections(text).slice(0, 30) : [])],
+    }, 0);
+    const from = { channel: r.channel, ts: r.ts, via: 'the director' };
+    try {
+      if (x.s.controllable && (x.s.status === 'waiting' || x.held.length)) { await hold(x, { typed: text, files: [], from }); return { held: true }; }
+      // Typed while it works, it waits for the turn to end - or is handed to it mid-turn.
+      const queued = x.s.status === 'busy';
+      const res = await typeIn(x, text, [], from);
+      if (res.waiting) { await hold(x, { typed: text, files: [], from }); return { held: true }; }
+      await delivered(x, from, res);
+      return { sent: res.sent !== false, queued, ...(res.cleared ? { cleared: res.cleared } : {}) };
+    } catch (err) {
+      mark(from, 'x');
+      await meta(x, `:x: ${escape(err.message)}`, 0);
+      throw err;
+    }
+  }
+
+  /** Keys the director presses: a choice on its prompt, by number, or keys by name. */
+  async function directorKeys(id, { keys = null, choice = null }) {
+    const x = await directorSession(id);
+    // One digit on an open prompt picks that choice: said by its name.
+    if (!choice && keys.length === 1 && /^[1-9]$/.test(keys[0]) && x.s.status === 'waiting') choice = Number(keys[0]);
+    let label, pressed, isChoice = false;
+    if (choice) {
+      const opts = (await act(x, { op: 'screen', sessionId: id })).screen?.options ?? [];
+      const o = opts[choice - 1];
+      if (!o) throw new Error(opts.length ? `its prompt has ${opts.length} choices` : 'it is not asking anything now');
+      pressed = o.keys.map((k) => k.toLowerCase());
+      label = `${choice}. ${o.label}`;
+      isChoice = true;
+    } else {
+      pressed = keys;
+      isChoice = x.s.status === 'waiting' && keys.length === 1 && /^esc(ape)?$/i.test(keys[0]);
+      label = isChoice ? 'Esc' : `keys ${keys.join(' ')}`;
+    }
+    await post(x.thread.channel, x.thread.ts, `the director ${isChoice ? 'chose' : 'pressed'} ${label}`, {
+      blocks: [context(`:robot_face: *the director* ${isChoice ? `chose *${escape(label)}*` : `pressed \`${escape(pressed.join(' '))}\``}`)],
+    }, 0);
+    const r = await press(x, pressed, label, null, isChoice, 'the director');
+    return { screen: r?.screen?.text ?? '' };
+  }
+
   /* --- Slack, in -------------------------------------------------------- */
 
   async function onEvent(type, payload, { forwarded = false } = {}) {
@@ -954,6 +1154,7 @@ export function startBridge({ info = () => null, usage = () => '', here = 'this 
       const inThread = ev.thread_ts && ev.thread_ts !== ev.ts;
       if (ev.user !== cfg.owner) { if (!inThread && ev.channel === cfg.channel) toppled(); return; }
       if (inThread) {
+        if (director && dThread && ev.channel === dThread.channel && ev.thread_ts === dThread.ts) return directorReply(ev);
         const key = byThread.get(`${ev.channel}/${ev.thread_ts}`);
         const x = key && live.get(key);
         if (x) return reply(x, ev);
@@ -992,6 +1193,12 @@ export function startBridge({ info = () => null, usage = () => '', here = 'this 
       } catch (err) { await post(channel, thread, `:x: ${escape(err.message)}`, {}, 0); }
       return;
     }
+    if (kind === 'ct:dir') {
+      const row = director && payload.message?.ts ? dq.get.get(payload.message.ts) : null;
+      const c = row?.choices ? JSON.parse(row.choices).find((o) => o.key === v.c) : null;
+      if (!c) return post(channel, thread, ':x: That question is not open any more.', {}, 0);
+      return directorChose(row, c);
+    }
     const x = live.get(keyOf(v.m ?? null, v.s));
     if (!x) {
       if (forwarded) return;
@@ -1012,7 +1219,7 @@ export function startBridge({ info = () => null, usage = () => '', here = 'this 
         // A choice on the prompt: the prompt says what you chose, in place.
         const label = v.l ?? v.k.join(' ');
         const onAlert = v.a && x.alert && payload.message?.ts === x.alert.ts;
-        if (onAlert) x.alert.pending = label;
+        if (onAlert) Object.assign(x.alert, { pending: label, by: 'you' });
         try {
           await act(x, { op: 'keys', sessionId: x.s.sessionId, keys: v.k });
         } catch (err) {
@@ -1144,6 +1351,12 @@ export function startBridge({ info = () => null, usage = () => '', here = 'this 
       post(cfg.channel, null, `:bell: *${escape(title)}*\n${escape(text)}`).then(toppled, () => {});
     },
     status: () => ({ ...status, threads: cfg?.channel ? q.count.get(cfg.channel).n : 0, backlog: api?.backlog ?? 0 }),
+    /* The director's way in: see director.js. */
+    directorReady: () => ready() && !!machines.get('')?.online,
+    threadOf(id) { const x = live.get(keyOf(null, id)); return x?.thread ? link(x.thread.channel, x.thread.ts) : null; },
+    directorType, directorKeys, directorPost, directorEdit,
+    async directorNote(id, text) { const x = await directorSession(id); return meta(x, text, 0); },
+    directorTook: (from) => mark(from, 'eyes'),
     stop() {
       clearInterval(watcher); clearInterval(cards); clearTimeout(ovTimer); clearTimeout(moveTimer);
       sock?.stop(); api?.stop();
