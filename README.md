@@ -486,8 +486,14 @@ back. A long turn you asked for from Slack mentions you when it ends.
   the thread mentions you and shows the question itself. That means the dialog's title, what
   it is about, and the command in question as code, with a button for each
   choice. The rest of the screen is one tap away, under *Full screen*. A choice
-  changes the alert in place, to `you chose 1. Yes`. A reply instead of a button
-  answers the prompt with Esc, then sends what you wrote.
+  changes the alert in place, to `you chose 1. Yes`. What you write while it asks
+  is held, not typed, since typing it would answer the prompt. The prompt is shown
+  again with `;1` `;2` … to choose and `;esc` to say no. What was held goes in once
+  it is answered, and `;drop` throws it away.
+- **A reaction on each message you write says where it has got to:** ✋ held for a
+  prompt, ⏳ typed, 👀 Claude has read it, ✅ answered, 🛑 interrupted. A message
+  sent through an app, such as the Claude connector, is read as written, without
+  the app's footer, and the turn it starts says `asked via` that app.
 - **Files you attach** are saved on the session's machine, and their paths are
   added to the message, so Claude can open them.
 - **In the channel itself** (or a DM with the app): `list` shows every session
