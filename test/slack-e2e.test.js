@@ -85,6 +85,7 @@ const said = (file) => { try { return fs.readFileSync(file, 'utf8').trim().split
 const prompts = (file) => said(file).filter((e) => e.type === 'user' && e.origin?.kind === 'human').map((e) => e.message.content);
 const replies = (file) => said(file).filter((e) => e.type === 'assistant').flatMap((e) => e.message.content.filter((b) => b.type === 'text').map((b) => b.text));
 const inThread = (ts) => slack.posts().filter((p) => p.thread_ts === ts);
+const lastSent = () => slack.sent.at(-1);
 const reacted = (name) => slack.calls.some((c) => c.method === 'reactions.add' && c.args.name === name);
 const blocksText = (m) => JSON.stringify(m.blocks ?? []);
 
@@ -143,6 +144,44 @@ test('a message sent through the Claude connector is typed as written, and its a
   const reply = await until('the answer', () => inThread(one.root.ts).find((p) => /echo: check site\.example/.test(p.text)));
   assert.match(reply.blocks[0].elements[0].text, /worked \d+s · asked via Claude/);
   assert.ok(!prompts(one.s.transcript).some((p) => /Sent using/.test(p)));
+});
+
+const marks = (ts) => slack.calls.filter((c) => c.method.startsWith('reactions.') && c.args.timestamp === ts).map((c) => `${c.method === 'reactions.add' ? '+' : '-'}${c.args.name}`);
+
+test('a message says where it has got to: typed, read, answered', { skip: !hasTmux, timeout: 30_000 }, async () => {
+  slack.message({ channel: 'C1', user: 'U1', text: 'receipt please', thread_ts: one.root.ts });
+  const sent = lastSent();
+  await until('the answer', () => inThread(one.root.ts).find((p) => /echo: receipt please/.test(p.text)));
+  await until('it to be marked answered', () => slack.reactions(sent).join() === 'white_check_mark');
+  const added = marks(sent).filter((m) => m.startsWith('+'));
+  assert.ok(added.includes('+eyes'), `read before it was answered: ${added}`);
+  assert.equal(added.at(-1), '+white_check_mark');
+});
+
+test('a message read mid-turn is marked read at once, and answered when the turn is', { skip: !hasTmux, timeout: 30_000 }, async () => {
+  slack.message({ channel: 'C1', user: 'U1', text: 'WORK on it', thread_ts: one.root.ts });
+  await until('it to be working', () => slack.messages.get(one.root.ts)?.text === 'alpha: working');
+  slack.message({ channel: 'C1', user: 'U1', text: 'and this too', thread_ts: one.root.ts });
+  const also = lastSent();
+  await until('the mid-turn message to be read', () => slack.reactions(also).join() === 'eyes');
+  assert.equal(slack.messages.get(one.root.ts)?.text, 'alpha: working', 'read while it still works');
+  await until('the turn to end', () => inThread(one.root.ts).find((p) => p.text === 'work done'));
+  await until('both answered', () => slack.reactions(also).join() === 'white_check_mark');
+});
+
+test('a message typed while it works waits its turn, marked typed until then', { skip: !hasTmux, timeout: 40_000 }, async () => {
+  slack.message({ channel: 'C1', user: 'U1', text: 'SLOW down', thread_ts: one.root.ts });
+  const slow = lastSent();
+  await until('it to be working', () => slack.messages.get(one.root.ts)?.text === 'alpha: working');
+  slack.message({ channel: 'C1', user: 'U1', text: 'after that', thread_ts: one.root.ts });
+  const next = lastSent();
+  await until('the queued message to be marked typed', () => slack.reactions(next).join() === 'hourglass_flowing_sand');
+  await sleep(1500);
+  assert.equal(slack.reactions(next).join(), 'hourglass_flowing_sand', 'not read while queued');
+  slack.message({ channel: 'C1', user: 'U1', text: ';esc', thread_ts: one.root.ts });
+  await until('the interrupted turn marked so', () => slack.reactions(slow).join() === 'octagonal_sign');
+  await until('the queued one answered after', () => slack.reactions(next).join() === 'white_check_mark');
+  assert.ok(marks(next).includes('+eyes'));
 });
 
 test('what is typed at the terminal shows in the thread', { skip: !hasTmux, timeout: 30_000 }, async () => {

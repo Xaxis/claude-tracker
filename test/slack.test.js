@@ -129,6 +129,16 @@ test('transcripts: only what a person typed counts as a prompt', () => {
   assert.deepEqual(readEntry(result, st), []);
 });
 
+test('transcripts: a message the person sent mid-turn is read as such; an agent\'s hand-back is not', () => {
+  // As Claude Code 2.1.329 writes them.
+  const mid = { type: 'attachment', attachment: { type: 'queued_command', prompt: 'also check the footer', commandMode: 'prompt', origin: { kind: 'human' } }, timestamp: '2026-11-20T12:53:47.363Z' };
+  assert.deepEqual(readEntry(mid, { tools: [] }).map((i) => [i.kind, i.text]), [['midturn', 'also check the footer']]);
+  const task = { type: 'attachment', attachment: { type: 'queued_command', prompt: '<task-notification>…', commandMode: 'task-notification' } };
+  assert.deepEqual(readEntry(task, { tools: [] }), []);
+  const agent = { type: 'attachment', attachment: { type: 'queued_command', prompt: '<agent-message from="a1">…', commandMode: 'prompt' } };
+  assert.deepEqual(readEntry(agent, { tools: [] }), []);
+});
+
 test('transcripts: commands, interruptions and command output read as such', () => {
   const st = { tools: [] };
   const cmd = { type: 'user', origin: { kind: 'human' }, message: { content: '<command-name>/model</command-name>\n<command-message>model</command-message>\n<command-args>opus</command-args>' } };

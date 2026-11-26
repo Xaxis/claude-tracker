@@ -56,6 +56,7 @@ const HELP = [
   '• `;mute` stops showing what it writes here (it still tells you when it needs you); `;unmute` starts again.',
   '• While it waits on a prompt, what you write is held, not typed: the buttons, or `;1` `;2` …, pick a choice and `;esc` says no - then what was held goes in. `;drop` throws away what is held.',
   '• Files you attach are saved on its machine, and their paths are added to the message.',
+  '• The reaction on what you write says where it is: :raised_hand: held for a prompt, :hourglass_flowing_sand: typed, :eyes: Claude has read it, :white_check_mark: answered.',
   '*Anywhere in this channel, or a DM with me*',
   '• `list` - every session, with a link to its thread.',
   '• `new <folder> [what to do]` - start Claude there, in a new tmux session. `new Mac:~/Projects/app …` starts it on another machine.',
@@ -148,6 +149,22 @@ export function startBridge({ info = () => null, usage = () => '', here = 'this 
   const post = (channel, thread, text, extra = {}, priority = 1) => send('chat.postMessage',
     { channel, thread_ts: thread, text, unfurl_links: false, unfurl_media: false, ...extra }, { priority });
   const react = (channel, ts, name) => send('reactions.add', { channel, timestamp: ts, name }, { priority: 0 }).catch(() => {});
+  /**
+   * Where a message from Slack has got to, as the one reaction on it: held
+   * (:raised_hand:), typed (:hourglass_flowing_sand:), read by Claude
+   * (:eyes:), answered (:white_check_mark:) - or interrupted, or failed.
+   */
+  const marks = new Map();   // `${channel}/${ts}` -> the reaction on it now
+  function mark(from, name) {
+    if (!from?.ts) return;
+    const k = `${from.channel}/${from.ts}`;
+    const was = marks.get(k);
+    if (was === name) return;
+    marks.set(k, name);
+    if (marks.size > 500) marks.delete(marks.keys().next().value);
+    if (was) send('reactions.remove', { channel: from.channel, timestamp: from.ts, name: was }, { priority: 0 }).catch(() => {});
+    react(from.channel, from.ts, name);
+  }
   const mention = () => (cfg?.owner ? `<@${cfg.owner}>` : '');
   const link = (channel, ts) => (cfg?.url ? `${cfg.url.replace(/\/?$/, '/')}archives/${channel}/p${String(ts).replace('.', '')}` : null);
 
@@ -467,9 +484,17 @@ export function startBridge({ info = () => null, usage = () => '', here = 'this 
 
   /** Was this prompt typed from Slack? Then it is already in the thread: what was sent, from where. */
   function fromHere(x, text) {
-    const m = x.sent.find((s) => s.norm === norm(text));
-    if (m) x.sent = x.sent.filter((s) => s !== m && !(m.ts && s.ts === m.ts));
-    return m ?? null;
+    const n = norm(text);
+    let m = x.sent.find((s) => s.norm === n);
+    // Messages queued while it worked can reach it as one, joined.
+    const all = m ? [m] : x.sent.filter((s) => s.norm && n.includes(s.norm));
+    if (!m && all.length > 1 && all.reduce((len, s) => len + s.norm.length, 0) <= n.length) m = all[0];
+    if (!m) return null;
+    const ts = new Set(all.map((s) => s.ts).filter(Boolean));
+    x.sent = x.sent.filter((s) => !all.includes(s) && !ts.has(s.ts));
+    const read = all.filter((s, i) => all.findIndex((o) => o.ts === s.ts) === i);
+    for (const s of read) mark(s, 'eyes');
+    return { ...m, also: read.slice(1) };
   }
 
   /**
@@ -489,9 +514,15 @@ export function startBridge({ info = () => null, usage = () => '', here = 'this 
       if (back.length && !quiet) await backfill(x, back);
       for (const it of list.filter((i) => !i.backfill)) {
         if (it.kind === 'prompt') {
-          // Anything typed ends the turn before it - a slash command too.
-          if (x.work?.texts.length || x.work?.tools.length) await flush(x);
-          if (it.command) { x.command = { text: it.text, at: Date.now(), mine: fromHere(x, it.text) }; continue; }
+          // Anything typed ends the turn before it - a slash command too - even
+          // one that had nothing to show yet: who asked for it hears how it went.
+          if (x.work) await flush(x);
+          if (it.command) {
+            const mine = fromHere(x, it.text);
+            if (mine) for (const s of [mine, ...mine.also]) mark(s, 'white_check_mark');
+            x.command = { text: it.text, at: Date.now(), mine };
+            continue;
+          }
           const mine = fromHere(x, it.text);
           x.work = { at: it.at ?? Date.now(), prompt: it.text, terminal: !mine, asked: mine, texts: [], tools: [] };
         } else if (it.kind === 'text') {
@@ -499,6 +530,10 @@ export function startBridge({ info = () => null, usage = () => '', here = 'this 
           for (const t of x.work.texts) if (!t.posted && t.text.length >= LONG && !quiet) { await saying(x, t); t.posted = true; }
           x.work.texts.push({ text: it.text, error: it.error });
           x.work.tools.push(...(it.tools ?? []));
+        } else if (it.kind === 'midturn') {
+          // Read while it works: answered when this turn is.
+          const mine = fromHere(x, it.text);
+          if (mine && x.work) (x.work.also ??= []).push(mine, ...mine.also);
         } else if (it.kind === 'tools') {
           x.work ??= { at: it.at ?? Date.now(), texts: [], tools: [] };
           x.work.tools.push(...(it.tools ?? []));
@@ -545,6 +580,7 @@ export function startBridge({ info = () => null, usage = () => '', here = 'this 
     const w = x.work;
     x.work = null;
     clearTimeout(x.flushTimer);
+    for (const s of [w?.asked, ...(w?.asked?.also ?? []), ...(w?.also ?? [])]) mark(s, w.interrupted ? 'octagonal_sign' : 'white_check_mark');
     if (!w || x.muted || cfg.paused) return;
     const texts = w.texts.filter((t) => !t.posted);
     const answer = texts.at(-1) ?? null;
@@ -649,7 +685,7 @@ export function startBridge({ info = () => null, usage = () => '', here = 'this 
    */
   async function hold(x, h) {
     x.held.push(h);
-    react(h.from.channel, h.from.ts, 'raised_hand');
+    mark(h.from, 'raised_hand');
     refreshCard(x, true);
     // The prompt went while this was on its way: it goes in now.
     if (x.s.status !== 'waiting') { chain(x, () => deliver(x)); return; }
@@ -667,7 +703,7 @@ export function startBridge({ info = () => null, usage = () => '', here = 'this 
       let r;
       try { r = await typeIn(x, h.typed, h.files, h.from); } catch (err) {
         x.held.shift();
-        react(h.from.channel, h.from.ts, 'x');
+        mark(h.from, 'x');
         await meta(x, `:x: a held message was not typed: ${escape(err.message)}`, 0);
         continue;
       }
@@ -731,7 +767,8 @@ export function startBridge({ info = () => null, usage = () => '', here = 'this 
 
   /** Typed in: said so on the message, with anything worth knowing about how it went. */
   async function delivered(x, from, r) {
-    react(from.channel, from.ts, r.sent === false ? 'warning' : 'white_check_mark');
+    // Unless Claude has read it already: its transcript can be quicker than this.
+    if (!['eyes', 'white_check_mark'].includes(marks.get(`${from.channel}/${from.ts}`))) mark(from, r.sent === false ? 'warning' : 'hourglass_flowing_sand');
     const notes = [
       r.cleared && `cleared what was in its input box first: “${escape(clip(r.cleared, 300))}”`,
       ...(r.skipped ?? []).map((f) => `${escape(f.name)} not attached: ${escape(f.skipped)}`),
@@ -781,7 +818,7 @@ export function startBridge({ info = () => null, usage = () => '', here = 'this 
     const text = written.trim();
     const say = (m, priority = 0) => post(t.channel, t.ts, m, {}, priority);
     const ctl = parseControl(text);
-    const fail = (err) => { react(ev.channel, ev.ts, 'x'); return say(`:x: ${escape(err.message)}`); };
+    const fail = (err) => { mark({ channel: ev.channel, ts: ev.ts }, 'x'); return say(`:x: ${escape(err.message)}`); };
     try {
       const pick = text.match(/^;\s*([1-9])$/);
       if (pick) return await choose(x, Number(pick[1]), ev, via);

@@ -197,6 +197,14 @@ export function readEntry(e, state) {
   if (e.type === 'ai-title' && e.aiTitle) { if (!state.named) state.title = e.aiTitle; return out; }
   if (e.type === 'custom-title' && e.customTitle) { state.title = e.customTitle; state.named = true; return out; }
   const at = Date.parse(e.timestamp) || Date.now();
+  // A message the person sent while Claude worked, handed to it mid-turn.
+  if (e.type === 'attachment' && e.attachment?.type === 'queued_command' && e.attachment.commandMode === 'prompt') {
+    const p = e.attachment.prompt;
+    const text = typeof p === 'string' ? p : Array.isArray(p) ? p.filter((b) => b?.type === 'text').map((b) => b.text).join('\n') : '';
+    const origin = e.attachment.origin ?? e.origin;
+    if (text && (origin ? origin.kind === 'human' : !/^\s*</.test(text))) out.push({ kind: 'midturn', text, at, uuid: e.uuid });
+    return out;
+  }
   if (e.type === 'user') {
     const text = userText(e.message?.content);
     if (text == null || e.isMeta || e.isCompactSummary) return out;

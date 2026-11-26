@@ -10,6 +10,7 @@ import path from 'node:path';
  *
  *   ASK …   asks permission, with a numbered menu, before it answers
  *   SLOW …  works for 30s (Esc interrupts)
+ *   WORK …  works for 4s, and is handed what is typed meanwhile, as Claude Code is mid-turn
  *   SHELLS … answers, then stays "shell": idle with shells left running
  *   STEPS …  a turn of several remarks and tool calls, a long write-up, and an answer
  *   /exit   quits
@@ -61,7 +62,13 @@ function setStatus(s, w = null) {
   if (s !== 'busy' && s !== 'waiting' && queued.length) setTimeout(() => submit(queued.shift()), 50);
 }
 
+let working = false;   // a WORK turn: what is typed while it runs is handed to it mid-turn
 function submit(text) {
+  if (status === 'busy' && working) {
+    write({ type: 'attachment', attachment: { type: 'queued_command', prompt: text, commandMode: 'prompt', origin: { kind: 'human' } } });
+    draw();
+    return;
+  }
   if (status === 'busy') { queued.push(text); draw(); return; }
   if (text === '/exit') { cleanup(); process.exit(0); }
   const command = text.match(/^\/(\S+)\s*(.*)$/);
@@ -97,6 +104,9 @@ function submit(text) {
       say('All done.');
       setStatus('idle');
     }, 300);
+  } else if (text.startsWith('WORK')) {
+    working = true;
+    timer = setTimeout(() => { working = false; say('work done', [{ type: 'tool_use', name: 'Bash', input: { command: 'make' } }]); setStatus('idle'); }, 4000);
   } else if (text.startsWith('SLOW')) {
     timer = setTimeout(() => { say('slow done'); setStatus('idle'); }, 30_000);
   } else {
@@ -137,7 +147,7 @@ process.stdin.on('data', (d) => {
     if (s[0] === '\x1b') {                                                     // Esc
       s = s.slice(1);
       if (menu) { menu = null; clearTimeout(timer); say('denied'); setStatus('idle'); }
-      else if (status === 'busy') { clearTimeout(timer); write({ type: 'user', message: { content: '[Request interrupted by user]' } }); setStatus('idle'); }
+      else if (status === 'busy') { clearTimeout(timer); working = false; write({ type: 'user', message: { content: '[Request interrupted by user]' } }); setStatus('idle'); }
       continue;
     }
     const ch = s[0];

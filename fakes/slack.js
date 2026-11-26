@@ -13,6 +13,7 @@ export async function fakeSlack() {
   const acks = new Set();
   let seq = 1;
   const files = new Map();
+  const reactions = new Map();    // message ts -> the reactions on it now
 
   const server = http.createServer((req, res) => {
     const url = new URL(req.url, 'http://x');
@@ -53,7 +54,16 @@ export async function fakeSlack() {
           messages.set(args.ts, { ...m, ...args, updated: (m.updated ?? 0) + 1 });
           return ok({ channel: args.channel, ts: args.ts });
         }
-        case 'reactions.add': return ok();
+        case 'reactions.add': {
+          const on = reactions.get(args.timestamp) ?? new Set();
+          if (on.has(args.name)) return fail('already_reacted');
+          reactions.set(args.timestamp, on.add(args.name));
+          return ok();
+        }
+        case 'reactions.remove': {
+          if (!reactions.get(args.timestamp)?.delete(args.name)) return fail('no_reaction');
+          return ok();
+        }
         case 'chat.delete': {
           if (!messages.has(args.ts)) return fail('message_not_found');
           messages.delete(args.ts);
@@ -112,6 +122,8 @@ export async function fakeSlack() {
   return {
     api: `http://127.0.0.1:${port}/api/`,
     calls, messages, acks,
+    /** The reactions on a message now, in the order they were put there. */
+    reactions: (ts) => [...(reactions.get(ts) ?? [])],
     get connected() { return sockets.size; },
     file(id, data) { files.set(id, Buffer.from(data)); return `http://127.0.0.1:${port}/files/${id}`; },
     /** Deliver an envelope down every open socket; resolves to its id. */
@@ -120,8 +132,12 @@ export async function fakeSlack() {
       for (const s of sockets) send(s, { envelope_id, type, payload, accepts_response_payload: false });
       return envelope_id;
     },
+    /** What was said to the trackers, by ts: the newest last. */
+    sent: [],
     message(event) {
-      return this.push('events_api', { event_id: `Ev${crypto.randomUUID()}`, event: { type: 'message', ts: `1800000000.${String(seq++).padStart(6, '0')}`, ...event } });
+      const ts = `1800000000.${String(seq++).padStart(6, '0')}`;
+      this.sent.push(ts);
+      return this.push('events_api', { event_id: `Ev${crypto.randomUUID()}`, event: { type: 'message', ts, ...event } });
     },
     /** The channel as it stands, newest last: what is there now, not everything ever posted. */
     top: (channel) => [...messages.values()].filter((m) => m.channel === channel && !m.thread_ts).sort((a, b) => Number(a.ts) - Number(b.ts)),
