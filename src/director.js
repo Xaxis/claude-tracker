@@ -415,8 +415,10 @@ export function startDirector({ hands, log = () => {} }) {
     const cfg = readJson(path.join(profile, '.claude.json'));
     const setUp = `run \`CLAUDE_CONFIG_DIR=${tilde(profile)} claude\` once in your projects folder, with its token set, to choose a theme and trust the folder`;
     if (!cfg?.hasCompletedOnboarding) throw new Refused(409, `${tilde(profile)} is not set up yet: ${setUp}`);
-    // Trusting a folder trusts what is in it.
-    const trusted = Object.entries(cfg.projects ?? {}).some(([p, v]) => v?.hasTrustDialogAccepted && (dir === p || dir.startsWith(`${p}/`)));
+    // Trusting a folder trusts what is in it - as Claude sees it, through any symlink.
+    const real = (p) => { try { return fs.realpathSync(p); } catch { return p; } };
+    const here = real(dir);
+    const trusted = Object.entries(cfg.projects ?? {}).some(([p, v]) => v?.hasTrustDialogAccepted && [p, real(p)].some((t) => here === t || here.startsWith(`${t}/`)));
     if (!trusted) throw new Refused(409, `${tilde(dir)} is not trusted in ${tilde(profile)}: ${setUp}`);
     return { CLAUDE_CONFIG_DIR: profile, CLAUDE_CODE_OAUTH_TOKEN: token };
   }

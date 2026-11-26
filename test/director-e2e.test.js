@@ -363,11 +363,13 @@ test('on an account of its own: refused until its token, profile and folder are 
   fs.writeFileSync(path.join(profile, '.claude.json'), JSON.stringify({ hasCompletedOnboarding: true, projects: {} }));
   await refused({ account: 'bot' }, 409, /not trusted/);
   fs.writeFileSync(path.join(profile, '.claude.json'), JSON.stringify({ hasCompletedOnboarding: true, projects: { [path.join(home, 'work')]: { hasTrustDialogAccepted: true } } }));
-  const r = await ok('POST', '/sessions', { cwd, account: 'bot', name: 'gamma-bot', prompt: 'hello from its own account' });
+  // Named through a symlink, it is the folder Claude trusts all the same.
+  fs.symlinkSync(path.join(home, 'work'), path.join(home, 'linked'));
+  const r = await ok('POST', '/sessions', { cwd: path.join(home, 'linked', 'gamma'), account: 'bot', name: 'gamma-bot', prompt: 'hello from its own account' });
   const got = await until('what the session got', () => { try { return JSON.parse(fs.readFileSync(path.join(prof, `env-${r.id}.json`), 'utf8')); } catch { return null; } });
   assert.deepEqual(got, { token: 'sk-ant-oat01-TEST_token-123', configDir: profile });
   assert.deepEqual(fs.readdirSync(path.join(data, 'launch-env')), [], 'the file it came in is gone');
-  await until('its first message', () => prompts(transcriptOf(cwd, r.id)).includes('hello from its own account'));
+  await until('its first message', () => [cwd, path.join(home, 'linked', 'gamma')].some((c) => prompts(transcriptOf(c, r.id)).includes('hello from its own account')));
   const shown = tmux('capture-pane', '-p', '-S', '-2000', '-t', '=gamma-bot').stdout;
   assert.ok(!shown.includes('TEST_token') && !shown.includes('postgres'), 'nothing from the env file is ever shown');
   await ok('POST', `/sessions/${r.id}/stop`);
