@@ -218,13 +218,34 @@ export function startDirector({ hands, log = () => {} }) {
       }
     }
     for (const v of gone) {
-      seen.delete(v.s.sessionId);
+      const id = v.s.sessionId;
+      seen.delete(id);
       clearTimeout(v.waitTimer); clearTimeout(v.doneTimer);
-      if (v.closeOnExit) hands.act({ op: 'close', ...v.closeOnExit }).catch((err) => log(`director: ${v.s.tmux}: ${err.message}`));
-      q.take.run(v.s.sessionId);
-      emit(v.s.sessionId, 'exited');
+      const started = q.own.get(id)?.how === 'started';
+      q.take.run(id);
+      if (!started || !v.s.pane) { emit(id, 'exited'); continue; }
+      // One it started goes with its tmux session; ended other than by its stop, what it last showed is kept.
+      closeAfter(v).then(({ screen, closed }) => {
+        emit(id, 'exited', screen ? { screen } : null);
+        if (!v.stopping) {
+          bridge?.directorAfter(id, `:robot_face: Claude ended without *the director* stopping it${closed ? ', so its tmux session was closed' : ''}${screen ? `. Its last lines:\n\`\`\`${screen}\`\`\`` : ''}`).catch(() => {});
+        }
+      });
     }
     looked = true;
+  }
+
+  /** A session it started, whose Claude has exited: its tmux session closed, and, unless it was stopped, the screen it left. */
+  async function closeAfter(v) {
+    let screen = null, closed = false;
+    if (!v.stopping) {
+      try {
+        const r = await hands.act({ op: 'early', pane: v.s.pane, socket: v.s.socket, any: true });
+        if (r.shell) screen = r.screen.text.split('\n').filter((x) => x.trim()).slice(-12).join('\n').slice(-1500) || null;
+      } catch { /* gone already */ }
+    }
+    try { closed = (await hands.act({ op: 'close', pane: v.s.pane, socket: v.s.socket })).closed; } catch (err) { log(`director: ${v.s.tmux}: ${err.message}`); }
+    return { screen, closed };
   }
 
   /**
@@ -622,11 +643,11 @@ export function startDirector({ hands, log = () => {} }) {
       }
       if (postReq && op === 'stop') {
         return write(id, async () => {
-          // One it started goes with its tmux session, once Claude has exited - which can be before this hears back.
+          // Said before typing: Claude can have exited before this hears back.
           const v = seen.get(id);
-          if (v && q.own.get(id)?.how === 'started') v.closeOnExit = { pane: s.pane, socket: s.socket };
+          if (v) v.stopping = true;
           try { return await bridge.directorType(id, '/exit', 'stopped it with'); } catch (err) {
-            if (v) v.closeOnExit = null;
+            if (v) v.stopping = false;
             throw err;
           }
         });

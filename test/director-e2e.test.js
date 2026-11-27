@@ -353,7 +353,8 @@ test('events: a long poll that wakes on the next one, idle, and seq that survive
 
 test('stop ends it with /exit, and it is gone', { skip: !hasTmux, timeout: 60_000 }, async () => {
   await ok('POST', `/sessions/${t.id}/stop`);
-  await event('exited', (e) => e.kind === 'exited' && e.session === t.id);
+  const exited = await event('exited', (e) => e.kind === 'exited' && e.session === t.id);
+  assert.equal(exited.detail, null, 'stopped, so nothing to keep of its screen');
   // One it started goes with its tmux session; the owner's keep theirs.
   await until('its tmux session closed', () => tmux('has-session', '-t', '=beta-dir').status !== 0);
   assert.equal(tmux('has-session', '-t', '=alpha').status, 0);
@@ -445,4 +446,39 @@ test('a start that will not come up is given up, its pane closed, saying why', {
   assert.ok(!(await events()).some((e) => e.kind === 'launch_failed' && e.detail.tmux === 'theta-dir'));
   await ok('POST', `/sessions/${up.session}/stop`);
   await gone('theta-dir');
+});
+
+test('one it started that ends on its own goes with its tmux session, its last lines kept, unless someone has it open', { skip: !hasTmux, timeout: 60_000 }, async () => {
+  const cwd = path.join(home, 'work', 'iota');
+  fs.mkdirSync(cwd, { recursive: true });
+  const crash = async (name) => {
+    const { id } = await ok('POST', '/sessions', { cwd, name });
+    const thread = threadTs(await until('its thread', async () => (await ok('GET', `/sessions/${id}`)).thread));
+    return { id, thread, crash: () => ok('POST', `/sessions/${id}/type`, { text: 'CRASH now' }) };
+  };
+  const note = (thread) => until('the note in its thread', () => inThread(thread).map(blocksText).find((b) => /ended without \*the director\* stopping it/.test(b)));
+  const a = await crash('iota-dir');
+  await a.crash();
+  const ex = await event('exited', (e) => e.kind === 'exited' && e.session === a.id);
+  assert.match(ex.detail.screen, /Error: the fake crashed/);
+  await until('its tmux session closed', () => tmux('has-session', '-t', '=iota-dir').status !== 0);
+  const said = await note(a.thread);
+  assert.match(said, /so its tmux session was closed\. Its last lines:/);
+  assert.match(said, /the fake crashed/);
+  // Someone has it open: left as it is.
+  const b = await crash('kappa-dir');
+  // A terminal attached to it, kept open by its input staying open.
+  const viewer = spawn('script', ['-qfc', `tmux -S '${sock}' attach -t =kappa-dir`, '/dev/null'], { env: { ...env0, TERM: 'xterm' }, stdio: ['pipe', 'ignore', 'ignore'] });
+  try {
+    await until('someone looking', () => tmux('list-sessions', '-F', '#{session_name} #{session_attached}').stdout.includes('kappa-dir 1'));
+    await b.crash();
+    const ex2 = await event('exited', (e) => e.kind === 'exited' && e.session === b.id);
+    assert.match(ex2.detail.screen, /Error: the fake crashed/);
+    const said2 = await note(b.thread);
+    assert.ok(!/so its tmux session was closed/.test(said2), said2);
+    assert.equal(tmux('has-session', '-t', '=kappa-dir').status, 0, 'left open while someone looks');
+  } finally {
+    viewer.kill();
+    tmux('kill-session', '-t', '=kappa-dir');
+  }
 });

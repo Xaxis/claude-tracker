@@ -1356,6 +1356,11 @@ export function startBridge({ info = () => null, usage = () => '', here = 'this 
     threadOf(id) { const x = live.get(keyOf(null, id)); return x?.thread ? link(x.thread.channel, x.thread.ts) : null; },
     directorType, directorKeys, directorPost, directorEdit,
     async directorNote(id, text) { const x = await directorSession(id); return meta(x, text, 0); },
+    /** A word in the thread of a session that has just ended, if it had one. */
+    async directorAfter(id, text) {
+      const row = ready() ? q.get.get(id) : null;
+      return row && !row.machine_id ? post(row.channel, row.ts, plain(text), { blocks: [context(text)] }, 0) : null;
+    },
     directorTook: (from) => mark(from, 'eyes'),
     stop() {
       clearInterval(watcher); clearInterval(cards); clearTimeout(ovTimer); clearTimeout(moveTimer);

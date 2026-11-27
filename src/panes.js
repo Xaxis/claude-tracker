@@ -93,14 +93,14 @@ async function panesOf(socket) {
   let text;
   try {
     text = await tmux(socket, ['list-panes', '-a', '-F',
-      '#{pane_id}\t#{pane_tty}\t#{session_name}\t#{window_index}\t#{pane_index}\t#{pane_current_command}']);
+      '#{pane_id}\t#{pane_tty}\t#{session_name}\t#{window_index}\t#{pane_index}\t#{pane_current_command}\t#{session_attached}']);
   } catch (err) {
     if (err.killed || err.signal) throw err;   // timed out: it has not said there are none
     return out;                                 // no server there
   }
   for (const line of text.split('\n')) {
-    const [id, tty, session, win, pane, command] = line.split('\t');
-    if (id) out.set(id, { id, tty: tty.replace(/^\/dev\//, ''), session, target: `${session}:${win}.${pane}`, command });
+    const [id, tty, session, win, pane, command, attached] = line.split('\t');
+    if (id) out.set(id, { id, tty: tty.replace(/^\/dev\//, ''), session, target: `${session}:${win}.${pane}`, command, attached: Number(attached) || 0 });
   }
   return out;
 }
@@ -798,11 +798,13 @@ export function startPanes({ onSessions = () => {}, onItems = () => {} } = {}) {
 
   /**
    * Close a tmux session Claude has exited from: only when its one pane is
-   * back at a shell, so nothing running there is ended with it.
+   * back at a shell, so nothing running there is ended with it, and no one
+   * has it open to look at.
    */
   async function closeSession({ pane, socket, force = false }) {
     const p = (await panesOf(socket)).get(pane);
     if (!p) return { closed: false };
+    if (p.attached) return { closed: false, why: 'someone has it open' };
     // Claude still in it, stopped on a first question: only in a pane this just made, before it began.
     const fresh = force && made.has(pane) && ![...live.values()].some((s) => s.pane === pane);
     if (!SHELLS.has(p.command) && !fresh) throw new Error(`left open: ${p.command} is running in it`);
