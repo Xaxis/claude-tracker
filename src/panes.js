@@ -812,14 +812,18 @@ export function startPanes({ onSessions = () => {}, onItems = () => {} } = {}) {
     return { closed: true };
   }
 
-  /** A pane Claude was just launched in, before it has registered: its screen, or keys for its first dialog. */
-  async function earlyPane({ pane, socket }, keys) {
+  /**
+   * A pane Claude was just launched in, before it has registered: its screen,
+   * or keys for its first dialog. `any`: its screen whatever runs there, and
+   * whether that is a shell - Claude ended before it began.
+   */
+  async function earlyPane({ pane, socket, any = false }, keys) {
     const panes = await panesOf(socket);
     const p = panes.get(pane);
     if (!p) throw new Error('that tmux session is gone');
-    if (p.command !== 'claude') throw new Error(`Claude is not running there (${p.command})`);
+    if (p.command !== 'claude' && (keys || !any)) throw new Error(`Claude is not running there (${p.command})`);
     if (keys) await tmux(socket, ['send-keys', '-t', pane, '--', ...keys]);
-    return tmux(socket, ['capture-pane', '-p', '-t', pane]);
+    return { text: await tmux(socket, ['capture-pane', '-p', '-t', pane]), shell: SHELLS.has(p.command) };
   }
 
   async function screen(s) {
@@ -838,8 +842,10 @@ export function startPanes({ onSessions = () => {}, onItems = () => {} } = {}) {
       if (op.op === 'launch') return launch(op);
       if (op.op === 'close') return closeSession(op);
       if (op.op === 'early') {
-        const text = (await earlyPane(op, op.keys ? parseKeys(op.keys) : null)).replace(/[ \t]+$/gm, '').trimEnd();
-        return { screen: { text, options: screenOptions(text), dialog: screenDialog(text) } };
+        const { text: raw, shell } = await earlyPane(op, op.keys ? parseKeys(op.keys) : null);
+        const text = raw.replace(/[ \t]+$/gm, '').trimEnd();
+        if (shell) return { screen: { text, options: [], dialog: null }, shell };
+        return { screen: { text, options: screenOptions(text), dialog: screenDialog(text) }, shell };
       }
       const s = await check(op.sessionId);
       switch (op.op) {

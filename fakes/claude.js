@@ -18,6 +18,10 @@ import path from 'node:path';
  *   /exit   quits
  *
  * Ctrl-C quits at once, so a test can tell if the tracker ever sends one.
+ *
+ * A `.fake-start` file in its folder, `{ "after": ms, "then": "ask" | "die" | "hang" }`,
+ * has it wait, then stop on a question before it registers (as Claude Code
+ * asks to trust a folder), fail before it ever does, or never get going.
  */
 const [profile, sessionId, cwd] = process.argv.slice(2);
 const slug = cwd.replace(/[^a-zA-Z0-9]/g, '-');
@@ -188,5 +192,19 @@ process.stdout.write('\x1b[?2004h');   // bracketed paste on, as Claude Code tur
 if (process.env.CLAUDE_CODE_OAUTH_TOKEN) {
   fs.writeFileSync(path.join(profile, `env-${sessionId}.json`), JSON.stringify({ token: process.env.CLAUDE_CODE_OAUTH_TOKEN, configDir: process.env.CLAUDE_CONFIG_DIR ?? null }));
 }
-register();
-draw();
+let start = null;
+try { start = JSON.parse(fs.readFileSync(path.join(cwd, '.fake-start'), 'utf8')); } catch { /* up at once */ }
+setTimeout(() => {
+  if (start?.then === 'die') {
+    process.stdout.write('\x1b[2J\x1b[H Error: the fake could not start\r\n');
+    process.exit(1);
+  }
+  if (start?.then === 'hang') { process.stdout.write('\x1b[2J\x1b[H Starting…\r\n'); return; }
+  if (start?.then === 'ask') {
+    menu = ['Yes, I trust this folder', 'No, exit'];
+    process.stdout.write(`\x1b[2J\x1b[H${'─'.repeat(50)}\r\n Accessing workspace:\r\n\r\n ${cwd}\r\n\r\n Quick safety check: Is this a project you trust?\r\n\r\n ❯ 1. ${menu[0]}\r\n   2. ${menu[1]}\r\n\r\n Enter to confirm · Esc to cancel\r\n`);
+    return;
+  }
+  register();
+  draw();
+}, start?.after ?? 0);

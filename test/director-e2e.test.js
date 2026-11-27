@@ -47,15 +47,17 @@ const psFails = path.join(home, 'ps-fails');
 const shims = path.join(root, 'shims');
 fs.mkdirSync(shims, { recursive: true });
 fs.writeFileSync(path.join(shims, 'ps'), `#!/bin/sh\n[ -e '${psFails}' ] && exit 2\nexec '${spawnSync('sh', ['-c', 'command -v ps'], { encoding: 'utf8' }).stdout.trim()}' "$@"\n`, { mode: 0o755 });
-// In the profile CLAUDE_CONFIG_DIR names, as Claude Code is, or the default one.
-const LAUNCH = `'${process.execPath}' '${FAKE}' "\${CLAUDE_CONFIG_DIR:-${prof}}" "$('${process.execPath}' -p 'crypto.randomUUID()')" "$PWD"`;
+// Named claude, as tmux sees Claude Code, in the profile CLAUDE_CONFIG_DIR names, or the default one.
+fs.mkdirSync(path.join(root, 'bin'));
+fs.symlinkSync(process.execPath, path.join(root, 'bin', 'claude'));
+const LAUNCH = `'${path.join(root, 'bin', 'claude')}' '${FAKE}' "\${CLAUDE_CONFIG_DIR:-${prof}}" "$('${process.execPath}' -p 'crypto.randomUUID()')" "$PWD"`;
 
 let slack, proc, log = '';
 const t = {};
 const env = () => ({
   ...env0, PATH: `${shims}:${env0.PATH}`, HOME: home, CLAUDE_TRACKER_DIR: data, CLAUDE_TRACKER_NOTIFY: '0', NO_COLOR: '1',
   CLAUDE_TRACKER_SLACK_API: slack.api, CLAUDE_TRACKER_PANES_MS: '250', CLAUDE_TRACKER_LAUNCH: LAUNCH,
-  CLAUDE_TRACKER_DIRECTOR_IDLE: '0.05',
+  CLAUDE_TRACKER_DIRECTOR_IDLE: '0.05', CLAUDE_TRACKER_DIRECTOR_LAUNCH_S: '8,20',
   BOX_GPU_DIR: path.join(home, 'box-gpu'), BOX_HEAVY_DIR: path.join(home, 'box-heavy'), BOX_GPU_STATE: path.join(home, 'gpu-state'),
 });
 function start() {
@@ -197,7 +199,7 @@ test('keys by name, a slash command, and the Ctrl-C it never sends', { skip: !ha
   assert.match(inThread(t.thread).map(blocksText).join('\n'), /the director\* ran `\/compact`/);
   const r = await ok('POST', `/sessions/${t.id}/keys`, { keys: ['shift-tab'] });
   assert.match(r.screen, /accept edits on/);
-  assert.equal(tmux('display', '-p', '-t', 'beta-dir', '#{pane_current_command}').stdout.trim(), 'node', 'still running: no Ctrl-C');
+  assert.equal(tmux('display', '-p', '-t', 'beta-dir', '#{pane_current_command}').stdout.trim(), 'claude', 'still running: no Ctrl-C');
 });
 
 test('a session that cannot be read for a moment has not ended, and is still the director\'s', { skip: !hasTmux, timeout: 60_000 }, async () => {
@@ -396,4 +398,51 @@ test('on an account of its own: refused until its token, profile and folder are 
   assert.ok(!shown.includes('TEST_token') && !shown.includes('postgres'), 'nothing from the env file is ever shown');
   await ok('POST', `/sessions/${r.id}/stop`);
   await until('its tmux session closed', () => tmux('has-session', '-t', '=gamma-bot').status !== 0);
+});
+
+test('a start that will not come up is given up, its pane closed, saying why', { skip: !hasTmux, timeout: 90_000 }, async () => {
+  fs.rmSync(path.join(data, 'director.json'));
+  const folder = (name, start) => {
+    const d = path.join(home, 'work', name);
+    fs.mkdirSync(d, { recursive: true });
+    if (start) fs.writeFileSync(path.join(d, '.fake-start'), JSON.stringify(start));
+    return d;
+  };
+  const gone = (name) => until(`${name} closed`, () => tmux('has-session', '-t', `=${name}`).status !== 0);
+  const [died, asked, askedLate, hung, slow] = await Promise.all([
+    api('POST', '/sessions', { cwd: folder('delta', { then: 'die' }), name: 'delta-dir' }),
+    api('POST', '/sessions', { cwd: folder('eps', { then: 'ask' }), name: 'eps-dir' }),
+    api('POST', '/sessions', { cwd: folder('zeta', { after: 10_000, then: 'ask' }), name: 'zeta-dir' }),
+    api('POST', '/sessions', { cwd: folder('eta', { then: 'hang' }), name: 'eta-dir' }),
+    api('POST', '/sessions', { cwd: folder('theta', { after: 10_000 }), name: 'theta-dir', prompt: 'hello, late' }),
+  ]);
+  // Ended, or asked, while its start waited: refused, saying so.
+  assert.equal(died.status, 409, JSON.stringify(died.body));
+  assert.match(died.body.error, /^Claude ended before it started: .*the fake could not start/);
+  assert.equal(asked.status, 409, JSON.stringify(asked.body));
+  assert.match(asked.body.error, /^Claude asked something before it started, so it was closed: Accessing workspace:.*trust/);
+  await gone('delta-dir');
+  await gone('eps-dir');
+  // Not up yet: pending, then given up once it asks, or once it has taken far too long.
+  for (const r of [askedLate, hung, slow]) {
+    assert.equal(r.status, 200, JSON.stringify(r.body));
+    assert.equal(r.body.id, null);
+    assert.match(r.body.pending, /launch_failed/);
+  }
+  const failed = (tmuxName) => event(`launch_failed for ${tmuxName}`, (e) => e.kind === 'launch_failed' && e.detail.tmux === tmuxName, 40_000);
+  const late = await failed('zeta-dir');
+  assert.equal(late.session, null);
+  assert.equal(late.detail.cwd, path.join(home, 'work', 'zeta'));
+  assert.match(late.detail.why, /^Claude asked something before it started, so it was closed: Accessing workspace:/);
+  await gone('zeta-dir');
+  assert.match((await failed('eta-dir')).detail.why, /^Claude was not up after 20 seconds, so it was closed$/);
+  await gone('eta-dir');
+  // One that is only slow comes up the director's, with its first message, said by its started event.
+  const up = await event('theta started', (e) => e.kind === 'started' && e.detail.tmux === 'theta-dir', 40_000);
+  assert.equal(up.detail.owner, 'director');
+  await until('its first message', () => prompts(transcriptOf(path.join(home, 'work', 'theta'), up.session)).includes('hello, late'));
+  assert.equal((await ok('GET', `/sessions/${up.session}`)).owner, 'director');
+  assert.ok(!(await events()).some((e) => e.kind === 'launch_failed' && e.detail.tmux === 'theta-dir'));
+  await ok('POST', `/sessions/${up.session}/stop`);
+  await gone('theta-dir');
 });

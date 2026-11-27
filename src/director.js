@@ -34,7 +34,10 @@ const CONTEXT_AT = [70, 85];      // percent of the way to auto-compact, each sa
 // How often idle stretches and context use are looked at: each look works out every session's account and context.
 const WATCH_MS = Math.min(30_000, Math.max(1000, (Math.min(...IDLE_AT) * 60_000) / 4));
 const BODY_MAX = 256 * 1024;
-const LAUNCH_WAIT_MS = 30_000;
+// Seconds a start waits for Claude to come up, and after which one still not up is given up (a test says sooner).
+const LAUNCH_S = (process.env.CLAUDE_TRACKER_DIRECTOR_LAUNCH_S || '30,600').split(',').map(Number);
+const LAUNCH_WAIT_MS = (LAUNCH_S[0] > 0 ? LAUNCH_S[0] : 30) * 1000;
+const LAUNCH_GIVE_UP_MS = LAUNCH_S[1] > 0 ? LAUNCH_S[1] * 1000 : LAUNCH_WAIT_MS * 20;
 
 const clip = (s, n) => { s = String(s ?? '').replace(/\s+/g, ' ').trim(); return s.length > n ? `${s.slice(0, n - 1)}…` : s; };
 
@@ -190,6 +193,7 @@ export function startDirector({ hands, log = () => {} }) {
           launches.delete(s.pane);
           q.give.run(s.sessionId, now, 'started');
           emit(s.sessionId, 'started', { cwd: s.cwd, owner: 'director', tmux: s.tmux });
+          launch.came = s;
           launch.found(s);
           v.prompt = launch.prompt;
           bridge?.directorNote(s.sessionId, `:robot_face: *the director* started this session${launch.prompt ? ': its first message is typed once it is up' : ''}`).catch(() => {});
@@ -281,8 +285,56 @@ export function startDirector({ hands, log = () => {} }) {
     emit(v.s.sessionId, 'turn_done', { n, answerPreview: clip(turn?.answer ?? '', 300), ...(turn?.interrupted ? { interrupted: true } : {}), ...(turn?.error ? { error: turn.error } : {}) });
   }
 
+  /**
+   * A start not up yet: still starting, stopped on a question, or ended
+   * before it began - with what its screen says. Only a pane back at its
+   * shell has ended: one running anything else may be Claude by another name.
+   */
+  async function examine(l) {
+    let r;
+    try { r = await hands.act({ op: 'early', pane: l.pane, socket: l.socket, any: true }); } catch (err) {
+      return /gone/.test(err.message) ? { state: 'gone', why: 'its tmux session closed before Claude started' } : { state: 'starting' };
+    }
+    const { screen, shell } = r;
+    if (shell) {
+      const last = screen.text.split('\n').map((x) => x.trim()).filter(Boolean).slice(-6).join(' / ');
+      return { state: 'ended', why: `Claude ended before it started${last ? `: ${clip(last, 400)}` : ''}` };
+    }
+    if (screen.options?.length) {
+      const d = screen.dialog;
+      const asked = d ? [d.title, ...d.body.slice(0, 3).map((x) => x.text)].join(' ') : screen.text.split('\n').filter(Boolean).slice(-6).join(' / ');
+      return { state: 'asking', why: `Claude asked something before it started, so it was closed: ${clip(asked, 400)}` };
+    }
+    return { state: 'starting' };
+  }
+
+  /** A start that will not come up: its pane closed, so nothing is left waiting unseen. */
+  async function abandon(l, x) {
+    launches.delete(l.pane);
+    if (x.state !== 'gone') await hands.act({ op: 'close', pane: l.pane, socket: l.socket, force: x.state !== 'ended' }).catch((err) => log(`director: ${l.tmux}: ${err.message}`));
+  }
+
+  /** Starts still not up once their start has answered: given up once they ask, end, or take far too long. */
+  function followLaunches() {
+    for (const l of launches.values()) {
+      if (l.checking || Date.now() - l.at < LAUNCH_WAIT_MS) continue;
+      l.checking = true;
+      examine(l).then(async (x) => {
+        if (launches.get(l.pane) !== l) return;   // it came up meanwhile
+        if (x.state === 'starting') {
+          if (Date.now() - l.at < LAUNCH_GIVE_UP_MS) return;
+          const took = LAUNCH_GIVE_UP_MS < 120_000 ? `${Math.round(LAUNCH_GIVE_UP_MS / 1000)} seconds` : `${Math.round(LAUNCH_GIVE_UP_MS / 60_000)} minutes`;
+          x = { state: 'late', why: `Claude was not up after ${took}, so it was closed` };
+        }
+        await abandon(l, x);
+        emit(null, 'launch_failed', { tmux: l.tmux, cwd: l.cwd, why: x.why });
+      }).catch((err) => log(`director: ${l.tmux}: ${err.message}`)).finally(() => { l.checking = false; });
+    }
+  }
+
   // Idle stretches and context use change without a session's list changing.
   const watch = setInterval(() => {
+    followLaunches();
     const now = Date.now();
     for (const v of seen.values()) {
       if (v.idleSince) {
@@ -439,25 +491,23 @@ export function startDirector({ hands, log = () => {} }) {
     const env = accountEnv(body.account ?? null, path.resolve(cwd.replace(/^~(?=\/|$)/, HOME)));
     let r;
     try { r = await hands.act({ op: 'launch', dir: cwd, name, model, env }); } catch (err) { throw new Refused(400, err.message); }
-    const found = new Promise((resolve) => {
-      launches.set(r.pane, { prompt: prompt?.trim() ? prompt : null, found: resolve, at: Date.now() });
+    const l = { pane: r.pane, socket: r.socket, tmux: r.tmux, cwd: r.dir, prompt: prompt?.trim() ? prompt : null, at: Date.now(), checking: true };
+    let s = await new Promise((resolve) => {
+      l.found = resolve;
+      launches.set(r.pane, l);
       setTimeout(() => resolve(null), LAUNCH_WAIT_MS).unref?.();
     });
-    setTimeout(() => launches.delete(r.pane), 15 * 60_000).unref?.();
-    const s = await found;
     if (!s) {
-      // Stopped on a question before it starts - a folder to trust, a first run: said, and the pane closed, rather than left waiting unseen.
-      let early = null;
-      try { early = (await hands.act({ op: 'early', pane: r.pane, socket: r.socket })).screen; } catch { /* gone, or not Claude */ }
-      if (early?.options?.length) {
-        launches.delete(r.pane);
-        await hands.act({ op: 'close', pane: r.pane, socket: r.socket, force: true }).catch(() => {});
-        const d = early.dialog;
-        const asked = d ? [d.title, ...d.body.slice(0, 3).map((l) => l.text)].join(' ') : early.text.split('\n').filter(Boolean).slice(-6).join(' / ');
-        throw new Refused(409, `Claude asked something before it started, so it was closed: ${clip(asked, 400)}`);
+      // Stopped on a question before it starts - a folder to trust, a first run - or ended: said, and the pane closed, rather than left waiting unseen.
+      const x = await examine(l).catch(() => ({ state: 'starting' }));
+      s = l.came ?? null;   // up while it was looked at
+      if (!s && launches.get(r.pane) === l && x.state !== 'starting') {
+        await abandon(l, x);
+        throw new Refused(409, x.why);
       }
+      l.checking = false;   // followed from here on: launch_failed if it never comes up
     }
-    return { id: s?.sessionId ?? null, tmux: r.tmux, cwd: r.dir, ...(s ? {} : { pending: 'not up yet: its id comes with the started event' }) };
+    return { id: s?.sessionId ?? null, tmux: r.tmux, cwd: r.dir, ...(s ? {} : { pending: 'not up yet: its id comes with the started event, or launch_failed says why not' }) };
   }
 
   /* --- the API ------------------------------------------------------------------ */
