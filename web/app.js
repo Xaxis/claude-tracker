@@ -1385,6 +1385,10 @@ function fillProject(row, p, v, colorOf, force = false) {
   const open = row.querySelector('.project-open');
   open.setAttribute('aria-expanded', String(machineState.open.has(p.name)));
   const seg = row.querySelector('.seg');
+  // A throwaway folder's: nothing to rank, as its folder goes with the run. One already ranked keeps its choices, to be set back.
+  const temp = p.temp && !p.ranked;
+  seg.hidden = temp;
+  if (temp) sum.append(' · ', el('span', 'is-temp', 'a temporary folder, nothing to rank'));
   seg.classList.toggle('is-pending', machineState.pending.has(p.name));
   for (const b of seg.children) {
     b.setAttribute('aria-checked', String(b.dataset.tier === tier));

@@ -253,14 +253,8 @@ function procLabel(comm, argv) {
 
 /* --- projects --------------------------------------------------------------- */
 
-const projectMemo = new Map();
+const projectMemo = new Map();   // dir -> { name, temp }
 
-/**
- * The project a directory belongs to, named as heavy names it, so a project's
- * sessions and its jobs meet under one name: a session's folder's project, else
- * the main repository's directory name (a worktree counts as its repo), else the
- * directory's own name.
- */
 /**
  * The main checkout `dir` belongs to, as `git rev-parse --git-common-dir` would
  * say (a worktree counts as its repo), or null outside a repository. Read from
@@ -294,8 +288,30 @@ export function gitTop(dir) {
   return top;
 }
 
+// Where throwaway folders are made.
+const TEMP_ROOTS = [...new Set([os.tmpdir(), '/tmp', '/var/tmp', '/dev/shm', '/private/tmp', '/private/var/folders'])];
+
+/**
+ * The project a directory belongs to, named as heavy names it, so a project's
+ * sessions and its jobs meet under one name: a session's folder's project, else
+ * the main repository's directory name (a worktree counts as its repo), else the
+ * directory's own name.
+ */
 export function projectOf(dir) {
-  if (!dir) return null;
+  return dir ? placed(dir).name : null;
+}
+
+/**
+ * Whether `dir`'s project is only a throwaway folder's own name: a temp folder
+ * outside every repository and every session's folders. It is named as heavy
+ * names it, but it is nothing to rank: the folder goes with the run, and a rank
+ * given it outlives both.
+ */
+export function inThrowaway(dir) {
+  return !!dir && placed(dir).temp;
+}
+
+function placed(dir) {
   if (projectMemo.has(dir)) return projectMemo.get(dir);
   let name = null;
   // A Claude session's own folders (its scratchpad in the temp dir's claude-<uid>, its
@@ -311,10 +327,15 @@ export function projectOf(dir) {
     const top = gitTop(dir);
     if (top) name = path.basename(top);
   }
-  name ??= path.basename(dir) || dir;
+  let temp = false;
+  if (!name) {
+    name = path.basename(dir) || dir;
+    temp = TEMP_ROOTS.some((t) => dir.startsWith(`${t}/`));
+  }
   if (projectMemo.size > 2000) projectMemo.clear();
-  projectMemo.set(dir, name);
-  return name;
+  const r = { name, temp };
+  projectMemo.set(dir, r);
+  return r;
 }
 
 /**
@@ -323,10 +344,10 @@ export function projectOf(dir) {
  * gone into one, that repository, as heavy names the jobs it runs there. A
  * session that moves between repositories moves with them.
  */
-export function sessionProject({ cwd, workDir } = {}) {
-  if (workDir && workDir !== cwd && !gitTop(cwd) && gitTop(workDir)) return projectOf(workDir);
-  return projectOf(cwd);
+export function sessionProject(s = {}) {
+  return projectOf(sessionDir(s));
 }
+const sessionDir = ({ cwd, workDir } = {}) => (workDir && workDir !== cwd && !gitTop(cwd) && gitTop(workDir) ? workDir : cwd);
 
 /**
  * The directory a Claude folder name stands for. Claude names a session's
@@ -483,7 +504,7 @@ export function sample(sessions = [], now = Date.now()) {
   // Running sessions by every id their commands carry, and by their own process.
   const bySid = new Map(), byPid = new Map();
   for (const s of sessions) {
-    const info = { ...s, project: sessionProject(s) };
+    const info = { ...s, project: sessionProject(s), temp: inThrowaway(sessionDir(s)) };
     for (const id of [s.sessionId, s.parkedJobId]) if (id) bySid.set(id, info);
     if (s.pid) byPid.set(s.pid, info);
   }
@@ -508,7 +529,7 @@ export function sample(sessions = [], now = Date.now()) {
     else if (byPid.has(pid)) o = { kind: 'session', s: byPid.get(pid) };
     else if (f.sessionId && bySid.has(f.sessionId)) o = { kind: 'session', s: bySid.get(f.sessionId) };
     else if (f.claude && f.cwd) {
-      o = { kind: 'session', s: { sessionId: `pid:${pid}`, pid, cwd: f.cwd, project: projectOf(f.cwd),
+      o = { kind: 'session', s: { sessionId: `pid:${pid}`, pid, cwd: f.cwd, project: projectOf(f.cwd), temp: inThrowaway(f.cwd),
         name: / /.test(f.cmd) ? f.cmd.replace(/^\S*\//, '').slice(0, 60) : null } };
     }
     else if (f.tracker || /\/claude-tracker\.service$/.test(f.cg)) o = { kind: 'tracker' };
@@ -517,7 +538,7 @@ export function sample(sessions = [], now = Date.now()) {
       const up = ownerOf(p.ppid, depth + 1);
       if (up && (up.kind === 'session' || up.kind === 'leftover' || up.kind === 'tracker' || (mac && up.kind === 'job'))) o = up;
     }
-    if (!o && f.sessionId) o = { kind: 'leftover', sessionId: f.sessionId, project: projectOf(f.pwd) };
+    if (!o && f.sessionId) o = { kind: 'leftover', sessionId: f.sessionId, project: projectOf(f.pwd), temp: inThrowaway(f.pwd) };
     if (!o) o = { kind: mac ? macOtherKind(f.exe ?? '', uidOf(pid)) : otherKind(f.cg, uidOf(pid)) };
     owner.set(pid, o);
     return o;
@@ -536,7 +557,7 @@ export function sample(sessions = [], now = Date.now()) {
   const bucket = (key, kind, name) => {
     let b = buckets.get(key);
     if (!b) {
-      b = { key, kind, name, cores: 0, mem: 0, procs: 0, sessions: new Map(), jobs: new Map(), leftovers: new Map(), comms: new Map() };
+      b = { key, kind, name, temp: true, cores: 0, mem: 0, procs: 0, sessions: new Map(), jobs: new Map(), leftovers: new Map(), comms: new Map() };
       buckets.set(key, b);
     }
     return b;
@@ -564,6 +585,7 @@ export function sample(sessions = [], now = Date.now()) {
       addComm(j.comms, p, cores);
     } else if (o.kind === 'session') {
       const b = bucket(`p:${o.s.project}`, 'project', o.s.project);
+      b.temp &&= !!o.s.temp;
       b.cores += cores; b.mem += p.rss; b.procs++;
       let s = b.sessions.get(o.s.sessionId);
       if (!s) {
@@ -576,6 +598,7 @@ export function sample(sessions = [], now = Date.now()) {
     } else if (o.kind === 'leftover') {
       const name = o.project ?? 'unknown';
       const b = bucket(`p:${name}`, 'project', name);
+      b.temp &&= !!o.temp;
       b.cores += cores; b.mem += p.rss; b.procs++;
       const l = b.leftovers.get(o.sessionId) ?? { sessionId: o.sessionId, cores: 0, mem: 0, procs: 0, comms: new Map() };
       l.cores += cores; l.mem += p.rss; l.procs++;
@@ -604,6 +627,8 @@ export function sample(sessions = [], now = Date.now()) {
     if (cores == null) cores = [...j.comms.values()].reduce((a, c) => a + c.cores, 0);
     const memUse = mem ?? [...j.comms.values()].reduce((a, c) => a + c.mem, 0);
     const b = bucket(`p:${j.project}`, 'project', j.project);
+    // A job heavy named for the throwaway folder it was started in.
+    b.temp &&= !!j.held?.cwd && inThrowaway(j.held.cwd) && projectOf(j.held.cwd) === j.project;
     b.cores += cores; b.mem += memUse; b.procs += j.procs;
     // A scope is named for its heavy, which lives as long as the job: one whose heavy is gone
     // holds what a killed job left running, nobody's any more.
@@ -704,7 +729,7 @@ export function machineView({ step = 15e3, nameOf = () => null, placeName = (_id
     let p = projects.get(name);
     if (!p) {
       const tier = prio.ranks[name] ?? 'normal';
-      p = { name, label: labelOf(name), tier, ranked: name in prio.ranks, weight: WEIGHTS[tier],
+      p = { name, label: labelOf(name), tier, ranked: name in prio.ranks, temp: false, weight: WEIGHTS[tier],
         cores: 0, mem: 0, procs: 0, sessions: [], jobs: [], waits: [], leftovers: [],
         pool: { held: 0, waiting: 0, share: tier === 'high' ? cfg.borrow ?? null : cfg.per_project ?? null } };
       projects.set(name, p);
@@ -718,7 +743,7 @@ export function machineView({ step = 15e3, nameOf = () => null, placeName = (_id
       continue;
     }
     const p = project(b.name);
-    p.cores = round(b.cores); p.mem = b.mem; p.procs = b.procs;
+    p.cores = round(b.cores); p.mem = b.mem; p.procs = b.procs; p.temp = b.temp;
     p.sessions = [...b.sessions.values()].sort((a, c) => c.cores - a.cores).map((x) => ({
       sessionId: x.sessionId, name: x.name ?? nameOf(x.sessionId), status: x.status, cwd: x.cwd,
       cores: round(x.cores), mem: x.mem, procs: x.procs, top: tops(x.comms) }));

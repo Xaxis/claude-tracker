@@ -167,6 +167,48 @@ test('a session started in the folder above its repositories is the project it w
   assert.ok(names.includes('echo') && !names.includes('delta'), names.join(','));
 });
 
+test('a throwaway folder outside every repository is no project to rank, though it is named for the folder as heavy names it', () => {
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ct-'));
+  const scratch = fs.mkdtempSync(path.join(tmpRoot, 'run-'));
+  const cloned = path.join(tmpRoot, 'clone');
+  fs.mkdirSync(path.join(cloned, '.git'), { recursive: true });
+  const sessionScratch = path.join(os.tmpdir(), 'claude-1000', '-srv-zeta', 'abc', 'scratchpad');
+  fs.mkdirSync(sessionScratch, { recursive: true });
+  const kept = repo('kappa');
+  const jobScope = `${USER}/box.slice/box-x.slice/heavy-${path.basename(scratch)}-910-1794000000000000000.scope`;
+  const world = (k) => {
+    machineFiles(1000 * k, 2400 * k);
+    proc(100, { comm: 'claude', cg: `${USER}/app.slice/run-r1.scope`, ticks: 10 * k, cwd: kept });
+    // A Claude run in a temp folder, one in a repository cloned into one, and what a session left in its scratchpad.
+    proc(900, { comm: 'claude', cg: `${USER}/app.slice/run-r9.scope`, ticks: 5 * k, argv: ['claude', '-p', 'x'], cwd: scratch });
+    proc(901, { comm: 'claude', cg: `${USER}/app.slice/run-r8.scope`, ticks: 5 * k, argv: ['claude', '-p', 'y'], cwd: cloned });
+    proc(902, { comm: 'node', cg: `${USER}/app.slice/run-r7.scope`, env: { CLAUDE_CODE_SESSION_ID: 'gone', PWD: sessionScratch } });
+    // A heavy job started in a throwaway folder: heavy names it for that folder.
+    proc(910, { comm: 'python3', cg: `${USER}/app.slice/run-r6.scope`, argv: ['python3', '/x/bin/heavy', 'pytest'] });
+    proc(911, { comm: 'pytest', ppid: 910, cg: jobScope, ticks: 20 * k });
+    scopeUse(jobScope, 1e6 * k, 2 ** 28);
+  };
+  fs.rmSync(path.join(BOX, 'slot.0'), { recursive: true, force: true });
+  fs.mkdirSync(path.join(BOX, 'slot.1'), { recursive: true });
+  fs.writeFileSync(path.join(BOX, 'slot.1', 'info.json'), JSON.stringify({ pid: 910, project: path.basename(scratch), cwd: scratch, cmd: 'pytest', since: Math.floor(Date.now() / 1000) }));
+  const sessions = [{ sessionId: 'k', pid: 100, cwd: kept, name: 'k', status: 'busy' }];
+  machine.resetMachine();
+  const t0 = Date.now();
+  world(1); machine.sample(sessions, t0);
+  world(4); machine.sample(sessions, t0 + 3000);
+  const byName = Object.fromEntries(machine.machineView({ nameOf: () => null }).projects.map((p) => [p.name, p]));
+  fs.rmSync(path.join(BOX, 'slot.1'), { recursive: true, force: true });
+
+  const run = byName[path.basename(scratch)];
+  assert.ok(run, 'it is still shown, under the name heavy gives it');
+  assert.equal(run.temp, true, 'but as a throwaway folder\'s');
+  assert.equal(run.sessions.length, 1);
+  assert.equal(run.jobs.length, 1, 'its heavy job meets it under the same name');
+  assert.equal(byName.clone?.temp, false, 'a repository is a project wherever it is');
+  assert.equal(byName.zeta?.temp, false, 'a session\'s scratchpad is that session\'s project');
+  assert.equal(byName.kappa?.temp, false);
+});
+
 test('the owner\'s priorities: read from heavy\'s file, set only through heavy', () => {
   const file = process.env.BOX_PRIORITY_FILE;
   try { fs.unlinkSync(file); } catch { /* none yet */ }

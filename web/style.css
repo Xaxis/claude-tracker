@@ -470,7 +470,7 @@ body:not(.detail) #cache { display: none !important; }
 .storage-row[hidden], .project-body[hidden] { display: none; }
 /* A machine with nothing to show (not sampled, or not measured) keeps only its heading and picker. */
 #machine.is-empty > :not(.panel-head), #storage.is-empty > :not(.panel-head) { display: none; }
-.machine-pick[hidden] { display: none; }
+.machine-pick[hidden], .seg[hidden] { display: none; }
 .machine-pick .is-offline { opacity: .6; }
 .more-btn { margin-top: 8px; }
 @media (max-width: 560px) {
