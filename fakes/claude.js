@@ -22,7 +22,7 @@ const [profile, sessionId, cwd] = process.argv.slice(2);
 const slug = cwd.replace(/[^a-zA-Z0-9]/g, '-');
 const transcript = path.join(profile, 'projects', slug, `${sessionId}.jsonl`);
 const registry = path.join(profile, 'sessions', `${process.pid}.json`);
-fs.mkdirSync(path.dirname(transcript), { recursive: true });
+// As Claude Code does: registered at once, its transcript (and the profile's projects/) only once something is said.
 fs.mkdirSync(path.dirname(registry), { recursive: true });
 
 let input = '', status = 'idle', waitingFor = null, menu = null, timer = null, log = [];
@@ -38,7 +38,10 @@ function register() {
     tmux: `fake:@0.${pane}`, status, waitingFor, startedAt: Date.now(), updatedAt: Date.now(), statusUpdatedAt: Date.now(),
   }));
 }
-const write = (e) => fs.appendFileSync(transcript, `${JSON.stringify({ sessionId, cwd, timestamp: new Date().toISOString(), uuid: Math.random().toString(36).slice(2), ...e })}\n`);
+const write = (e) => {
+  fs.mkdirSync(path.dirname(transcript), { recursive: true });
+  fs.appendFileSync(transcript, `${JSON.stringify({ sessionId, cwd, timestamp: new Date().toISOString(), uuid: Math.random().toString(36).slice(2), ...e })}\n`);
+};
 const say = (text, tools = []) => write({ type: 'assistant', message: { content: [...tools, { type: 'text', text }] } });
 
 function draw() {

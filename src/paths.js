@@ -62,7 +62,10 @@ function isProfileDir(dir) {
   try {
     if (!fs.statSync(dir).isDirectory()) return false;
   } catch { return false; }
-  if (!fs.existsSync(path.join(dir, 'projects'))) return false;
+  // Claude Code registers a session in sessions/ as it starts, but makes projects/ only once
+  // something is said: a profile it has only opened (a theme chosen, a folder trusted) has no
+  // projects/ yet, and its first session must still be seen.
+  if (!['projects', 'sessions'].some((f) => fs.existsSync(path.join(dir, f)))) return false;
   return ['settings.json', 'history.jsonl', '.claude.json', 'sessions']
     .some((f) => fs.existsSync(path.join(dir, f)));
 }

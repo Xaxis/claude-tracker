@@ -47,7 +47,8 @@ const psFails = path.join(home, 'ps-fails');
 const shims = path.join(root, 'shims');
 fs.mkdirSync(shims, { recursive: true });
 fs.writeFileSync(path.join(shims, 'ps'), `#!/bin/sh\n[ -e '${psFails}' ] && exit 2\nexec '${spawnSync('sh', ['-c', 'command -v ps'], { encoding: 'utf8' }).stdout.trim()}' "$@"\n`, { mode: 0o755 });
-const LAUNCH = `'${process.execPath}' '${FAKE}' '${prof}' "$('${process.execPath}' -p 'crypto.randomUUID()')" "$PWD"`;
+// In the profile CLAUDE_CONFIG_DIR names, as Claude Code is, or the default one.
+const LAUNCH = `'${process.execPath}' '${FAKE}' "\${CLAUDE_CONFIG_DIR:-${prof}}" "$('${process.execPath}' -p 'crypto.randomUUID()')" "$PWD"`;
 
 let slack, proc, log = '';
 const t = {};
@@ -81,7 +82,7 @@ const ok = async (method, p, body) => {
 const events = async () => (await ok('GET', '/events?after=0')).events;
 const event = (what, pred) => until(what, async () => (await events()).find(pred));
 
-const transcriptOf = (cwd, id) => path.join(prof, 'projects', cwd.replace(/[^a-zA-Z0-9]/g, '-'), `${id}.jsonl`);
+const transcriptOf = (cwd, id, profile = prof) => path.join(profile, 'projects', cwd.replace(/[^a-zA-Z0-9]/g, '-'), `${id}.jsonl`);
 const said = (file) => { try { return fs.readFileSync(file, 'utf8').trim().split('\n').map((l) => JSON.parse(l)); } catch { return []; } };
 const prompts = (file) => said(file).filter((e) => e.type === 'user' && e.origin?.kind === 'human').map((e) => e.message.content);
 const replies = (file) => said(file).filter((e) => e.type === 'assistant').flatMap((e) => e.message.content.filter((b) => b.type === 'text').map((b) => b.text));
@@ -366,10 +367,15 @@ test('on an account of its own: refused until its token, profile and folder are 
   // Named through a symlink, it is the folder Claude trusts all the same.
   fs.symlinkSync(path.join(home, 'work'), path.join(home, 'linked'));
   const r = await ok('POST', '/sessions', { cwd: path.join(home, 'linked', 'gamma'), account: 'bot', name: 'gamma-bot', prompt: 'hello from its own account' });
-  const got = await until('what the session got', () => { try { return JSON.parse(fs.readFileSync(path.join(prof, `env-${r.id}.json`), 'utf8')); } catch { return null; } });
+  // Its profile has never been used for more than a theme and a trusted folder: no projects/ yet, as Claude Code leaves it.
+  assert.equal(r.pending, undefined, `it came up, in a profile with nothing in it yet: ${JSON.stringify(r)}`);
+  const got = await until('what the session got', () => { try { return JSON.parse(fs.readFileSync(path.join(profile, `env-${r.id}.json`), 'utf8')); } catch { return null; } });
   assert.deepEqual(got, { token: 'sk-ant-oat01-TEST_token-123', configDir: profile });
   assert.deepEqual(fs.readdirSync(path.join(data, 'launch-env')), [], 'the file it came in is gone');
-  await until('its first message', () => [cwd, path.join(home, 'linked', 'gamma')].some((c) => prompts(transcriptOf(c, r.id)).includes('hello from its own account')));
+  await until('its first message', () => [cwd, path.join(home, 'linked', 'gamma')].some((c) => prompts(transcriptOf(c, r.id, profile)).includes('hello from its own account')));
+  // Its transcript, in a projects/ that only now exists, is read like any other.
+  const done = await event('its turn done', (e) => e.kind === 'turn_done' && e.session === r.id);
+  assert.equal(done.detail.n, 1);
   const shown = tmux('capture-pane', '-p', '-S', '-2000', '-t', '=gamma-bot').stdout;
   assert.ok(!shown.includes('TEST_token') && !shown.includes('postgres'), 'nothing from the env file is ever shown');
   await ok('POST', `/sessions/${r.id}/stop`);

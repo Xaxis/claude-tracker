@@ -110,15 +110,19 @@ const isPrint = (args) => / (-p|--print)( |$)/.test(` ${args} `);
 
 // Looking for profiles walks the home directory; once a tick is too often.
 let profiles = null, profilesAt = 0;
-function profilesNow() {
-  if (!profiles || Date.now() - profilesAt > 30_000) { profiles = discoverProfiles(); profilesAt = Date.now(); }
+function profilesNow(fresh = false) {
+  if (fresh || !profiles || Date.now() - profilesAt > 30_000) { profiles = discoverProfiles(); profilesAt = Date.now(); }
   return profiles;
 }
 
-/** The live processes in every profile's session registry, once each. */
-function registered() {
+/**
+ * The live processes in every profile's session registry, once each. `fresh`
+ * while a Claude just started has yet to show up: it may be the first ever to
+ * run in its profile, which only now becomes one.
+ */
+function registered(fresh = false) {
   const byPid = new Map();
-  for (const profile of profilesNow()) {
+  for (const profile of profilesNow(fresh)) {
     let names = [];
     try { names = fs.readdirSync(profile.sessionsDir); } catch { continue; }
     for (const n of names) {
@@ -623,7 +627,7 @@ export function startPanes({ onSessions = () => {}, onItems = () => {} } = {}) {
     if (ticking || stopped) return;
     ticking = true;
     try {
-      const entries = registered();
+      const entries = registered([...made.keys()].some((p) => ![...live.values()].some((x) => x.pane === p) && Date.now() - made.get(p) < 2 * 60_000));
       const pids = [...entries.keys()].sort().join(',');
       if (pids !== placing || Date.now() - placedAt > PLACE_MS) {
         places = await place([...entries.values()]);

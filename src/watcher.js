@@ -87,7 +87,8 @@ export function startWatcher({ onChange }) {
   let profileKey = '';
   const attach = () => {
     profiles = discoverProfiles();
-    const key = profiles.map((p) => p.dir).join('|');
+    // A profile Claude has only opened has no projects/ to watch yet: watched again once it has.
+    const key = profiles.map((p) => `${p.dir}${fs.existsSync(p.projectsDir) ? '' : '?'}`).join('|');
     if (key === profileKey) return;
     const isNew = profileKey !== '';
     profileKey = key;
