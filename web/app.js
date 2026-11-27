@@ -925,7 +925,7 @@ const TIERS_SHOWN = ['high', 'normal', 'low', 'paused'];
 const TIER_LABEL = { high: 'High', normal: 'Normal', low: 'Low', paused: 'Paused' };
 const TIER_HELP = {
   high: 'Goes first: its jobs start before other projects\', and get 4× the CPU when the cores run out',
-  normal: 'First come, first served, with an even share of the CPU',
+  normal: 'First come, first served, with an even share of the CPU. The default: a project set back to it leaves the owner\'s list',
   low: 'Gives way: waits while higher projects want a slot, and gets a fifth of the CPU a normal project gets',
   paused: 'Starts nothing new. What already runs goes on, on idle CPU only',
 };
@@ -1296,20 +1296,29 @@ function renderProjects(v, top, colorOf) {
   else if (pr.broken) note.textContent = 'The priority file does not read as JSON: set any project to rewrite it';
   else if (pr.set) note.textContent = `Last set ${pr.updated ? `${duration(Date.now() - pr.updated)} ago` : ''}${pr.by ? ` from ${pr.by}` : ''}`;
   else note.textContent = 'None set yet: first come, first served, with heavy\'s own ranks';
-  const active = (p) => (p.cores >= 0.05 || p.jobs.length || p.waits.length || p.sessions.length || p.leftovers.length ? 1 : 0);
-  const list = [...v.projects].sort((a, b) => active(b) - active(a) || a.name.localeCompare(b.name));
+  const active = (p) => p.cores >= 0.05 || p.jobs.length || p.waits.length || p.sessions.length || p.leftovers.length;
+  const byName = (a, b) => a.name.localeCompare(b.name);
+  // Ranked with nothing here now - its folder may be long gone - is folded away, not a row that looks like a dead session.
+  const list = v.projects.filter(active).sort(byName);
+  const idle = v.projects.filter((p) => !active(p)).sort(byName);
   const seen = new Set();
-  let prev = null;
-  for (const p of list) {
-    seen.add(p.name);
-    let row = machineState.rows.get(p.name);
-    if (!row) { row = projectRow(p.name); machineState.rows.set(p.name, row); }
-    fillProject(row, p, v, colorOf);
-    // Move it into place only when it is not there already: moving a node drops its hover and focus.
-    const want = prev ? prev.nextSibling : host.firstChild;
-    if (want !== row) host.insertBefore(row, want);
-    prev = row;
-  }
+  const lay = (into, ps) => {
+    let prev = null;
+    for (const p of ps) {
+      seen.add(p.name);
+      let row = machineState.rows.get(p.name);
+      if (!row) { row = projectRow(p.name); machineState.rows.set(p.name, row); }
+      fillProject(row, p, v, colorOf);
+      // Move it into place only when it is not there already: moving a node drops its hover and focus.
+      const want = prev ? prev.nextSibling : into.firstChild;
+      if (want !== row) into.insertBefore(row, want);
+      prev = row;
+    }
+  };
+  lay(host, list);
+  lay($('#idle-projects'), idle);
+  $('#idle-wrap').hidden = !idle.length;
+  $('#idle-sum').textContent = String(idle.length);
   for (const [name, row] of machineState.rows) if (!seen.has(name)) { row.remove(); machineState.rows.delete(name); }
   if (!list.length && !host.querySelector('.empty')) host.append(el('p', 'empty', 'No project uses this machine right now.'));
   if (list.length) host.querySelector(':scope > .empty')?.remove();

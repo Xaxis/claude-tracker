@@ -440,6 +440,8 @@ body:not(.detail) #cache { display: none !important; }
 .others { margin-top: 12px; font-size: 13px; }
 .others summary { cursor: pointer; color: var(--text-secondary); font-size: 12px; }
 .others .session-list { margin-top: 10px; }
+.others-note { margin: 8px 0 0; color: var(--text-secondary); font-size: 12px; }
+.others .project-list { margin-top: 10px; }
 
 /* --- disk space ------------------------------------------------------------- */
 .disk-list { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 14px 24px; margin-bottom: 18px; }
