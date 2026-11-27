@@ -187,6 +187,16 @@ export function toolSummary(block, cwd = null) {
   }
 }
 
+/**
+ * Why Claude Code stopped with an error of its own instead of an answer, as
+ * it names it (`rate_limit`, `authentication_failed`, `server_error`, …), and
+ * when a usage limit says it resets.
+ */
+function failureOf(e) {
+  const resets = Number(e.quotaLimits?.resetsAt);
+  return { kind: String(e.error ?? 'error'), ...(resets > 0 ? { resetsAt: resets < 1e12 ? resets * 1000 : resets } : {}) };
+}
+
 /** The text of a user entry's content, or null for tool results. */
 function userText(content) {
   if (typeof content === 'string') return content;
@@ -256,7 +266,7 @@ export function readEntry(e, state) {
   if (e.type === 'assistant') {
     for (const b of Array.isArray(e.message?.content) ? e.message.content : []) {
       if (b?.type === 'text' && b.text?.trim()) {
-        out.push({ kind: 'text', text: b.text, tools: state.tools ?? [], at, uuid: e.uuid, error: !!e.isApiErrorMessage });
+        out.push({ kind: 'text', text: b.text, tools: state.tools ?? [], at, uuid: e.uuid, error: !!e.isApiErrorMessage, ...(e.isApiErrorMessage ? { failure: failureOf(e) } : {}) });
         state.tools = [];
         state.said = short(b.text.split('\n').find((l) => l.trim()) ?? '', 160);
       } else if (b?.type === 'tool_use') {

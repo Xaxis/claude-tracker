@@ -14,6 +14,7 @@ import path from 'node:path';
  *   SHELLS … answers, then stays "shell": idle with shells left running
  *   STEPS …  a turn of several remarks and tool calls, a long write-up, and an answer
  *   CONTEXT n  answers as a call that carried n tokens of context, with its usage, as Claude Code records each call
+ *   LIMIT …  stops on the plan's usage limit, as Claude Code records it: an error of its own, never sent to the API
  *   /exit   quits
  *
  * Ctrl-C quits at once, so a test can tell if the tracker ever sends one.
@@ -113,6 +114,15 @@ function submit(text) {
     const id = Math.random().toString(36).slice(2);
     timer = setTimeout(() => {
       write({ type: 'assistant', requestId: `req_${id}`, message: { id: `msg_${id}`, model: 'claude-opus-5-5', usage: { input_tokens: n, output_tokens: 5 }, content: [{ type: 'text', text: `context ${n}` }] } });
+      setStatus('idle');
+    }, 200);
+  } else if (text.startsWith('LIMIT')) {
+    timer = setTimeout(() => {
+      write({
+        type: 'assistant', isApiErrorMessage: true, error: 'rate_limit', apiError: 'usage_limit_reached',
+        quotaLimits: { status: 'rejected', resetsAt: 1795111200, rateLimitType: 'five_hour' },
+        message: { model: '<synthetic>', content: [{ type: 'text', text: "You've hit your limit · resets 3pm" }] },
+      });
       setStatus('idle');
     }, 200);
   } else if (text.startsWith('WORK')) {

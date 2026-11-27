@@ -278,7 +278,7 @@ export function startDirector({ hands, log = () => {} }) {
     if (v.doneN === n) return;
     v.doneN = n;
     const turn = readTurns(t, n - 1, 1)[0];
-    emit(v.s.sessionId, 'turn_done', { n, answerPreview: clip(turn?.answer ?? '', 300), ...(turn?.interrupted ? { interrupted: true } : {}) });
+    emit(v.s.sessionId, 'turn_done', { n, answerPreview: clip(turn?.answer ?? '', 300), ...(turn?.interrupted ? { interrupted: true } : {}), ...(turn?.error ? { error: turn.error } : {}) });
   }
 
   // Idle stretches and context use change without a session's list changing.
@@ -333,7 +333,11 @@ export function startDirector({ hands, log = () => {} }) {
       entries(t.path, t.starts[i], t.starts[i + 1] ?? t.scanned, (e) => {
         for (const it of readEntry(e, state)) {
           if (it.kind === 'prompt' && !it.command && turn.prompt == null) { turn.prompt = it.text; turn.at = it.at; }
-          else if (it.kind === 'text') { turn.answer = it.text; turn.tools.push(...it.tools); }
+          else if (it.kind === 'text') {
+            turn.answer = it.text; turn.tools.push(...it.tools);
+            // Ended on a limit, a lapsed sign-in, an API failure: no answer, and no use nudging until it is over.
+            if (it.failure) turn.error = it.failure; else delete turn.error;
+          }
           else if (it.kind === 'note' && it.text === 'interrupted') turn.interrupted = true;
         }
       }, true);

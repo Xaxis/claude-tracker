@@ -232,6 +232,22 @@ test('context nearly full is said at 70%, and again at 85%', { skip: !hasTmux, t
   assert.equal((await events()).filter((e) => e.kind === 'context_high' && e.session === t.id).length, 2, 'once per level');
 });
 
+test('a turn that stops on the plan\'s limit says so, and when the limit resets', { skip: !hasTmux, timeout: 60_000 }, async () => {
+  await until('idle', async () => (await ok('GET', `/sessions/${t.id}`)).state === 'idle');
+  await ok('POST', `/sessions/${t.id}/type`, { text: 'LIMIT then' });
+  const done = await event('the turn on the limit', (e) => e.kind === 'turn_done' && e.session === t.id && e.detail.answerPreview.includes('hit your limit'));
+  const limit = { kind: 'rate_limit', resetsAt: 1795111200000 };
+  assert.deepEqual(done.detail.error, limit);
+  const [turn] = (await ok('GET', `/sessions/${t.id}/turns?after=${done.detail.n - 1}&limit=1`)).turns;
+  assert.equal(turn.n, done.detail.n);
+  assert.deepEqual(turn.error, limit);
+  // A turn that answers says nothing of one.
+  await ok('POST', `/sessions/${t.id}/type`, { text: 'after the limit' });
+  const next = await event('the next turn', (e) => e.kind === 'turn_done' && e.session === t.id && e.detail.n === done.detail.n + 1);
+  assert.equal(next.detail.error, undefined);
+  assert.equal((await ok('GET', `/sessions/${t.id}/turns?after=${done.detail.n}`)).turns[0].error, undefined);
+});
+
 test('`director pause` in the channel refuses every write until `director resume`, which an app cannot send', { skip: !hasTmux, timeout: 60_000 }, async () => {
   slack.message({ channel: 'C1', user: 'U1', text: 'director pause' });
   await event('paused', (e) => e.kind === 'paused');
