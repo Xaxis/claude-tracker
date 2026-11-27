@@ -567,19 +567,29 @@ from there.
     thread. It also says whether the director is paused.
   - `POST /sessions` `{ cwd, prompt?, model?, name?, account? }` starts Claude
     in a new tmux session, as `new` does in Slack. If Claude stops on a question
-    before it starts, such as a folder to trust, the session is closed and the
-    request refused with the question.
+    before it starts, such as a folder to trust, or ends before it starts, the
+    session is closed and the request refused, saying why. One not up within
+    30 s comes back pending: its id arrives with a `started` event, or a
+    `launch_failed` event says why it never came up. Once it asks something,
+    ends, or is still not up after 10 minutes, it is closed.
   - `POST /sessions/:id/type`, `/keys` (`{ keys: ["2"] }` or `{ choice: 2 }`),
     `/command` (`compact`, `clear`, or `model` with an `arg`) and `/stop`. Stop
-    types `/exit` and never sends Ctrl-C. A session the director started has
-    its tmux session closed once Claude has exited.
+    types `/exit` and never sends Ctrl-C.
+  - A session the director started has its tmux session closed once Claude
+    has exited, however it ended, unless someone has it open. If it ended
+    without the director stopping it, its last lines go in its `exited` event
+    and its Slack thread.
   - `GET /sessions/:id/screen` returns the terminal.
   - `GET /sessions/:id/turns?after=n` returns its turns, numbered from the start
-    of its transcript: what was asked, what it did and what it answered.
+    of its transcript: what was asked, what it did and what it answered. A turn
+    that Claude Code ended with an error of its own, such as a usage limit or an
+    expired sign-in, carries `error: { kind, resetsAt? }`, and so does its
+    `turn_done` event.
 - **Events.** `GET /events?after=<seq>&wait=<seconds>` is a long poll. It covers:
-  a session started, a turn done, a prompt waiting, idle, context at 70% and
-  again at 85% of the way to auto-compact, exited, handed over or taken back,
-  your messages and choices, and the director paused or resumed. Numbers survive
+  a session started, a start that never came up, a turn done, a prompt waiting,
+  idle, context at 70% and again at 85% of the way to auto-compact, exited,
+  handed over or taken back, your messages and choices, and the director paused
+  or resumed. Numbers survive
   a restart, and events are kept for a week.
 - **Only its own sessions.** It may write only to a session it started, or one
   you handed it with `;director` in that session's thread. `;mine` takes the
